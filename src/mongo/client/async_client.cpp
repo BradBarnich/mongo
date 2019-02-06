@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,9 +37,8 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/authenticate.h"
 #include "mongo/config.h"
-#include "mongo/db/auth/authorization_manager_global.h"
-#include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/egress_tag_closer_manager.h"
 #include "mongo/rpc/factory.h"
@@ -65,11 +66,12 @@ Future<AsyncDBClient::Handle> AsyncDBClient::connect(const HostAndPort& peer,
         });
 }
 
-BSONObj AsyncDBClient::_buildIsMasterRequest(const std::string& appName) {
+BSONObj AsyncDBClient::_buildIsMasterRequest(const std::string& appName,
+                                             executor::NetworkConnectionHook* hook) {
     BSONObjBuilder bob;
 
     bob.append("isMaster", 1);
-    bob.append("hangUpOnStepDown", false);
+
     const auto versionString = VersionInfoInterface::instance().version();
     ClientMetadata::serialize(appName, versionString, &bob);
 
@@ -88,7 +90,11 @@ BSONObj AsyncDBClient::_buildIsMasterRequest(const std::string& appName) {
         WireSpec::appendInternalClientWireVersion(WireSpec::instance().outgoing, &bob);
     }
 
-    return bob.obj();
+    if (hook) {
+        return hook->augmentIsMasterRequest(bob.obj());
+    } else {
+        return bob.obj();
+    }
 }
 
 void AsyncDBClient::_parseIsMasterResponse(BSONObj request,
@@ -125,13 +131,20 @@ void AsyncDBClient::_parseIsMasterResponse(BSONObj request,
     _compressorManager.clientFinish(responseBody);
 }
 
-Future<void> AsyncDBClient::authenticate(const BSONObj& params) {
-    // This check is sufficient to see if auth is enabled on the system,
-    // and avoids creating dependencies on deeper, less accessible auth code.
-    if (!isInternalAuthSet()) {
-        return Future<void>::makeReady();
-    }
+auth::RunCommandHook AsyncDBClient::_makeAuthRunCommandHook() {
+    return [this](OpMsgRequest request) {
+        return runCommand(std::move(request)).then([](rpc::UniqueReply reply) -> Future<BSONObj> {
+            auto status = getStatusFromCommandResult(reply->getCommandReply());
+            if (!status.isOK()) {
+                return status;
+            } else {
+                return reply->getCommandReply();
+            }
+        });
+    };
+}
 
+Future<void> AsyncDBClient::authenticate(const BSONObj& params) {
     // We will only have a valid clientName if SSL is enabled.
     std::string clientName;
 #ifdef MONGO_CONFIG_SSL
@@ -140,37 +153,28 @@ Future<void> AsyncDBClient::authenticate(const BSONObj& params) {
     }
 #endif
 
-    auto pf = makePromiseFuture<void>();
-    auto authCompleteCb = [promise = pf.promise.share()](auth::AuthResponse response) mutable {
-        if (response.isOK()) {
-            promise.emplaceValue();
-        } else {
-            promise.setError(response.status);
-        }
-    };
+    return auth::authenticateClient(params, remote(), clientName, _makeAuthRunCommandHook());
+}
 
-    auto doAuthCb = [this](executor::RemoteCommandRequest request,
-                           auth::AuthCompletionHandler handler) {
+Future<void> AsyncDBClient::authenticateInternal(boost::optional<std::string> mechanismHint) {
+    // If no internal auth information is set, don't bother trying to authenticate.
+    if (!auth::isInternalAuthSet()) {
+        return Future<void>::makeReady();
+    }
+    // We will only have a valid clientName if SSL is enabled.
+    std::string clientName;
+#ifdef MONGO_CONFIG_SSL
+    if (getSSLManager()) {
+        clientName = getSSLManager()->getSSLConfiguration().clientSubjectName.toString();
+    }
+#endif
 
-        runCommandRequest(request).getAsync([handler = std::move(handler)](
-            StatusWith<executor::RemoteCommandResponse> response) {
-            if (!response.isOK()) {
-                handler(executor::RemoteCommandResponse(response.getStatus()));
-            } else {
-                handler(std::move(response.getValue()));
-            }
-        });
-    };
-
-    auth::authenticateClient(
-        params, remote(), clientName, std::move(doAuthCb), std::move(authCompleteCb));
-
-    return std::move(pf.future);
+    return auth::authenticateInternalClient(clientName, mechanismHint, _makeAuthRunCommandHook());
 }
 
 Future<void> AsyncDBClient::initWireVersion(const std::string& appName,
                                             executor::NetworkConnectionHook* const hook) {
-    auto requestObj = _buildIsMasterRequest(appName);
+    auto requestObj = _buildIsMasterRequest(appName, hook);
     // We use a legacy request to create our ismaster request because we may
     // have to communicate with servers that do not support other protocols.
     auto requestMsg =
@@ -189,7 +193,7 @@ Future<void> AsyncDBClient::initWireVersion(const std::string& appName,
     });
 }
 
-Future<Message> AsyncDBClient::_call(Message request, const transport::BatonHandle& baton) {
+Future<Message> AsyncDBClient::_call(Message request, const BatonHandle& baton) {
     auto swm = _compressorManager.compressMessage(request);
     if (!swm.isOK()) {
         return swm.getStatus();
@@ -215,8 +219,7 @@ Future<Message> AsyncDBClient::_call(Message request, const transport::BatonHand
         });
 }
 
-Future<rpc::UniqueReply> AsyncDBClient::runCommand(OpMsgRequest request,
-                                                   const transport::BatonHandle& baton) {
+Future<rpc::UniqueReply> AsyncDBClient::runCommand(OpMsgRequest request, const BatonHandle& baton) {
     invariant(_negotiatedProtocol);
     auto requestMsg = rpc::messageFromOpMsgRequest(*_negotiatedProtocol, std::move(request));
     return _call(std::move(requestMsg), baton)
@@ -226,7 +229,7 @@ Future<rpc::UniqueReply> AsyncDBClient::runCommand(OpMsgRequest request,
 }
 
 Future<executor::RemoteCommandResponse> AsyncDBClient::runCommandRequest(
-    executor::RemoteCommandRequest request, const transport::BatonHandle& baton) {
+    executor::RemoteCommandRequest request, const BatonHandle& baton) {
     auto clkSource = _svcCtx->getPreciseClockSource();
     auto start = clkSource->now();
     auto opMsgRequest = OpMsgRequest::fromDBAndBody(
@@ -242,7 +245,7 @@ Future<executor::RemoteCommandResponse> AsyncDBClient::runCommandRequest(
         });
 }
 
-void AsyncDBClient::cancel(const transport::BatonHandle& baton) {
+void AsyncDBClient::cancel(const BatonHandle& baton) {
     _session->cancelAsyncOperations(baton);
 }
 

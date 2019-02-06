@@ -1,28 +1,31 @@
-/*    Copyright 2009 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -58,6 +61,16 @@ namespace mongo {
  * @return the SSL version std::string prefixed with prefix and suffixed with suffix
  */
 const std::string getSSLVersion(const std::string& prefix, const std::string& suffix);
+
+/**
+ * Validation callback for setParameter 'opensslCipherConfig'.
+ */
+Status validateOpensslCipherConfig(const std::string&);
+
+/**
+ * Validation callback for setParameter 'disableNonTLSConnectionLogging'.
+ */
+Status validateDisableNonTLSConnectionLogging(const bool&);
 }
 
 #ifdef MONGO_CONFIG_SSL
@@ -77,6 +90,24 @@ typedef SSLContextRef SSLConnectionType;
 #error "Unknown SSL Provider"
 #endif
 
+
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
+/*
+ * There are a number of OpenSSL types that we want to be able to use with unique_ptr that have a
+ * custom OpenSSL deleter function. This template implements a stateless deleter for types with
+ * C free functions:
+ * using UniqueX509 = std::unique_ptr<X509, OpenSSLDeleter<decltype(::X509_free), ::X509_free>>;
+ */
+template <typename Deleter, Deleter* impl>
+struct OpenSSLDeleter {
+    template <typename Obj>
+    void operator()(Obj* ptr) const {
+        if (ptr != nullptr) {
+            impl(ptr);
+        }
+    }
+};
+#endif
 /**
  * Maintain per connection SSL state for the Sock class. Used by SSLManagerInterface to perform SSL
  * operations.
@@ -88,14 +119,24 @@ public:
     virtual std::string getSNIServerName() const = 0;
 };
 
-struct SSLConfiguration {
+class SSLConfiguration {
+public:
     bool isClusterMember(StringData subjectName) const;
-    bool isClusterMember(const SSLX509Name& subjectName) const;
+    bool isClusterMember(SSLX509Name subjectName) const;
     BSONObj getServerStatusBSON() const;
-    SSLX509Name serverSubjectName;
+    Status setServerSubjectName(SSLX509Name name);
+
+    const SSLX509Name& serverSubjectName() const {
+        return _serverSubjectName;
+    }
+
     SSLX509Name clientSubjectName;
     Date_t serverCertificateExpirationDate;
     bool hasCA = false;
+
+private:
+    SSLX509Name _serverSubjectName;
+    std::vector<SSLX509Name::Entry> _canonicalServerSubjectName;
 };
 
 /**
@@ -120,11 +161,11 @@ const ASN1OID mongodbRolesOID("1.3.6.1.4.1.34601.2.1.1",
  * Counts of negogtiated version used by TLS connections.
  */
 struct TLSVersionCounts {
-    AtomicInt64 tlsUnknown;
-    AtomicInt64 tls10;
-    AtomicInt64 tls11;
-    AtomicInt64 tls12;
-    AtomicInt64 tls13;
+    AtomicWord<long long> tlsUnknown;
+    AtomicWord<long long> tls10;
+    AtomicWord<long long> tls11;
+    AtomicWord<long long> tls12;
+    AtomicWord<long long> tls13;
 
     static TLSVersionCounts& get(ServiceContext* serviceContext);
 };
@@ -231,11 +272,24 @@ StatusWith<stdx::unordered_set<RoleName>> parsePeerRoles(ConstDataRange cdrExten
 std::string removeFQDNRoot(std::string name);
 
 /**
- * Escape a string per RGC 2253
+ * Escape a string per RFC 2253
  *
  * See "2.4 Converting an AttributeValue from ASN.1 to a String" in RFC 2243
  */
 std::string escapeRfc2253(StringData str);
+
+/**
+ * Parse a DN from a string per RFC 4514
+ */
+StatusWith<SSLX509Name> parseDN(StringData str);
+
+/**
+ * These functions map short names for RDN components to numeric OID's and the other way around.
+ *
+ * The x509ShortNameToOid returns boost::none if no mapping exists for that oid.
+ */
+std::string x509OidToShortName(StringData name);
+boost::optional<std::string> x509ShortNameToOid(StringData name);
 
 /**
  * Platform neutral TLS version enum

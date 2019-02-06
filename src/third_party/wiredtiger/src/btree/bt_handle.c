@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -13,6 +13,35 @@ static int __btree_get_last_recno(WT_SESSION_IMPL *);
 static int __btree_page_sizes(WT_SESSION_IMPL *);
 static int __btree_preload(WT_SESSION_IMPL *);
 static int __btree_tree_open_empty(WT_SESSION_IMPL *, bool);
+
+/*
+ * __wt_btree_page_version_config --
+ *	Select a Btree page format.
+ */
+void
+__wt_btree_page_version_config(WT_SESSION_IMPL *session)
+{
+	WT_CONNECTION_IMPL *conn;
+
+	conn = S2C(session);
+
+	/*
+	 * Write timestamp format pages if at the right version or if configured
+	 * at build-time.
+	 *
+	 * WiredTiger version where timestamp page format is written. This is a
+	 * future release, and the values may require update when the release is
+	 * named.
+	 */
+#define	WT_VERSION_TS_MAJOR	3
+#define	WT_VERSION_TS_MINOR	3
+	__wt_process.page_version_ts =
+	    conn->compat_major >= WT_VERSION_TS_MAJOR &&
+	    conn->compat_minor >= WT_VERSION_TS_MINOR;
+#if defined(HAVE_PAGE_VERSION_TS)
+	__wt_process.page_version_ts = true;
+#endif
+}
 
 /*
  * __btree_clear --
@@ -459,8 +488,8 @@ __btree_conf(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
 	 *	Don't do compression adjustment for fixed-size column store, the
 	 * leaf page sizes don't change. (We could adjust internal pages but not
 	 * internal pages, but that seems an unlikely use case.)
-	 *	XXX
-	 *	Don't do compression adjustment of snappy-compressed blocks.
+	 * 	XXX
+	 * 	Don't do compression adjustment of snappy-compressed blocks.
 	 */
 	btree->intlpage_compadjust = false;
 	btree->maxintlpage_precomp = btree->maxintlpage;
@@ -669,7 +698,7 @@ __btree_tree_open_empty(WT_SESSION_IMPL *session, bool creation)
 		ref->home = root;
 		ref->page = NULL;
 		ref->addr = NULL;
-		ref->state = WT_REF_DELETED;
+		WT_REF_SET_STATE(ref, WT_REF_DELETED);
 		ref->ref_recno = 1;
 		break;
 	case BTREE_ROW:
@@ -682,7 +711,7 @@ __btree_tree_open_empty(WT_SESSION_IMPL *session, bool creation)
 		ref->home = root;
 		ref->page = NULL;
 		ref->addr = NULL;
-		ref->state = WT_REF_DELETED;
+		WT_REF_SET_STATE(ref, WT_REF_DELETED);
 		WT_ERR(__wt_row_ikey_incr(session, root, 0, "", 1, ref));
 		break;
 	}
@@ -691,7 +720,7 @@ __btree_tree_open_empty(WT_SESSION_IMPL *session, bool creation)
 	if (F_ISSET(btree, WT_BTREE_BULK)) {
 		WT_ERR(__wt_btree_new_leaf_page(session, &leaf));
 		ref->page = leaf;
-		ref->state = WT_REF_MEM;
+		WT_REF_SET_STATE(ref, WT_REF_MEM);
 		WT_ERR(__wt_page_modify_init(session, leaf));
 		__wt_page_only_modify_set(session, leaf);
 	}

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -42,6 +44,7 @@
 #include "mongo/util/time_support.h"
 
 namespace mongo {
+class CommitQuorumOptions;
 class Timestamp;
 
 namespace repl {
@@ -305,8 +308,9 @@ public:
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
         OpTime currentCommittedSnapshotOpTime) const;
 
-    // produce a reply to an ismaster request.  It is only valid to call this if we are a
-    // replset.
+    // Produce a reply to an ismaster request.  It is only valid to call this if we are a
+    // replset.  Drivers interpret the isMaster fields according to the Server Discovery and
+    // Monitoring Spec, see the "Parsing an isMaster response" section.
     void fillIsMasterForReplSet(IsMasterResponse* response);
 
     // Produce member data for the serverStatus command and diagnostic logging.
@@ -592,12 +596,6 @@ public:
     rpc::OplogQueryMetadata prepareOplogQueryMetadata(int rbid) const;
 
     /**
-     * Writes into 'output' all the information needed to generate a summary of the current
-     * replication state for use by the web interface.
-     */
-    void summarizeAsHtml(ReplSetHtmlSummary* output);
-
-    /**
      * Prepares a ReplSetRequestVotesResponse.
      */
     void processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
@@ -661,6 +659,23 @@ public:
      * we last restarted, then its value will be boost::none.
      */
     std::map<int, boost::optional<OpTime>> latestKnownOpTimeSinceHeartbeatRestartPerMember() const;
+
+    /**
+     * Checks if the 'commitQuorum' can be satisifed by 'members'. Returns true if it can be
+     * satisfied.
+     *
+     * 'members' must be part of the replica set configuration.
+     */
+    bool checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum,
+                                           const std::vector<MemberConfig>& members) const;
+
+    /**
+     * Returns 'true' if the 'commitQuorum' is satisifed by the 'commitReadyMembers'.
+     *
+     * 'commitReadyMembers' must be part of the replica set configuration.
+     */
+    bool checkIfCommitQuorumIsSatisfied(const CommitQuorumOptions& commitQuorum,
+                                        const std::vector<HostAndPort>& commitReadyMembers) const;
 
     ////////////////////////////////////////////////////////////
     //

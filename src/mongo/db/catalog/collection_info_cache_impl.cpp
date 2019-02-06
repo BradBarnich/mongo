@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,13 +34,12 @@
 
 #include "mongo/db/catalog/collection_info_cache_impl.h"
 
-#include "mongo/base/init.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index/wildcard_key_generator.h"
+#include "mongo/db/index/wildcard_access_method.h"
 #include "mongo/db/index_legacy.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_cache.h"
@@ -47,15 +48,9 @@
 #include "mongo/db/ttl_collection_cache.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/clock_source.h"
-#include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
-MONGO_REGISTER_SHIM(CollectionInfoCache::makeImpl)
-(Collection* const collection, const NamespaceString& ns, PrivateTo<CollectionInfoCache>)
-    ->std::unique_ptr<CollectionInfoCache::Impl> {
-    return std::make_unique<CollectionInfoCacheImpl>(collection, ns);
-}
 
 CollectionInfoCacheImpl::CollectionInfoCacheImpl(Collection* collection, const NamespaceString& ns)
     : _collection(collection),
@@ -86,14 +81,17 @@ void CollectionInfoCacheImpl::computeIndexKeys(OperationContext* opCtx) {
     bool hadTTLIndex = _hasTTLIndex;
     _hasTTLIndex = false;
 
-    IndexCatalog::IndexIterator i = _collection->getIndexCatalog()->getIndexIterator(opCtx, true);
-    while (i.more()) {
-        IndexDescriptor* descriptor = i.next();
+    std::unique_ptr<IndexCatalog::IndexIterator> it =
+        _collection->getIndexCatalog()->getIndexIterator(opCtx, true);
+    while (it->more()) {
+        const IndexCatalogEntry* entry = it->next();
+        const IndexDescriptor* descriptor = entry->descriptor();
+        const IndexAccessMethod* iam = entry->accessMethod();
 
         if (descriptor->getAccessMethodName() == IndexNames::WILDCARD) {
             // Obtain the projection used by the $** index's key generator.
-            auto pathProj = WildcardKeyGenerator::createProjectionExec(
-                descriptor->keyPattern(), descriptor->pathProjection());
+            const auto* pathProj =
+                static_cast<const WildcardAccessMethod*>(iam)->getProjectionExec();
             // If the projection is an exclusion, then we must check the new document's keys on all
             // updates, since we do not exhaustively know the set of paths to be indexed.
             if (pathProj->getType() == ProjectionExecAgg::ProjectionType::kExclusionProjection) {
@@ -140,7 +138,6 @@ void CollectionInfoCacheImpl::computeIndexKeys(OperationContext* opCtx) {
         }
 
         // handle partial indexes
-        const IndexCatalogEntry* entry = i.catalogEntry(descriptor);
         const MatchExpression* filter = entry->getFilterExpression();
         if (filter) {
             stdx::unordered_set<std::string> paths;
@@ -177,7 +174,7 @@ void CollectionInfoCacheImpl::notifyOfQuery(OperationContext* opCtx,
 }
 
 void CollectionInfoCacheImpl::clearQueryCache() {
-    LOG(1) << _collection->ns().ns() << ": clearing plan cache - collection info cache reset";
+    LOG(1) << _collection->ns() << ": clearing plan cache - collection info cache reset";
     if (NULL != _planCache.get()) {
         _planCache->clear();
     }
@@ -192,20 +189,19 @@ QuerySettings* CollectionInfoCacheImpl::getQuerySettings() const {
 }
 
 void CollectionInfoCacheImpl::updatePlanCacheIndexEntries(OperationContext* opCtx) {
-    std::vector<IndexEntry> indexEntries;
+    std::vector<CoreIndexInfo> indexCores;
 
     // TODO We shouldn't need to include unfinished indexes, but we must here because the index
     // catalog may be in an inconsistent state.  SERVER-18346.
     const bool includeUnfinishedIndexes = true;
-    IndexCatalog::IndexIterator ii =
+    std::unique_ptr<IndexCatalog::IndexIterator> ii =
         _collection->getIndexCatalog()->getIndexIterator(opCtx, includeUnfinishedIndexes);
-    while (ii.more()) {
-        const IndexDescriptor* desc = ii.next();
-        const IndexCatalogEntry* ice = ii.catalogEntry(desc);
-        indexEntries.emplace_back(indexEntryFromIndexCatalogEntry(opCtx, *ice));
+    while (ii->more()) {
+        const IndexCatalogEntry* ice = ii->next();
+        indexCores.emplace_back(indexInfoFromIndexCatalogEntry(*ice));
     }
 
-    _planCache->notifyOfIndexEntries(indexEntries);
+    _planCache->notifyOfIndexUpdates(indexCores);
 }
 
 void CollectionInfoCacheImpl::init(OperationContext* opCtx) {
@@ -213,10 +209,10 @@ void CollectionInfoCacheImpl::init(OperationContext* opCtx) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns().ns(), MODE_X));
 
     const bool includeUnfinishedIndexes = false;
-    IndexCatalog::IndexIterator ii =
+    std::unique_ptr<IndexCatalog::IndexIterator> ii =
         _collection->getIndexCatalog()->getIndexIterator(opCtx, includeUnfinishedIndexes);
-    while (ii.more()) {
-        const IndexDescriptor* desc = ii.next();
+    while (ii->more()) {
+        const IndexDescriptor* desc = ii->next()->descriptor();
         _indexUsageTracker.registerIndex(desc->indexName(), desc->keyPattern());
     }
 
@@ -252,4 +248,19 @@ void CollectionInfoCacheImpl::rebuildIndexData(OperationContext* opCtx) {
 CollectionIndexUsageMap CollectionInfoCacheImpl::getIndexUsageStats() const {
     return _indexUsageTracker.getUsageStats();
 }
+
+void CollectionInfoCacheImpl::setNs(NamespaceString ns) {
+    auto oldNs = _ns;
+    _ns = std::move(ns);
+
+    _planCache->setNs(_ns);
+
+    // Update the TTL collection cache.
+    if (_hasTTLIndex) {
+        auto& ttlCollectionCache = TTLCollectionCache::get(getGlobalServiceContext());
+        ttlCollectionCache.unregisterCollection(oldNs);
+        ttlCollectionCache.registerCollection(_ns);
+    }
+}
+
 }  // namespace mongo

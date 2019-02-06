@@ -1,30 +1,33 @@
 // dbclient.cpp - connect to a Mongo database as a database, from C++
 
-/*    Copyright 2009 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
@@ -44,7 +47,7 @@
 #include "mongo/client/constants.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/config.h"
-#include "mongo/db/auth/internal_user_auth.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
@@ -79,26 +82,7 @@ using std::vector;
 using executor::RemoteCommandRequest;
 using executor::RemoteCommandResponse;
 
-namespace {
-
-#ifdef MONGO_CONFIG_SSL
-static SimpleMutex s_mtx;
-static SSLManagerInterface* s_sslMgr(NULL);
-
-SSLManagerInterface* sslManager() {
-    stdx::lock_guard<SimpleMutex> lk(s_mtx);
-    if (s_sslMgr) {
-        return s_sslMgr;
-    }
-
-    s_sslMgr = getSSLManager();
-    return s_sslMgr;
-}
-#endif
-
-}  // namespace
-
-AtomicInt64 DBClientBase::ConnectionIdSequence;
+AtomicWord<long long> DBClientBase::ConnectionIdSequence;
 
 void (*DBClientBase::withConnection_do_not_use)(std::string host,
                                                 std::function<void(DBClientBase*)>) = nullptr;
@@ -415,14 +399,6 @@ string DBClientBase::getLastErrorString(const BSONObj& info) {
     }
 }
 
-const BSONObj getpreverrorcmdobj = fromjson("{getpreverror:1}");
-
-BSONObj DBClientBase::getPrevError() {
-    BSONObj info;
-    runCommand("admin", getpreverrorcmdobj, info);
-    return info;
-}
-
 string DBClientBase::createPasswordDigest(const string& username, const string& clearTextPassword) {
     return mongo::createPasswordDigest(username, clearTextPassword);
 }
@@ -446,59 +422,72 @@ private:
 };
 }  // namespace
 
+auth::RunCommandHook DBClientBase::_makeAuthRunCommandHook() {
+    return [this](OpMsgRequest request) -> Future<BSONObj> {
+        try {
+            auto ret = runCommand(std::move(request));
+            auto status = getStatusFromCommandResult(ret->getCommandReply());
+            if (!status.isOK()) {
+                return status;
+            }
+            return Future<BSONObj>::makeReady(std::move(ret->getCommandReply()));
+        } catch (const DBException& e) {
+            return Future<BSONObj>::makeReady(e.toStatus());
+        }
+    };
+}
+
 void DBClientBase::_auth(const BSONObj& params) {
     ScopedMetadataWriterRemover remover{this};
 
     // We will only have a client name if SSL is enabled
     std::string clientName = "";
 #ifdef MONGO_CONFIG_SSL
-    if (sslManager() != nullptr) {
-        clientName = sslManager()->getSSLConfiguration().clientSubjectName.toString();
+    if (getSSLManager() != nullptr) {
+        clientName = getSSLManager()->getSSLConfiguration().clientSubjectName.toString();
     }
 #endif
 
-    auth::authenticateClient(
-        params,
-        HostAndPort(getServerAddress()),
-        clientName,
-        [this](RemoteCommandRequest request, auth::AuthCompletionHandler handler) {
-            BSONObj info;
-            auto start = Date_t::now();
-
-            try {
-                auto reply = runCommand(
-                    OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj, request.metadata));
-
-                BSONObj data = reply->getCommandReply().getOwned();
-                Milliseconds millis(Date_t::now() - start);
-
-                // Hand control back to authenticateClient()
-                handler({data, millis});
-
-            } catch (...) {
-                handler(exceptionToStatus());
-            }
-        });
+    HostAndPort remote(getServerAddress());
+    auth::authenticateClient(params, remote, clientName, _makeAuthRunCommandHook())
+        .onError([](Status status) {
+            // for some reason, DBClient transformed all errors into AuthenticationFailed errors
+            return Status(ErrorCodes::AuthenticationFailed, status.reason());
+        })
+        .get();
 }
 
-bool DBClientBase::authenticateInternalUser() {
-    if (!isInternalAuthSet()) {
+Status DBClientBase::authenticateInternalUser() {
+    ScopedMetadataWriterRemover remover{this};
+    if (!auth::isInternalAuthSet()) {
         if (!serverGlobalParams.quiet.load()) {
             log() << "ERROR: No authentication parameters set for internal user";
         }
-        return false;
+        return {ErrorCodes::AuthenticationFailed,
+                "No authentication parameters set for internal user"};
     }
 
-    try {
-        auth(getInternalUserAuthParams());
-        return true;
-    } catch (const AssertionException& ex) {
-        if (!serverGlobalParams.quiet.load()) {
-            log() << "can't authenticate to " << toString()
-                  << " as internal user, error: " << ex.what();
-        }
-        return false;
+    // We will only have a client name if SSL is enabled
+    std::string clientName = "";
+#ifdef MONGO_CONFIG_SSL
+    if (getSSLManager() != nullptr) {
+        clientName = getSSLManager()->getSSLConfiguration().clientSubjectName.toString();
     }
+#endif
+
+    auto status =
+        auth::authenticateInternalClient(clientName, boost::none, _makeAuthRunCommandHook())
+            .getNoThrow();
+    if (status.isOK()) {
+        return status;
+    }
+
+    if (serverGlobalParams.quiet.load()) {
+        log() << "can't authenticate to " << toString()
+              << " as internal user, error: " << status.reason();
+    }
+
+    return status;
 }
 
 void DBClientBase::auth(const BSONObj& params) {
@@ -841,7 +830,7 @@ void DBClientBase::dropIndex(const string& ns, BSONObj keys) {
 void DBClientBase::dropIndex(const string& ns, const string& indexName) {
     BSONObj info;
     if (!runCommand(nsToDatabase(ns),
-                    BSON("deleteIndexes" << nsToCollectionSubstring(ns) << "index" << indexName),
+                    BSON("dropIndexes" << nsToCollectionSubstring(ns) << "index" << indexName),
                     info)) {
         LOG(_logLevel) << "dropIndex failed: " << info << endl;
         uassert(10007, "dropIndex failed", 0);
@@ -853,8 +842,8 @@ void DBClientBase::dropIndexes(const string& ns) {
     uassert(10008,
             "dropIndexes failed",
             runCommand(nsToDatabase(ns),
-                       BSON("deleteIndexes" << nsToCollectionSubstring(ns) << "index"
-                                            << "*"),
+                       BSON("dropIndexes" << nsToCollectionSubstring(ns) << "index"
+                                          << "*"),
                        info));
 }
 

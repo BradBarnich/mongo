@@ -44,9 +44,6 @@ DBCollection.prototype.help = function() {
     print(
         "\tdb." + shortName +
         ".estimatedDocumentCount( <optional params> ) - estimate the document count using collection metadata, optional parameters are: maxTimeMS");
-    print(
-        "\tdb." + shortName +
-        ".copyTo(newColl) - duplicates collection by copying all documents to newColl; no indexes are copied.");
     print("\tdb." + shortName + ".convertToCapped(maxBytes) - calls {convertToCapped:'" +
           shortName + "', size:maxBytes}} command");
     print("\tdb." + shortName + ".createIndex(keypattern[,options])");
@@ -231,12 +228,12 @@ DBCollection.prototype.find = function(query, fields, limit, skip, batchSize, op
     {
         const session = this.getDB().getSession();
 
-        const readPreference = session._serverSession.client.getReadPreference(session);
+        const readPreference = session._getSessionAwareClient().getReadPreference(session);
         if (readPreference !== null) {
             cursor.readPref(readPreference.mode, readPreference.tags);
         }
 
-        const readConcern = session._serverSession.client.getReadConcern(session);
+        const readConcern = session._getSessionAwareClient().getReadConcern(session);
         if (readConcern !== null) {
             cursor.readConcern(readConcern.level);
         }
@@ -665,11 +662,9 @@ DBCollection.prototype.reIndex = function() {
     return this._db.runCommand({reIndex: this.getName()});
 };
 
-DBCollection.prototype.dropIndexes = function() {
-    if (arguments.length)
-        throw Error("dropIndexes doesn't take arguments");
-
-    var res = this._db.runCommand({deleteIndexes: this.getName(), index: "*"});
+DBCollection.prototype.dropIndexes = function(indexNames) {
+    indexNames = indexNames || '*';
+    var res = this._db.runCommand({dropIndexes: this.getName(), index: indexNames});
     assert(res, "no result from dropIndex result");
     if (res.ok)
         return res;
@@ -850,26 +845,8 @@ DBCollection.prototype.hashAllDocs = function() {
  */
 DBCollection.prototype.dropIndex = function(index) {
     assert(index, "need to specify index to dropIndex");
-    var res = this._dbCommand("deleteIndexes", {index: index});
+    var res = this._dbCommand("dropIndexes", {index: index});
     return res;
-};
-
-DBCollection.prototype.copyTo = function(newName) {
-    return this.getDB().eval(function(collName, newName) {
-        var from = db[collName];
-        var to = db[newName];
-        to.ensureIndex({_id: 1});
-        var count = 0;
-
-        var cursor = from.find();
-        while (cursor.hasNext()) {
-            var o = cursor.next();
-            count++;
-            to.save(o);
-        }
-
-        return count;
-    }, this.getName(), newName);
 };
 
 DBCollection.prototype.getCollection = function(subName) {

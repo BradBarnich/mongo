@@ -1413,6 +1413,10 @@ var authCommandsLib = {
                 privileges: [{resource: {cluster: true}, actions: ["inprog"]}]
               },
               {
+                runOnDb: adminDbName,
+                privileges: [{resource: {cluster: true}, actions: ["inprog"]}]
+              },
+              {
                 runOnDb: firstDbName,
                 roles: roles_monitoring,
                 privileges: [{resource: {cluster: true}, actions: ["inprog"]}],
@@ -1434,15 +1438,6 @@ var authCommandsLib = {
               cursor: {}
           },
           testcases: [{runOnDb: adminDbName, roles: roles_all}]
-        },
-        {
-          testname: "aggregate_listLocalCursors",
-          command: {aggregate: 1, pipeline: [{$listLocalCursors: {}}], cursor: {}},
-          testcases: [{
-              runOnDb: adminDbName,
-              roles:
-                  {clusterAdmin: 1, clusterMonitor: 1, clusterManager: 1, root: 1, __system: 1}
-          }],
         },
         {
           testname: "aggregate_listLocalSessions_allUsers_true",
@@ -3135,7 +3130,7 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_monitoring,
+                roles: Object.extend({backup: 1}, roles_monitoring),
                 privileges: [{resource: {cluster: true}, actions: ["serverStatus"]}]
               },
               {runOnDb: firstDbName, roles: {}, expectFail: true},
@@ -3831,6 +3826,24 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "dbstats_on_local",
+          command: {dbStats: 1},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: "local",
+                roles: {
+                    "readLocal": 1,
+                    "readWriteLocal": 1,
+                    "clusterAdmin": 1,
+                    "clusterMonitor": 1,
+                    "root": 1,
+                    "__system": 1,
+                },
+              },
+          ]
+        },
+        {
           testname: "find_config_changelog",
           command: {find: "changelog"},
           testcases: [
@@ -4269,15 +4282,6 @@ var authCommandsLib = {
               },
               {runOnDb: firstDbName, roles: {}},
               {runOnDb: secondDbName, roles: {}}
-          ]
-        },
-        {
-          testname: "getPrevError",
-          command: {getPrevError: 1},
-          skipSharded: true,
-          testcases: [
-              {runOnDb: firstDbName, roles: roles_all, privileges: []},
-              {runOnDb: secondDbName, roles: roles_all, privileges: []}
           ]
         },
         {
@@ -5492,17 +5496,17 @@ var authCommandsLib = {
           testcases: [
               {
                 runOnDb: adminDbName,
-                roles: roles_monitoring,
+                roles: Object.extend({backup: 1}, roles_monitoring),
                 privileges: [{resource: {cluster: true}, actions: ["serverStatus"]}]
               },
               {
                 runOnDb: firstDbName,
-                roles: roles_monitoring,
+                roles: Object.extend({backup: 1}, roles_monitoring),
                 privileges: [{resource: {cluster: true}, actions: ["serverStatus"]}]
               },
               {
                 runOnDb: secondDbName,
-                roles: roles_monitoring,
+                roles: Object.extend({backup: 1}, roles_monitoring),
                 privileges: [{resource: {cluster: true}, actions: ["serverStatus"]}]
               }
           ]
@@ -5968,7 +5972,29 @@ var authCommandsLib = {
                       {killCursors: "$cmd.aggregate", cursors: [response.cursor.id]}));
               }
           }
-        }
+        },
+        {
+          testname: "startRecordingTraffic",
+          command: {startRecordingTraffic: 1, filename: "notARealPath"},
+          testcases: [
+              {runOnDb: adminDbName, roles: roles_hostManager},
+          ],
+          teardown: (db, response) => {
+              if (response.ok) {
+                  assert.commandWorked(db.runCommand({stopRecordingTraffic: 1}));
+              }
+          }
+        },
+        {
+          testname: "stopRecordingTraffic",
+          command: {stopRecordingTraffic: 1},
+          testcases: [
+              {runOnDb: adminDbName, roles: roles_hostManager},
+          ],
+          setup: function(db) {
+              db.runCommand({startRecordingTraffic: 1, filename: "notARealPath"});
+          }
+        },
     ],
 
     /************* SHARED TEST LOGIC ****************/

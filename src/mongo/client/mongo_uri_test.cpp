@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2009-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,9 +41,16 @@
 #include "mongo/unittest/unittest.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional_io.hpp>
 
 namespace mongo {
 namespace {
+using transport::ConnectSSLMode;
+constexpr auto kEnableSSL = ConnectSSLMode::kEnableSSL;
+constexpr auto kDisableSSL = ConnectSSLMode::kDisableSSL;
+constexpr auto kGlobalSSLMode = ConnectSSLMode::kGlobalSSLMode;
+
 struct URITestCase {
     std::string URI;
     std::string uname;
@@ -49,36 +58,93 @@ struct URITestCase {
     ConnectionString::ConnectionType type;
     std::string setname;
     size_t numservers;
-    size_t numOptions;
+    MongoURI::OptionsMap options;
     std::string database;
+    ConnectSSLMode sslMode;
 };
 
 struct InvalidURITestCase {
     std::string URI;
+    boost::optional<ErrorCodes::Error> code;
+    InvalidURITestCase(std::string aURI, boost::optional<ErrorCodes::Error> aCode = boost::none) {
+        URI = std::move(aURI);
+        code = std::move(aCode);
+    }
 };
+
+void compareOptions(size_t lineNumber,
+                    StringData uri,
+                    const MongoURI::OptionsMap& connection,
+                    const MongoURI::OptionsMap& expected) {
+    std::vector<std::pair<MongoURI::CaseInsensitiveString, std::string>> options(begin(connection),
+                                                                                 end(connection));
+    std::sort(begin(options), end(options));
+    std::vector<std::pair<MongoURI::CaseInsensitiveString, std::string>> expectedOptions(
+        begin(expected), end(expected));
+    std::sort(begin(expectedOptions), end(expectedOptions));
+
+    for (std::size_t i = 0; i < std::min(options.size(), expectedOptions.size()); ++i) {
+        if (options[i] != expectedOptions[i]) {
+            unittest::log() << "Option: \"tolower(" << options[i].first.original()
+                            << ")=" << options[i].second << "\" doesn't equal: \"tolower("
+                            << expectedOptions[i].first.original()
+                            << ")=" << expectedOptions[i].second << "\""
+                            << " data on line: " << lineNumber << std::endl;
+            std::cerr << "Failing URI: \"" << uri << "\""
+                      << " data on line: " << lineNumber << std::endl;
+            ASSERT(false);
+        }
+    }
+    ASSERT_EQ(options.size(), expectedOptions.size()) << "Failing URI: "
+                                                      << " data on line: " << lineNumber << uri;
+}
 
 const ConnectionString::ConnectionType kMaster = ConnectionString::MASTER;
 const ConnectionString::ConnectionType kSet = ConnectionString::SET;
 
 const URITestCase validCases[] = {
 
-    {"mongodb://user:pwd@127.0.0.1", "user", "pwd", kMaster, "", 1, 0, ""},
+    {"mongodb://user:pwd@127.0.0.1", "user", "pwd", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
-    {"mongodb://user@127.0.0.1", "user", "", kMaster, "", 1, 0, ""},
+    {"mongodb://user@127.0.0.1", "user", "", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
-    {"mongodb://localhost/?foo=bar", "", "", kMaster, "", 1, 1, ""},
+    {"mongodb://localhost/?foo=bar", "", "", kMaster, "", 1, {{"foo", "bar"}}, "", kGlobalSSLMode},
 
-    {"mongodb://localhost,/?foo=bar", "", "", kMaster, "", 1, 1, ""},
+    {"mongodb://localhost,/?foo=bar", "", "", kMaster, "", 1, {{"foo", "bar"}}, "", kGlobalSSLMode},
 
-    {"mongodb://user:pwd@127.0.0.1:1234", "user", "pwd", kMaster, "", 1, 0, ""},
+    {"mongodb://user:pwd@127.0.0.1:1234", "user", "pwd", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
-    {"mongodb://user@127.0.0.1:1234", "user", "", kMaster, "", 1, 0, ""},
+    {"mongodb://user@127.0.0.1:1234", "user", "", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
-    {"mongodb://127.0.0.1:1234/dbName?foo=a&c=b", "", "", kMaster, "", 1, 2, "dbName"},
+    {"mongodb://127.0.0.1:1234/dbName?foo=a&c=b",
+     "",
+     "",
+     kMaster,
+     "",
+     1,
+     {{"foo", "a"}, {"c", "b"}},
+     "dbName",
+     kGlobalSSLMode},
 
-    {"mongodb://127.0.0.1/dbName?foo=a&c=b", "", "", kMaster, "", 1, 2, "dbName"},
+    {"mongodb://127.0.0.1/dbName?foo=a&c=b",
+     "",
+     "",
+     kMaster,
+     "",
+     1,
+     {{"foo", "a"}, {"c", "b"}},
+     "dbName",
+     kGlobalSSLMode},
 
-    {"mongodb://user:pwd@127.0.0.1,/dbName?foo=a&c=b", "user", "pwd", kMaster, "", 1, 2, "dbName"},
+    {"mongodb://user:pwd@127.0.0.1,/dbName?foo=a&c=b",
+     "user",
+     "pwd",
+     kMaster,
+     "",
+     1,
+     {{"foo", "a"}, {"c", "b"}},
+     "dbName",
+     kGlobalSSLMode},
 
     {"mongodb://user:pwd@127.0.0.1,127.0.0.2/dbname?a=b&replicaSet=replName",
      "user",
@@ -86,8 +152,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     2,
-     "dbname"},
+     {{"a", "b"}, {"replicaSet", "replName"}},
+     "dbname",
+     kGlobalSSLMode},
 
     {"mongodb://needs%20encoding%25%23!%3C%3E:pwd@127.0.0.1,127.0.0.2/"
      "dbname?a=b&replicaSet=replName",
@@ -96,8 +163,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     2,
-     "dbname"},
+     {{"a", "b"}, {"replicaSet", "replName"}},
+     "dbname",
+     kGlobalSSLMode},
 
     {"mongodb://needs%20encoding%25%23!%3C%3E:pwd@127.0.0.1,127.0.0.2/"
      "db@name?a=b&replicaSet=replName",
@@ -106,8 +174,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     2,
-     "db@name"},
+     {{"a", "b"}, {"replicaSet", "replName"}},
+     "db@name",
+     kGlobalSSLMode},
 
     {"mongodb://user:needs%20encoding%25%23!%3C%3E@127.0.0.1,127.0.0.2/"
      "dbname?a=b&replicaSet=replName",
@@ -116,8 +185,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     2,
-     "dbname"},
+     {{"a", "b"}, {"replicaSet", "replName"}},
+     "dbname",
+     kGlobalSSLMode},
 
     {"mongodb://user:pwd@127.0.0.1,127.0.0.2/dbname?a=b&replicaSet=needs%20encoding%25%23!%3C%3E",
      "user",
@@ -125,8 +195,9 @@ const URITestCase validCases[] = {
      kSet,
      "needs encoding%#!<>",
      2,
-     2,
-     "dbname"},
+     {{"a", "b"}, {"replicaSet", "needs encoding%#!<>"}},
+     "dbname",
+     kGlobalSSLMode},
 
     {"mongodb://user:pwd@127.0.0.1,127.0.0.2/needsencoding%40hello?a=b&replicaSet=replName",
      "user",
@@ -134,8 +205,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     2,
-     "needsencoding@hello"},
+     {{"a", "b"}, {"replicaSet", "replName"}},
+     "needsencoding@hello",
+     kGlobalSSLMode},
 
     {"mongodb://user:pwd@127.0.0.1,127.0.0.2/?replicaSet=replName",
      "user",
@@ -143,8 +215,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     1,
-     ""},
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
 
     {"mongodb://user@127.0.0.1,127.0.0.2/?replicaSet=replName",
      "user",
@@ -152,8 +225,19 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     1,
-     ""},
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
+
+    {"mongodb://user@127.0.0.1,127.0.0.2/?replicaset=replName",
+     "user",
+     "",
+     kSet,
+     "replName",
+     2,
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
 
     {"mongodb://127.0.0.1,127.0.0.2/dbName?foo=a&c=b&replicaSet=replName",
      "",
@@ -161,8 +245,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     3,
-     "dbName"},
+     {{"foo", "a"}, {"c", "b"}, {"replicaSet", "replName"}},
+     "dbName",
+     kGlobalSSLMode},
 
     {"mongodb://user:pwd@127.0.0.1:1234,127.0.0.2:1234/?replicaSet=replName",
      "user",
@@ -170,8 +255,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     1,
-     ""},
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
 
     {"mongodb://user@127.0.0.1:1234,127.0.0.2:1234/?replicaSet=replName",
      "user",
@@ -179,8 +265,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     1,
-     ""},
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
 
     {"mongodb://127.0.0.1:1234,127.0.0.1:1234/dbName?foo=a&c=b&replicaSet=replName",
      "",
@@ -188,20 +275,37 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     3,
-     "dbName"},
+     {{"foo", "a"}, {"c", "b"}, {"replicaSet", "replName"}},
+     "dbName",
+     kGlobalSSLMode},
 
-    {"mongodb://user:pwd@[::1]", "user", "pwd", kMaster, "", 1, 0, ""},
+    {"mongodb://user:pwd@[::1]", "user", "pwd", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
-    {"mongodb://user@[::1]", "user", "", kMaster, "", 1, 0, ""},
+    {"mongodb://user@[::1]", "user", "", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
-    {"mongodb://[::1]/dbName?foo=a&c=b", "", "", kMaster, "", 1, 2, "dbName"},
+    {"mongodb://[::1]/dbName?foo=a&c=b",
+     "",
+     "",
+     kMaster,
+     "",
+     1,
+     {{"foo", "a"}, {"c", "b"}},
+     "dbName",
+     kGlobalSSLMode},
 
-    {"mongodb://user:pwd@[::1]:1234", "user", "pwd", kMaster, "", 1, 0, ""},
+    {"mongodb://user:pwd@[::1]:1234", "user", "pwd", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
-    {"mongodb://user@[::1]:1234", "user", "", kMaster, "", 1, 0, ""},
+    {"mongodb://user@[::1]:1234", "user", "", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
-    {"mongodb://[::1]:1234/dbName?foo=a&c=b", "", "", kMaster, "", 1, 2, "dbName"},
+    {"mongodb://[::1]:1234/dbName?foo=a&c=b",
+     "",
+     "",
+     kMaster,
+     "",
+     1,
+     {{"foo", "a"}, {"c", "b"}},
+     "dbName",
+     kGlobalSSLMode},
 
     {"mongodb://user:pwd@[::1],127.0.0.2/?replicaSet=replName",
      "user",
@@ -209,10 +313,19 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     1,
-     ""},
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
 
-    {"mongodb://user@[::1],127.0.0.2/?replicaSet=replName", "user", "", kSet, "replName", 2, 1, ""},
+    {"mongodb://user@[::1],127.0.0.2/?replicaSet=replName",
+     "user",
+     "",
+     kSet,
+     "replName",
+     2,
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
 
     {"mongodb://[::1],127.0.0.2/dbName?foo=a&c=b&replicaSet=replName",
      "",
@@ -220,8 +333,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     3,
-     "dbName"},
+     {{"foo", "a"}, {"c", "b"}, {"replicaSet", "replName"}},
+     "dbName",
+     kGlobalSSLMode},
 
     {"mongodb://user:pwd@[::1]:1234,127.0.0.2:1234/?replicaSet=replName",
      "user",
@@ -229,8 +343,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     1,
-     ""},
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
 
     {"mongodb://user@[::1]:1234,127.0.0.2:1234/?replicaSet=replName",
      "user",
@@ -238,8 +353,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     1,
-     ""},
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
 
     {"mongodb://[::1]:1234,[::1]:1234/dbName?foo=a&c=b&replicaSet=replName",
      "",
@@ -247,20 +363,37 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     3,
-     "dbName"},
+     {{"foo", "a"}, {"c", "b"}, {"replicaSet", "replName"}},
+     "dbName",
+     kGlobalSSLMode},
 
-    {"mongodb://user:pwd@[::1]", "user", "pwd", kMaster, "", 1, 0, ""},
+    {"mongodb://user:pwd@[::1]", "user", "pwd", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
-    {"mongodb://user@[::1]", "user", "", kMaster, "", 1, 0, ""},
+    {"mongodb://user@[::1]", "user", "", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
-    {"mongodb://[::1]/dbName?foo=a&c=b", "", "", kMaster, "", 1, 2, "dbName"},
+    {"mongodb://[::1]/dbName?foo=a&c=b",
+     "",
+     "",
+     kMaster,
+     "",
+     1,
+     {{"foo", "a"}, {"c", "b"}},
+     "dbName",
+     kGlobalSSLMode},
 
-    {"mongodb://user:pwd@[::1]:1234", "user", "pwd", kMaster, "", 1, 0, ""},
+    {"mongodb://user:pwd@[::1]:1234", "user", "pwd", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
-    {"mongodb://user@[::1]:1234", "user", "", kMaster, "", 1, 0, ""},
+    {"mongodb://user@[::1]:1234", "user", "", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
-    {"mongodb://[::1]:1234/dbName?foo=a&c=b", "", "", kMaster, "", 1, 2, "dbName"},
+    {"mongodb://[::1]:1234/dbName?foo=a&c=b",
+     "",
+     "",
+     kMaster,
+     "",
+     1,
+     {{"foo", "a"}, {"c", "b"}},
+     "dbName",
+     kGlobalSSLMode},
 
     {"mongodb://user:pwd@[::1],127.0.0.2/?replicaSet=replName",
      "user",
@@ -268,10 +401,19 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     1,
-     ""},
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
 
-    {"mongodb://user@[::1],127.0.0.2/?replicaSet=replName", "user", "", kSet, "replName", 2, 1, ""},
+    {"mongodb://user@[::1],127.0.0.2/?replicaSet=replName",
+     "user",
+     "",
+     kSet,
+     "replName",
+     2,
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
 
     {"mongodb://[::1],127.0.0.2/dbName?foo=a&c=b&replicaSet=replName",
      "",
@@ -279,8 +421,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     3,
-     "dbName"},
+     {{"foo", "a"}, {"c", "b"}, {"replicaSet", "replName"}},
+     "dbName",
+     kGlobalSSLMode},
 
     {"mongodb://user:pwd@[::1]:1234,127.0.0.2:1234/?replicaSet=replName",
      "user",
@@ -288,8 +431,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     1,
-     ""},
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
 
     {"mongodb://user@[::1]:1234,127.0.0.2:1234/?replicaSet=replName",
      "user",
@@ -297,8 +441,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     1,
-     ""},
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
 
     {"mongodb://[::1]:1234,[::1]:1234/dbName?foo=a&c=b&replicaSet=replName",
      "",
@@ -306,8 +451,9 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     3,
-     "dbName"},
+     {{"foo", "a"}, {"c", "b"}, {"replicaSet", "replName"}},
+     "dbName",
+     kGlobalSSLMode},
 
     {"mongodb://user:pwd@[::1]/?authMechanism=GSSAPI&authMechanismProperties=SERVICE_NAME:foobar",
      "user",
@@ -315,8 +461,9 @@ const URITestCase validCases[] = {
      kMaster,
      "",
      1,
-     2,
-     ""},
+     {{"authmechanism", "GSSAPI"}, {"authmechanismproperties", "SERVICE_NAME:foobar"}},
+     "",
+     kGlobalSSLMode},
 
     {"mongodb://user:pwd@[::1]/?authMechanism=GSSAPI&gssapiServiceName=foobar",
      "user",
@@ -324,10 +471,11 @@ const URITestCase validCases[] = {
      kMaster,
      "",
      1,
-     2,
-     ""},
+     {{"authmechanism", "GSSAPI"}, {"gssapiServiceName", "foobar"}},
+     "",
+     kGlobalSSLMode},
 
-    {"mongodb://%2Ftmp%2Fmongodb-27017.sock", "", "", kMaster, "", 1, 0, ""},
+    {"mongodb://%2Ftmp%2Fmongodb-27017.sock", "", "", kMaster, "", 1, {}, "", kGlobalSSLMode},
 
     {"mongodb://%2Ftmp%2Fmongodb-27017.sock,%2Ftmp%2Fmongodb-27018.sock/?replicaSet=replName",
      "",
@@ -335,8 +483,14 @@ const URITestCase validCases[] = {
      kSet,
      "replName",
      2,
-     1,
-     ""},
+     {{"replicaSet", "replName"}},
+     "",
+     kGlobalSSLMode},
+
+    {"mongodb://localhost/?ssl=true", "", "", kMaster, "", 1, {{"ssl", "true"}}, "", kEnableSSL},
+    {"mongodb://localhost/?ssl=false", "", "", kMaster, "", 1, {{"ssl", "false"}}, "", kDisableSSL},
+    {"mongodb://localhost/?tls=true", "", "", kMaster, "", 1, {{"tls", "true"}}, "", kEnableSSL},
+    {"mongodb://localhost/?tls=false", "", "", kMaster, "", 1, {{"tls", "false"}}, "", kDisableSSL},
 };
 
 const InvalidURITestCase invalidCases[] = {
@@ -353,6 +507,9 @@ const InvalidURITestCase invalidCases[] = {
 
     // Host list must actually be comma separated.
     {"mongodb://localhost:27017localhost:27018"},
+
+    // % symbol in password must be escaped.
+    {"mongodb://localhost:pass%word@127.0.0.1:27017", ErrorCodes::duplicateCodeForTest(51040)},
 
     // Domain sockets have to end in ".sock".
     {"mongodb://%2Fnotareal%2Fdomainsock"},
@@ -404,6 +561,10 @@ const InvalidURITestCase invalidCases[] = {
 
     // Missing an entire key-value pair
     {"mongodb://127.0.0.1:1234/dbName?foo=a&&c=b"},
+
+    // Illegal value for ssl/tls.
+    {"mongodb://127.0.0.1:1234/dbName?ssl=blah", ErrorCodes::duplicateCodeForTest(51041)},
+    {"mongodb://127.0.0.1:1234/dbName?tls=blah", ErrorCodes::duplicateCodeForTest(51041)},
 };
 
 // Helper Method to take a filename for a json file and return the array of tests inside of it
@@ -444,7 +605,7 @@ void testValidURIFormat(URITestCase testCase) {
     ASSERT_EQ(testCase.type, result.type());
     ASSERT_EQ(testCase.setname, result.getSetName());
     ASSERT_EQ(testCase.numservers, result.getServers().size());
-    ASSERT_EQ(testCase.numOptions, result.getOptions().size());
+    compareOptions(0, testCase.URI, result.getOptions(), testCase.options);
     ASSERT_EQ(testCase.database, result.getDatabase());
 }
 
@@ -465,6 +626,9 @@ TEST(MongoURI, InvalidURIs) {
         unittest::log() << "Testing URI: " << testCase.URI << '\n';
         auto cs_status = MongoURI::parse(testCase.URI);
         ASSERT_NOT_OK(cs_status);
+        if (testCase.code) {
+            ASSERT_EQUALS(*testCase.code, cs_status.getStatus());
+        }
     }
 }
 
@@ -540,7 +704,7 @@ TEST(MongoURI, specTests) {
 
             if (!valid) {
                 // This uri string is invalid --> parse the uri and ensure it fails
-                const InvalidURITestCase testCase = {uri};
+                const InvalidURITestCase testCase = InvalidURITestCase{uri};
                 unittest::log() << "Testing URI: " << testCase.URI << '\n';
                 auto cs_status = MongoURI::parse(testCase.URI);
                 ASSERT_NOT_OK(cs_status);
@@ -572,6 +736,7 @@ TEST(MongoURI, specTests) {
                 std::string setName;
                 const auto optionsElement = test.getField("options");
                 ASSERT_FALSE(optionsElement.eoo());
+                MongoURI::OptionsMap options;
                 if (optionsElement.type() != jstNULL) {
                     ASSERT_EQ(optionsElement.type(), Object);
                     const auto optionsObj = optionsElement.Obj();
@@ -582,17 +747,21 @@ TEST(MongoURI, specTests) {
                         setName = replsetElement.String();
                         connectionType = kSet;
                     }
+
+                    for (auto&& field : optionsElement.Obj()) {
+                        if (field.type() == String) {
+                            options[field.fieldNameStringData()] = field.String();
+                        } else if (field.isNumber()) {
+                            options[field.fieldNameStringData()] = std::to_string(field.Int());
+                        } else {
+                            MONGO_UNREACHABLE;
+                        }
+                    }
                 }
 
                 // Create the URITestCase abnd
-                const URITestCase testCase = {uri,
-                                              username,
-                                              password,
-                                              connectionType,
-                                              setName,
-                                              numHosts,
-                                              numOptions,
-                                              database};
+                const URITestCase testCase = {
+                    uri, username, password, connectionType, setName, numHosts, options, database};
                 testValidURIFormat(testCase);
             }
         }
@@ -608,7 +777,7 @@ TEST(MongoURI, srvRecordTest) {
         std::string password;
         std::string database;
         std::vector<HostAndPort> hosts;
-        std::map<std::string, std::string> options;
+        std::map<MongoURI::CaseInsensitiveString, std::string> options;
         Expectation expectation;
     } tests[] = {
         // Test some non-SRV URIs to make sure that they do not perform expansions
@@ -833,27 +1002,7 @@ TEST(MongoURI, srvRecordTest) {
                                                    << " data on line : " << test.lineNumber;
         ASSERT_EQ(rv.getDatabase(), test.database) << "Failed on URI: " << test.uri
                                                    << " data on line : " << test.lineNumber;
-        std::vector<std::pair<std::string, std::string>> options(begin(rv.getOptions()),
-                                                                 end(rv.getOptions()));
-        std::sort(begin(options), end(options));
-        std::vector<std::pair<std::string, std::string>> expectedOptions(begin(test.options),
-                                                                         end(test.options));
-        std::sort(begin(expectedOptions), end(expectedOptions));
-
-        for (std::size_t i = 0; i < std::min(options.size(), expectedOptions.size()); ++i) {
-            if (options[i] != expectedOptions[i]) {
-                unittest::log() << "Option: \"" << options[i].first << "=" << options[i].second
-                                << "\" doesn't equal: \"" << expectedOptions[i].first << "="
-                                << expectedOptions[i].second << "\""
-                                << " data on line: " << test.lineNumber << std::endl;
-                std::cerr << "Failing URI: \"" << test.uri << "\""
-                          << " data on line: " << test.lineNumber << std::endl;
-                ASSERT(false);
-            }
-        }
-        ASSERT_EQ(options.size(), expectedOptions.size()) << "Failing URI: "
-                                                          << " data on line: " << test.lineNumber
-                                                          << test.uri;
+        compareOptions(test.lineNumber, test.uri, rv.getOptions(), test.options);
 
         std::vector<HostAndPort> hosts(begin(rv.getServers()), end(rv.getServers()));
         std::sort(begin(hosts), end(hosts));

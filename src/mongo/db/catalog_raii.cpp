@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -53,10 +55,13 @@ void uassertLockTimeout(std::string resourceName, LockMode lockMode, bool isLock
 AutoGetDb::AutoGetDb(OperationContext* opCtx, StringData dbName, LockMode mode, Date_t deadline)
     : _dbLock(opCtx, dbName, mode, deadline), _db([&] {
           uassertLockTimeout(str::stream() << "database " << dbName, mode, _dbLock.isLocked());
-          return DatabaseHolder::getDatabaseHolder().get(opCtx, dbName);
+          auto databaseHolder = DatabaseHolder::get(opCtx);
+          return databaseHolder->getDb(opCtx, dbName);
       }()) {
     if (_db) {
-        DatabaseShardingState::get(_db).checkDbVersion(opCtx);
+        auto& dss = DatabaseShardingState::get(_db);
+        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+        dss.checkDbVersion(opCtx, dssLock);
     }
 }
 
@@ -66,19 +71,11 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
                                      LockMode modeColl,
                                      ViewMode viewMode,
                                      Date_t deadline)
-    :  // The UUID to NamespaceString resolution is performed outside of any locks
-      _resolvedNss(resolveNamespaceStringOrUUID(opCtx, nsOrUUID)),
-      // The database locking is performed based on the resolved NamespaceString
-      _autoDb(opCtx, _resolvedNss.db(), modeDB, deadline) {
-    // In order to account for possible collection rename happening because the resolution from UUID
-    // to NamespaceString was done outside of database lock, if UUID was specified we need to
-    // re-resolve the _resolvedNss after acquiring the database lock so it has the correct value.
-    //
-    // Holding a database lock prevents collection renames, so this guarantees a stable UUID to
-    // NamespaceString mapping.
-    if (nsOrUUID.uuid())
-        _resolvedNss = resolveNamespaceStringOrUUID(opCtx, nsOrUUID);
-
+    : _autoDb(opCtx,
+              !nsOrUUID.dbname().empty() ? nsOrUUID.dbname() : nsOrUUID.nss()->db(),
+              modeDB,
+              deadline),
+      _resolvedNss(resolveNamespaceStringOrUUID(opCtx, nsOrUUID)) {
     _collLock.emplace(opCtx->lockState(), _resolvedNss.ns(), modeColl, deadline);
     uassertLockTimeout(
         str::stream() << "collection " << nsOrUUID.toString(), modeColl, _collLock->isLocked());
@@ -110,18 +107,20 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
         // pending catalog changes. Instead, we must return an error in such situations. We ignore
         // this restriction for the oplog, since it never has pending catalog changes.
         auto readConcernLevel = repl::ReadConcernArgs::get(opCtx).getLevel();
-        auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
-        if (readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern && mySnapshot &&
+        if (readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern &&
             _resolvedNss != NamespaceString::kRsOplogNamespace) {
-            auto minSnapshot = _coll->getMinimumVisibleSnapshot();
-            uassert(
-                ErrorCodes::SnapshotUnavailable,
-                str::stream() << "Unable to read from a snapshot due to pending collection catalog "
-                                 "changes; please retry the operation. Snapshot timestamp is "
-                              << mySnapshot->toString()
-                              << ". Collection minimum is "
-                              << minSnapshot->toString(),
-                !minSnapshot || *mySnapshot >= *minSnapshot);
+            auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+            if (mySnapshot) {
+                auto minSnapshot = _coll->getMinimumVisibleSnapshot();
+                uassert(ErrorCodes::SnapshotUnavailable,
+                        str::stream()
+                            << "Unable to read from a snapshot due to pending collection catalog "
+                               "changes; please retry the operation. Snapshot timestamp is "
+                            << mySnapshot->toString()
+                            << ". Collection minimum is "
+                            << minSnapshot->toString(),
+                        !minSnapshot || *mySnapshot >= *minSnapshot);
+            }
         }
 
         // If the collection exists, there is no need to check for views.
@@ -170,10 +169,13 @@ AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* opCtx,
             _autoDb.emplace(opCtx, dbName, MODE_X, deadline);
         }
 
-        _db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbName, &_justCreated);
+        auto databaseHolder = DatabaseHolder::get(opCtx);
+        _db = databaseHolder->openDb(opCtx, dbName, &_justCreated);
     }
 
-    DatabaseShardingState::get(_db).checkDbVersion(opCtx);
+    auto& dss = DatabaseShardingState::get(_db);
+    auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+    dss.checkDbVersion(opCtx, dssLock);
 }
 
 ConcealUUIDCatalogChangesBlock::ConcealUUIDCatalogChangesBlock(OperationContext* opCtx)

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,6 +39,8 @@
 #include <algorithm>
 
 #include "mongo/base/status.h"
+#include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
+#include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
@@ -46,7 +50,6 @@
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_process.h"
-#include "mongo/db/repl/replication_state_transition_lock_guard.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/service_context.h"
@@ -178,7 +181,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
 
             // Arbiters are the only nodes allowed to advance their commit point via heartbeats.
             if (_getMemberState_inlock().arbiter()) {
-                _advanceCommitPoint_inlock(lastOpCommitted);
+                _advanceCommitPoint(lk, lastOpCommitted);
             }
             // Asynchronous stepdown could happen, but it will wait for _mutex and execute
             // after this function, so we cannot and don't need to wait for it to finish.
@@ -215,7 +218,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         hbStatusResponse.getValue().hasState() &&
         hbStatusResponse.getValue().getState() != MemberState::RS_PRIMARY &&
         action.getAdvancedOpTime()) {
-        _updateLastCommittedOpTime_inlock();
+        _updateLastCommittedOpTime(lk);
     }
 
     // Abort catchup if we have caught up to the latest known optime after heartbeat refreshing.
@@ -249,7 +252,7 @@ stdx::unique_lock<stdx::mutex> ReplicationCoordinatorImpl::_handleHeartbeatRespo
             // Update the cached member state if different than the current topology member state
             if (_memberState != _topCoord->getMemberState()) {
                 const PostMemberStateUpdateAction postUpdateAction =
-                    _updateMemberStateFromTopologyCoordinator_inlock(nullptr);
+                    _updateMemberStateFromTopologyCoordinator(lock, nullptr);
                 lock.unlock();
                 _performPostMemberStateUpdateAction(postUpdateAction);
                 lock.lock();
@@ -379,16 +382,28 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
     }
 
     auto opCtx = cc().makeOperationContext();
-    ReplicationStateTransitionLockGuard::Args transitionArgs;
-    // Kill all user operations to help us get the global lock faster, as well as to ensure that
-    // operations that are no longer safe to run (like writes) get killed.
-    transitionArgs.killUserOperations = true;
-    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get(), transitionArgs);
+
+    ReplicationStateTransitionLockGuard rstlLock(
+        opCtx.get(), ReplicationStateTransitionLockGuard::EnqueueOnly());
+
+    // kill all write operations which are no longer safe to run on step down. Also, operations that
+    // have taken global lock in S mode will be killed to avoid 3-way deadlock between read,
+    // prepared transaction and step down thread.
+    KillOpContainer koc(this, opCtx.get());
+    koc.startKillOpThread();
+
+    {
+        auto rstlOnErrorGuard = makeGuard([&koc] { koc.stopAndWaitForKillOpThread(); });
+        rstlLock.waitForLockUntil(Date_t::max());
+    }
+
+    // Yield locks for prepared transactions.
+    yieldLocksForPreparedTransactions(opCtx.get());
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     _topCoord->finishUnconditionalStepDown();
-    const auto action = _updateMemberStateFromTopologyCoordinator_inlock(opCtx.get());
+    const auto action = _updateMemberStateFromTopologyCoordinator(lk, opCtx.get());
     if (_pendingTermUpdateDuringStepDown) {
         TopologyCoordinator::UpdateTermResult result;
         _updateTerm_inlock(*_pendingTermUpdateDuringStepDown, &result);
@@ -556,14 +571,14 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
     }
 
     auto opCtx = cc().makeOperationContext();
-    boost::optional<Lock::GlobalWrite> globalExclusiveLock;
+    boost::optional<ReplicationStateTransitionLockGuard> transitionGuard;
     stdx::unique_lock<stdx::mutex> lk{_mutex};
     if (_memberState.primary()) {
-        // If we are primary, we need the global lock in MODE_X to step down. If we somehow
-        // transition out of primary while waiting for the global lock, there's no harm in holding
+        // If we are primary, we need the RSTL in mode X to step down. If we somehow
+        // transition out of primary while waiting for the RSTL, there's no harm in holding
         // it.
         lk.unlock();
-        globalExclusiveLock.emplace(opCtx.get());
+        transitionGuard.emplace(opCtx.get());
         lk.lock();
     }
 
@@ -592,7 +607,7 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
                 log() << "Cannot find self in new replica set configuration; I must be removed; "
                       << myIndex.getStatus();
                 break;
-            case ErrorCodes::DuplicateKey:
+            case ErrorCodes::InvalidReplicaSetConfig:
                 error() << "Several entries in new config represent this node; "
                            "Removing self until an acceptable configuration arrives; "
                         << myIndex.getStatus();
@@ -610,7 +625,7 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
     // the data structures inside of the TopologyCoordinator.
     const int myIndexValue = myIndex.getStatus().isOK() ? myIndex.getValue() : -1;
     const PostMemberStateUpdateAction action =
-        _setCurrentRSConfig_inlock(opCtx.get(), newConfig, myIndexValue);
+        _setCurrentRSConfig(lk, opCtx.get(), newConfig, myIndexValue);
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
 }

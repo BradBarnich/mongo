@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -173,10 +173,10 @@ static int
 json_strdup(WT_SESSION *session, JSON_INPUT_STATE *ins, char **resultp)
 {
 	WT_DECL_RET;
+	size_t srclen;
+	ssize_t resultlen;
 	char *result, *resultcpy;
 	const char *src;
-	ssize_t resultlen;
-	size_t srclen;
 
 	result = NULL;
 	src = ins->tokstart + 1;  /*strip "" from token */

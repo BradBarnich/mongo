@@ -1,5 +1,5 @@
 // Test parsing of readConcern level 'snapshot' on mongos.
-// @tags: [requires_replication,requires_sharding, uses_transactions, uses_single_shard_transaction]
+// @tags: [requires_replication,requires_sharding, uses_transactions]
 (function() {
     "use strict";
 
@@ -8,7 +8,7 @@
     function expectSuccessInTxnThenAbort(session, sessionConn, cmdObj) {
         session.startTransaction();
         assert.commandWorked(sessionConn.runCommand(cmdObj));
-        session.abortTransaction();
+        session.abortTransaction_forTesting();
     }
 
     // Runs the command as the first in a multi statement txn that is aborted right after, expecting
@@ -16,7 +16,7 @@
     function expectFailInTxnThenAbort(session, sessionConn, expectedErrorCode, cmdObj) {
         session.startTransaction();
         assert.commandFailedWithCode(sessionConn.runCommand(cmdObj), expectedErrorCode);
-        session.abortTransaction();
+        session.abortTransaction_forTesting();
     }
 
     const dbName = "test";

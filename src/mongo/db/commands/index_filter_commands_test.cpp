@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -426,13 +428,12 @@ TEST(IndexFilterCommandsTest, SetAndClearFiltersCollation) {
 
     // Create a plan cache. Add an index so that indexability is included in the plan cache keys.
     PlanCache planCache;
-    planCache.notifyOfIndexEntries({IndexEntry(fromjson("{a: 1}"),
-                                               false,
-                                               false,
-                                               false,
-                                               IndexEntry::Identifier{"index_name"},
-                                               NULL,
-                                               BSONObj())});
+    const auto keyPattern = fromjson("{a: 1}");
+    planCache.notifyOfIndexUpdates(
+        {CoreIndexInfo(keyPattern,
+                       IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                       true,                                     // sparse
+                       IndexEntry::Identifier{"index_name"})});  // name
 
     // Inject query shapes with and without collation into plan cache.
     addQueryShapeToPlanCache(
@@ -457,7 +458,8 @@ TEST(IndexFilterCommandsTest, SetAndClearFiltersCollation) {
     ASSERT_EQUALS(StringData(filters[0].getObjectField("collation").getStringField("locale")),
                   "mock_reverse_string");
 
-    // Plan cache should only contain entry for query without collation.
+    // Setting a filter will remove the cache entry associated with the query so now the plan cache
+    // should only contain the entry for the query without collation.
     ASSERT_FALSE(planCacheContains(
         opCtx.get(), planCache, "{a: 'foo'}", "{}", "{}", "{locale: 'mock_reverse_string'}"));
     ASSERT_TRUE(planCacheContains(opCtx.get(), planCache, "{a: 'foo'}", "{}", "{}", "{}"));
@@ -499,27 +501,23 @@ TEST(IndexFilterCommandsTest, SetAndClearFiltersCollation) {
 
 TEST(IndexFilterCommandsTest, SetFilterAcceptsIndexNames) {
     CollatorInterfaceMock reverseCollator(CollatorInterfaceMock::MockType::kReverseString);
-    IndexEntry collatedIndex(fromjson("{a: 1}"),
-                             false,
-                             false,
-                             false,
-                             IndexEntry::Identifier{"a_1:rev"},
-                             nullptr,
-                             BSONObj());
+    PlanCache planCache;
+    const auto keyPattern = fromjson("{a: 1}");
+    CoreIndexInfo collatedIndex(keyPattern,
+                                IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                                false,                               // sparse
+                                IndexEntry::Identifier{"a_1:rev"});  // name
     collatedIndex.collator = &reverseCollator;
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
     QuerySettings querySettings;
 
-    PlanCache planCache;
-    planCache.notifyOfIndexEntries({IndexEntry(fromjson("{a: 1}"),
-                                               false,
-                                               false,
-                                               false,
-                                               IndexEntry::Identifier{"a_1"},
-                                               nullptr,
-                                               BSONObj()),
-                                    collatedIndex});
+    planCache.notifyOfIndexUpdates(
+        {CoreIndexInfo(keyPattern,
+                       IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                       false,                           // sparse
+                       IndexEntry::Identifier{"a_1"}),  // name
+         collatedIndex});
 
     addQueryShapeToPlanCache(opCtx.get(), &planCache, "{a: 2}", "{}", "{}", "{}");
     ASSERT_TRUE(planCacheContains(opCtx.get(), planCache, "{a: 2}", "{}", "{}", "{}"));

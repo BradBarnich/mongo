@@ -1,44 +1,81 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/query/find_common.h"
+#include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/s/query/blocking_results_merger.h"
 
 namespace mongo {
 
 BlockingResultsMerger::BlockingResultsMerger(OperationContext* opCtx,
                                              AsyncResultsMergerParams&& armParams,
-                                             executor::TaskExecutor* executor)
+                                             executor::TaskExecutor* executor,
+                                             std::unique_ptr<ResourceYielder> resourceYielder)
     : _tailableMode(armParams.getTailableMode().value_or(TailableModeEnum::kNormal)),
       _executor(executor),
-      _arm(opCtx, executor, std::move(armParams)) {}
+      _arm(opCtx, executor, std::move(armParams)),
+      _resourceYielder(std::move(resourceYielder)) {}
+
+StatusWith<stdx::cv_status> BlockingResultsMerger::doWaiting(
+    OperationContext* opCtx, const std::function<StatusWith<stdx::cv_status>()>& waitFn) noexcept {
+
+    if (_resourceYielder) {
+        try {
+            // The BRM interface returns Statuses. Be sure we respect that here.
+            _resourceYielder->yield(opCtx);
+        } catch (const DBException& e) {
+            return e.toStatus();
+        }
+    }
+
+    boost::optional<StatusWith<stdx::cv_status>> result;
+    try {
+        // This shouldn't throw, but we cannot enforce that.
+        result = waitFn();
+    } catch (const DBException&) {
+        MONGO_UNREACHABLE;
+    }
+
+    if (_resourceYielder) {
+        try {
+            _resourceYielder->unyield(opCtx);
+        } catch (const DBException& e) {
+            return e.toStatus();
+        }
+    }
+
+    return *result;
+}
 
 StatusWith<ClusterQueryResult> BlockingResultsMerger::awaitNextWithTimeout(
     OperationContext* opCtx, RouterExecStage::ExecContext execCtx) {
@@ -52,9 +89,10 @@ StatusWith<ClusterQueryResult> BlockingResultsMerger::awaitNextWithTimeout(
         }
         auto event = nextEventStatus.getValue();
 
-        // Block until there are further results to return, or our time limit is exceeded.
-        auto waitStatus =
-            _executor->waitForEvent(opCtx, event, awaitDataState(opCtx).waitForInsertsDeadline);
+        const auto waitStatus = doWaiting(opCtx, [this, opCtx, &event]() {
+            return _executor->waitForEvent(
+                opCtx, event, awaitDataState(opCtx).waitForInsertsDeadline);
+        });
 
         if (!waitStatus.isOK()) {
             return waitStatus.getStatus();
@@ -82,7 +120,8 @@ StatusWith<ClusterQueryResult> BlockingResultsMerger::blockUntilNext(OperationCo
         auto event = nextEventStatus.getValue();
 
         // Block until there are further results to return.
-        auto status = _executor->waitForEvent(opCtx, event);
+        auto status = doWaiting(
+            opCtx, [this, opCtx, &event]() { return _executor->waitForEvent(opCtx, event); });
 
         if (!status.isOK()) {
             return status.getStatus();

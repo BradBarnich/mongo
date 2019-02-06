@@ -1,32 +1,33 @@
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -34,14 +35,21 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForAbortAfterExecutingAbortLogic);
+MONGO_FAIL_POINT_DEFINE(participantReturnNetworkErrorForCommitAfterExecutingCommitLogic);
+MONGO_FAIL_POINT_DEFINE(hangBeforeCommitingTxn);
+MONGO_FAIL_POINT_DEFINE(hangBeforeAbortingTxn);
 
 class CmdCommitTxn : public BasicCommand {
 public:
@@ -81,6 +89,9 @@ public:
                 "commitTransaction must be run within a transaction",
                 txnParticipant);
 
+        LOG(3) << "Received commitTransaction for transaction with txnNumber "
+               << opCtx->getTxnNumber() << " on session " << opCtx->getLogicalSessionId()->toBSON();
+
         // commitTransaction is retryable.
         if (txnParticipant->transactionIsCommitted()) {
             // We set the client last op to the last optime observed by the system to ensure that
@@ -88,6 +99,11 @@ public:
             // commit oplog entry.
             auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
             replClient.setLastOpToSystemLastOpTime(opCtx);
+            if (MONGO_FAIL_POINT(participantReturnNetworkErrorForCommitAfterExecutingCommitLogic)) {
+                uasserted(ErrorCodes::HostUnreachable,
+                          "returning network error because failpoint is on");
+            }
+
             return true;
         }
 
@@ -95,13 +111,20 @@ public:
                 "Transaction isn't in progress",
                 txnParticipant->inMultiDocumentTransaction());
 
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &hangBeforeCommitingTxn, opCtx, "hangBeforeCommitingTxn");
+
         auto optionalCommitTimestamp = cmd.getCommitTimestamp();
         if (optionalCommitTimestamp) {
             // commitPreparedTransaction will throw if the transaction is not prepared.
-            txnParticipant->commitPreparedTransaction(opCtx, optionalCommitTimestamp.get());
+            txnParticipant->commitPreparedTransaction(opCtx, optionalCommitTimestamp.get(), {});
         } else {
             // commitUnpreparedTransaction will throw if the transaction is prepared.
             txnParticipant->commitUnpreparedTransaction(opCtx);
+        }
+        if (MONGO_FAIL_POINT(participantReturnNetworkErrorForCommitAfterExecutingCommitLogic)) {
+            uasserted(ErrorCodes::HostUnreachable,
+                      "returning network error because failpoint is on");
         }
 
         return true;
@@ -144,25 +167,23 @@ public:
                 "abortTransaction must be run within a transaction",
                 txnParticipant);
 
+        LOG(3) << "Received abortTransaction for transaction with txnNumber "
+               << opCtx->getTxnNumber() << " on session " << opCtx->getLogicalSessionId()->toBSON();
+
         uassert(ErrorCodes::NoSuchTransaction,
                 "Transaction isn't in progress",
                 txnParticipant->inMultiDocumentTransaction());
 
-        auto wasPrepared = txnParticipant->transactionIsPrepared();
-        try {
-            txnParticipant->abortActiveTransaction(opCtx);
-        } catch (...) {
-            // Make sure that abort succeeds if we are prepared. We check if we're prepared before
-            // aborting because the state may have changed while attempting to abort.
-            invariant(!wasPrepared,
-                      str::stream() << "Caught exception during transaction "
-                                    << opCtx->getTxnNumber()
-                                    << " abort on "
-                                    << opCtx->getLogicalSessionId()
-                                    << ": "
-                                    << exceptionToStatus());
-            throw;
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &hangBeforeAbortingTxn, opCtx, "hangBeforeAbortingTxn");
+
+        txnParticipant->abortActiveTransaction(opCtx);
+
+        if (MONGO_FAIL_POINT(participantReturnNetworkErrorForAbortAfterExecutingAbortLogic)) {
+            uasserted(ErrorCodes::HostUnreachable,
+                      "returning network error because failpoint is on");
         }
+
         return true;
     }
 

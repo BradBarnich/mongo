@@ -1,25 +1,27 @@
 // expression_parser.cpp
 
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -66,7 +68,7 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
 #include "mongo/db/matcher/schema/json_schema_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/string_map.h"
@@ -99,9 +101,6 @@ constexpr StringData AlwaysTrueMatchExpression::kName;
 constexpr StringData OrMatchExpression::kName;
 constexpr StringData AndMatchExpression::kName;
 constexpr StringData NorMatchExpression::kName;
-
-const double MatchExpressionParser::kLongLongMaxPlusOneAsDouble =
-    scalbn(1, std::numeric_limits<long long>::digits);
 
 /**
  * 'DocumentParseLevel' refers to the current position of the parser as it descends a
@@ -153,7 +152,7 @@ StatusWith<long long> MatchExpressionParser::parseIntegerElementToLong(BSONEleme
         // No integral doubles that are too large to be represented as a 64 bit signed integer.
         // We use 'kLongLongMaxAsDouble' because if we just did eDouble > 2^63-1, it would be
         // compared against 2^63. eDouble=2^63 would not get caught that way.
-        if (eDouble >= MatchExpressionParser::kLongLongMaxPlusOneAsDouble ||
+        if (eDouble >= BSONElement::kLongLongMaxPlusOneAsDouble ||
             eDouble < std::numeric_limits<long long>::min()) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "Cannot represent as a 64-bit integer: " << elem);
@@ -1373,13 +1372,34 @@ StatusWithMatchExpression parseNot(StringData name,
         return parseStatus;
     }
 
-    for (size_t i = 0; i < theAnd->numChildren(); i++) {
-        if (theAnd->getChild(i)->matchType() == MatchExpression::REGEX) {
-            return {ErrorCodes::BadValue, "$not cannot have a regex"};
-        }
+    return {stdx::make_unique<NotMatchExpression>(theAnd.release())};
+}
+
+StatusWithMatchExpression parseInternalSchemaBinDataSubType(StringData name, BSONElement e) {
+    if (!e.isNumber()) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << InternalSchemaBinDataSubTypeExpression::kName
+                                    << " must be represented as a number");
     }
 
-    return {stdx::make_unique<NotMatchExpression>(theAnd.release())};
+    auto valueAsInt = MatchExpressionParser::parseIntegerElementToInt(e);
+    if (!valueAsInt.isOK()) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Invalid numerical BinData subtype value for "
+                                    << InternalSchemaBinDataSubTypeExpression::kName
+                                    << ": "
+                                    << e.number());
+    }
+
+    if (!isValidBinDataType(valueAsInt.getValue())) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << InternalSchemaBinDataSubTypeExpression::kName
+                                    << " value must represent BinData subtype: "
+                                    << valueAsInt.getValue());
+    }
+
+    return {stdx::make_unique<InternalSchemaBinDataSubTypeExpression>(
+        name, static_cast<BinDataType>(valueAsInt.getValue()))};
 }
 
 /**
@@ -1709,6 +1729,10 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
         case PathAcceptingKeyword::INTERNAL_SCHEMA_EQ: {
             return {stdx::make_unique<InternalSchemaEqMatchExpression>(name, e)};
         }
+
+        case PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_SUBTYPE: {
+            return parseInternalSchemaBinDataSubType(name, e);
+        }
     }
 
     return {
@@ -1846,6 +1870,8 @@ MONGO_INITIALIZER(MatchExpressionParser)(InitializerContext* context) {
             {"_internalExprEq", PathAcceptingKeyword::INTERNAL_EXPR_EQ},
             {"_internalSchemaAllElemMatchFromIndex",
              PathAcceptingKeyword::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX},
+            {"_internalSchemaBinDataSubType",
+             PathAcceptingKeyword::INTERNAL_SCHEMA_BIN_DATA_SUBTYPE},
             {"_internalSchemaEq", PathAcceptingKeyword::INTERNAL_SCHEMA_EQ},
             {"_internalSchemaFmod", PathAcceptingKeyword::INTERNAL_SCHEMA_FMOD},
             {"_internalSchemaMatchArrayIndex",

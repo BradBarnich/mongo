@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -142,14 +144,14 @@ class InitialSyncer {
 
 public:
     /**
-     * Callback function to report last applied optime (with hash) of initial sync.
+     * Callback function to report last applied optime of initial sync.
      */
-    typedef stdx::function<void(const StatusWith<OpTimeWithHash>& lastApplied)> OnCompletionFn;
+    typedef stdx::function<void(const StatusWith<OpTime>& lastApplied)> OnCompletionFn;
 
     /**
      * Callback completion guard for initial syncer.
      */
-    using OnCompletionGuard = CallbackCompletionGuard<StatusWith<OpTimeWithHash>>;
+    using OnCompletionGuard = CallbackCompletionGuard<StatusWith<OpTime>>;
 
     using StartCollectionClonerFn = DatabaseCloner::StartCollectionClonerFn;
 
@@ -220,7 +222,7 @@ public:
      *
      * For testing only.
      */
-    void setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
+    void setScheduleDbWorkFn_forTest(const DatabaseCloner::ScheduleDbWorkFn& scheduleDbWorkFn);
 
     /**
      * Overrides how executor starts a collection cloner.
@@ -358,7 +360,7 @@ private:
     /**
      * Tears down internal state before reporting final status to caller.
      */
-    void _tearDown_inlock(OperationContext* opCtx, const StatusWith<OpTimeWithHash>& lastApplied);
+    void _tearDown_inlock(OperationContext* opCtx, const StatusWith<OpTime>& lastApplied);
 
     /**
      * Callback to start a single initial sync attempt.
@@ -408,7 +410,7 @@ private:
      */
     void _fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>& result,
                              std::shared_ptr<OnCompletionGuard> onCompletionGuard,
-                             const OpTimeWithHash& lastOpTimeWithHash);
+                             const OpTime& lastOpTime);
 
     /**
      * Callback for oplog fetcher.
@@ -441,7 +443,7 @@ private:
      * Callback for MultiApplier completion.
      */
     void _multiApplierCallback(const Status& status,
-                               OpTimeWithHash lastApplied,
+                               OpTime lastApplied,
                                std::uint32_t numApplied,
                                std::shared_ptr<OnCompletionGuard> onCompletionGuard);
 
@@ -467,12 +469,12 @@ private:
      * Reports result of current initial sync attempt. May schedule another initial sync attempt
      * depending on shutdown state and whether we've exhausted all initial sync retries.
      */
-    void _finishInitialSyncAttempt(const StatusWith<OpTimeWithHash>& lastApplied);
+    void _finishInitialSyncAttempt(const StatusWith<OpTime>& lastApplied);
 
     /**
      * Invokes completion callback and transitions state to State::kComplete.
      */
-    void _finishCallback(StatusWith<OpTimeWithHash> lastApplied);
+    void _finishCallback(StatusWith<OpTime> lastApplied);
 
     // Obtains a valid sync source from the sync source selector.
     // Returns error if a sync source cannot be found.
@@ -538,11 +540,11 @@ private:
      * Saves handle if work was successfully scheduled.
      * Returns scheduleWork status (without the handle).
      */
-    Status _scheduleWorkAndSaveHandle_inlock(const executor::TaskExecutor::CallbackFn& work,
+    Status _scheduleWorkAndSaveHandle_inlock(executor::TaskExecutor::CallbackFn work,
                                              executor::TaskExecutor::CallbackHandle* handle,
                                              const std::string& name);
     Status _scheduleWorkAtAndSaveHandle_inlock(Date_t when,
-                                               const executor::TaskExecutor::CallbackFn& work,
+                                               executor::TaskExecutor::CallbackFn work,
                                                executor::TaskExecutor::CallbackHandle* handle,
                                                const std::string& name);
 
@@ -566,7 +568,7 @@ private:
     void _shutdownComponent_inlock(Component& component);
 
     // Counts how many documents have been refetched from the source in the current batch.
-    AtomicUInt32 _fetchCount;
+    AtomicWord<unsigned> _fetchCount;
 
     //
     // All member variables are labeled with one of the following codes indicating the
@@ -588,8 +590,8 @@ private:
     ReplicationProcess* _replicationProcess;                                    // (S)
 
     // This is invoked with the final status of the initial sync. If startup() fails, this callback
-    // is never invoked. The caller gets the last applied optime with hash when the initial sync
-    // completes successfully or an error status.
+    // is never invoked. The caller gets the last applied optime when the initial sync completes
+    // successfully or an error status.
     // '_onCompletion' is cleared on completion (in _finishCallback()) in order to release any
     // resources that might be held by the callback function object.
     OnCompletionFn _onCompletion;  // (M)
@@ -618,8 +620,8 @@ private:
     std::unique_ptr<Fetcher> _fCVFetcher;                 // (S)
     std::unique_ptr<MultiApplier> _applier;               // (M)
     HostAndPort _syncSource;                              // (M)
-    OpTimeWithHash _lastFetched;                          // (MX)
-    OpTimeWithHash _lastApplied;                          // (MX)
+    OpTime _lastFetched;                                  // (MX)
+    OpTime _lastApplied;                                  // (MX)
     std::unique_ptr<OplogBuffer> _oplogBuffer;            // (M)
     std::unique_ptr<OplogApplier::Observer> _observer;    // (S)
     std::unique_ptr<OplogApplier> _oplogApplier;          // (M)
@@ -631,8 +633,8 @@ private:
     State _state = State::kPreStart;  // (M)
 
     // Passed to CollectionCloner via DatabasesCloner.
-    CollectionCloner::ScheduleDbWorkFn _scheduleDbWorkFn;  // (M)
-    StartCollectionClonerFn _startCollectionClonerFn;      // (M)
+    DatabaseCloner::ScheduleDbWorkFn _scheduleDbWorkFn;  // (M)
+    StartCollectionClonerFn _startCollectionClonerFn;    // (M)
 
     // Contains stats on the current initial sync request (includes all attempts).
     // To access these stats in a user-readable format, use getInitialSyncProgress().

@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -50,7 +50,7 @@ struct __wt_config_parser_impl {
 		"", 0, 0, WT_CONFIG_ITEM_NUM				\
 	}
 
-#define	WT_CONFIG_UNSET	-1
+#define	WT_CONFIG_UNSET	(-1)
 /*
  * DO NOT EDIT: automatically built by dist/api_config.py.
  * configuration section: BEGIN

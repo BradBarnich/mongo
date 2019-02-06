@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -60,6 +62,12 @@ ReplicationCoordinatorMock::ReplicationCoordinatorMock(ServiceContext* service,
                                                        const ReplSettings& settings)
     : _service(service), _settings(settings) {}
 
+ReplicationCoordinatorMock::ReplicationCoordinatorMock(ServiceContext* service,
+                                                       StorageInterface* storage)
+    : ReplicationCoordinatorMock(service, createReplSettingsForSingleNodeReplSet()) {
+    _storage = storage;
+}
+
 ReplicationCoordinatorMock::ReplicationCoordinatorMock(ServiceContext* service)
     : ReplicationCoordinatorMock(service, createReplSettingsForSingleNodeReplSet()) {}
 
@@ -98,7 +106,11 @@ Status ReplicationCoordinatorMock::waitForMemberState(MemberState expectedState,
     return Status::OK();
 }
 
-bool ReplicationCoordinatorMock::isInPrimaryOrSecondaryState() const {
+bool ReplicationCoordinatorMock::isInPrimaryOrSecondaryState(OperationContext* opCtx) const {
+    return isInPrimaryOrSecondaryState_UNSAFE();
+}
+
+bool ReplicationCoordinatorMock::isInPrimaryOrSecondaryState_UNSAFE() const {
     return _memberState.primary() || _memberState.secondary();
 }
 
@@ -221,6 +233,10 @@ Status ReplicationCoordinatorMock::waitUntilOpTimeForReadUntil(OperationContext*
     return Status::OK();
 }
 
+Status ReplicationCoordinatorMock::awaitOpTimeCommitted(OperationContext* opCtx, OpTime opTime) {
+    return Status::OK();
+}
+
 OID ReplicationCoordinatorMock::getElectionId() {
     // TODO
     return OID();
@@ -234,9 +250,18 @@ int ReplicationCoordinatorMock::getMyId() const {
     return 0;
 }
 
+HostAndPort ReplicationCoordinatorMock::getMyHostAndPort() const {
+    return HostAndPort();
+}
+
 Status ReplicationCoordinatorMock::setFollowerMode(const MemberState& newState) {
     _memberState = newState;
     return Status::OK();
+}
+
+Status ReplicationCoordinatorMock::setFollowerModeStrict(OperationContext* opCtx,
+                                                         const MemberState& newState) {
+    return setFollowerMode(newState);
 }
 
 ReplicationCoordinator::ApplierState ReplicationCoordinatorMock::getApplierState() {
@@ -355,6 +380,17 @@ Status ReplicationCoordinatorMock::checkIfWriteConcernCanBeSatisfied(
     return Status::OK();
 }
 
+Status ReplicationCoordinatorMock::checkIfCommitQuorumCanBeSatisfied(
+    const CommitQuorumOptions& commitQuorum) const {
+    return Status::OK();
+}
+
+StatusWith<bool> ReplicationCoordinatorMock::checkIfCommitQuorumIsSatisfied(
+    const CommitQuorumOptions& commitQuorum,
+    const std::vector<HostAndPort>& commitReadyMembers) const {
+    return true;
+}
+
 WriteConcernOptions ReplicationCoordinatorMock::getGetLastErrorDefault() {
     return WriteConcernOptions();
 }
@@ -410,8 +446,6 @@ bool ReplicationCoordinatorMock::getWriteConcernMajorityShouldJournal() {
     return true;
 }
 
-void ReplicationCoordinatorMock::summarizeAsHtml(ReplSetHtmlSummary* output) {}
-
 long long ReplicationCoordinatorMock::getTerm() {
     return _term;
 }
@@ -446,13 +480,6 @@ WriteConcernOptions ReplicationCoordinatorMock::populateUnsetWriteConcernOptions
     return wc;
 }
 
-ReplSettings::IndexPrefetchConfig ReplicationCoordinatorMock::getIndexPrefetchConfig() const {
-    return ReplSettings::IndexPrefetchConfig();
-}
-
-void ReplicationCoordinatorMock::setIndexPrefetchConfig(
-    const ReplSettings::IndexPrefetchConfig cfg) {}
-
 Status ReplicationCoordinatorMock::stepUpIfEligible(bool skipDryRun) {
     return Status::OK();
 }
@@ -466,6 +493,21 @@ Status ReplicationCoordinatorMock::abortCatchupIfNeeded() {
 }
 
 void ReplicationCoordinatorMock::signalDropPendingCollectionsRemovedFromStorage() {}
+
+boost::optional<Timestamp> ReplicationCoordinatorMock::getRecoveryTimestamp() {
+    if (_storage) {
+        return _storage->getRecoveryTimestamp(getServiceContext());
+    }
+    return boost::none;
+}
+
+bool ReplicationCoordinatorMock::setContainsArbiter() const {
+    return false;
+}
+
+void ReplicationCoordinatorMock::attemptToAdvanceStableTimestamp() {
+    return;
+}
 
 }  // namespace repl
 }  // namespace mongo

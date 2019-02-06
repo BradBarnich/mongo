@@ -1,23 +1,25 @@
-/*
- *    Copyright (C) 2018 MongoDB, Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,267 +30,209 @@
 
 #pragma once
 
-#include <boost/optional.hpp>
-#include <list>
-#include <map>
-#include <set>
+#include <vector>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/bson/timestamp.h"
-#include "mongo/s/shard_id.h"
-#include "mongo/stdx/mutex.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/decorable.h"
-#include "mongo/util/future.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/transaction_coordinator_driver.h"
+#include "mongo/logger/logstream_builder.h"
 
 namespace mongo {
 
-class OperationContext;
-class Session;
-
 /**
- * A state machine that coordinates a distributed transaction commit with the transaction
- * participants.
+ * Class responsible for coordinating two-phase commit across shards.
  */
 class TransactionCoordinator {
     MONGO_DISALLOW_COPYING(TransactionCoordinator);
 
 public:
-    TransactionCoordinator() = default;
-    ~TransactionCoordinator() = default;
+    TransactionCoordinator(ServiceContext* serviceContext,
+                           const LogicalSessionId& lsid,
+                           TxnNumber txnNumber);
+    ~TransactionCoordinator();
 
     /**
-     * The internal state machine, or "brain", used by the TransactionCoordinator to determine what
-     * to do in response to an "event" (receiving a request or hearing back a response).
+     * Represents a decision made by the coordinator, including commit timestamp to be sent with
+     * commitTransaction in the case of a decision to commit.
      */
-    class StateMachine {
-        friend class TransactionCoordinator;
-
-    public:
-        ~StateMachine();
-        enum class State {
-            kWaitingForParticipantList,
-            kWaitingForVotes,
-            kAborted,
-            kWaitingForCommitAcks,
-            kCommitted,
-
-            // The state machine transitions to this state when a message that is considered illegal
-            // to receive in a particular state is received. This indicates either a byzantine
-            // message, or that the transition table does not accurately reflect an asynchronous
-            // network.
-            kBroken,
-        };
-
-        // State machine inputs
-        enum class Event {
-            kRecvVoteAbort,
-            kRecvVoteCommit,
-            kRecvParticipantList,
-            kRecvFinalVoteCommit,
-            kRecvFinalCommitAck,
-            kRecvTryAbort,
-        };
-
-        // State machine outputs
-        enum class Action { kNone, kSendCommit, kSendAbort };
-
-        // IMPORTANT: If there is a state transition, this will release the lock in order to signal
-        // any promises that may be waiting on a state change, and will not reacquire it.
-        Action onEvent(stdx::unique_lock<stdx::mutex> lk, Event e);
-
-        State state() const {
-            return _state;
-        }
+    struct CoordinatorCommitDecision {
+        txn::CommitDecision decision;
+        boost::optional<Timestamp> commitTimestamp;
 
         /**
-         * Returns a future that will be signaled when the state machine transitions to one of
-         * the states specified. If several are specified, the first state to be hit after the call
-         * to waitForTransitionTo will trigger the future. If the state machine is currently in one
-         * of the states specified when the function is called, the returned future will already be
-         * ready, and contain the current state. The set of states must ALWAYS include all terminal
-         * states of the state machine in order to prevent a Future that hangs forever, e.g.
-         * if the caller only waits for a state that has already happened or will never happen.
+         * Parses a CoordinatorCommitDecision from the object.
          */
-        Future<State> waitForTransitionTo(const std::set<State>& states);
+        static StatusWith<CoordinatorCommitDecision> fromBSON(const BSONObj& obj);
 
-    private:
-        void _signalAllPromisesWaitingForState(stdx::unique_lock<stdx::mutex> lk, State state);
-
-        struct Transition {
-            Transition(Action action, State nextState) : action(action), nextState(nextState) {}
-            Transition(State nextState) : Transition(Action::kNone, nextState) {}
-            Transition(Action action) : action(action) {}
-            Transition() : Transition(Action::kNone) {}
-
-            Action action;
-            boost::optional<State> nextState;
+        /**
+         * Returns an instance of CoordinatorCommitDecision from an object.
+         *
+         * Throws if the object cannot be deserialized.
+         */
+        static CoordinatorCommitDecision fromBSONThrowing(const BSONObj& obj) {
+            return uassertStatusOK(fromBSON(obj));
         };
 
-        struct StateTransitionPromise {
-            StateTransitionPromise(Promise<State> promiseArg, std::set<State> triggeringStatesArg)
-                : promise(std::move(promiseArg)), triggeringStates(triggeringStatesArg) {}
-
-            Promise<State> promise;
-            std::set<State> triggeringStates;
-        };
-
-        static const std::map<State, std::map<Event, Transition>> transitionTable;
-        State _state{State::kWaitingForParticipantList};
-        std::list<StateTransitionPromise> _stateTransitionPromises;
+        /**
+         * Returns the BSON representation of this object.
+         */
+        BSONObj toBSON() const;
     };
 
     /**
-     * The coordinateCommit command contains the full participant list that this node is responsible
-     * for coordinating the commit across.
-     *
-     * Stores the participant list.
-     *
-     * Throws if any participants that this node has already heard a vote from are not in the list.
+     * The state of the coordinator.
      */
-    StateMachine::Action recvCoordinateCommit(const std::set<ShardId>& participants);
-
-    /**
-     * A participant sends a voteCommit command with its prepareTimestamp if it succeeded in
-     * preparing the transaction.
-     *
-     * Stores the participant's vote.
-     *
-     * Throws if the full participant list has been received and this shard is not one of the
-     * participants.
-     */
-    StateMachine::Action recvVoteCommit(const ShardId& shardId, Timestamp prepareTimestamp);
-
-    /**
-     * A participant sends a voteAbort command if it failed to prepare the transaction.
-     *
-     * Stores the participant's vote and causes the coordinator to decide to abort the transaction.
-     *
-     * Throws if the full participant list has been received and this shard is not one of the
-     * participants.
-     */
-    StateMachine::Action recvVoteAbort(const ShardId& shardId);
-
-    /**
-     * A tryAbort event is received by the coordinator when a transaction is implicitly aborted when
-     * a new transaction is received for the same session with a higher transaction number.
-     */
-    StateMachine::Action recvTryAbort();
-
-    /**
-     * Returns a Future which will be signaled when the TransactionCoordinator either commits
-     * or aborts. The resulting future will contain the final state of the coordinator.
-     */
-    Future<TransactionCoordinator::StateMachine::State> waitForCompletion();
-
-    /**
-     * Marks this participant as having completed committing the transaction.
-     */
-    void recvCommitAck(const ShardId& shardId);
-
-    std::set<ShardId> getNonAckedCommitParticipants() const {
-        return _participantList.getNonAckedCommitParticipants();
-    }
-
-    std::set<ShardId> getNonVotedAbortParticipants() const {
-        return _participantList.getNonVotedAbortParticipants();
-    }
-
-    Timestamp getCommitTimestamp() const {
-        return _participantList.getHighestPrepareTimestamp();
-    }
-
-    StateMachine::State state() const {
-        return _stateMachine.state();
-    }
-
-    class ParticipantList {
-    public:
-        void recordFullList(const std::set<ShardId>& participants);
-        void recordVoteCommit(const ShardId& shardId, Timestamp prepareTimestamp);
-        void recordVoteAbort(const ShardId& shardId);
-        void recordCommitAck(const ShardId& shardId);
-        void recordAbortAck(const ShardId& shardId);
-
-        bool allParticipantsVotedCommit() const;
-        bool allParticipantsAckedAbort() const;
-        bool allParticipantsAckedCommit() const;
-
-        Timestamp getHighestPrepareTimestamp() const;
-
-        std::set<ShardId> getNonAckedCommitParticipants() const;
-        std::set<ShardId> getNonVotedAbortParticipants() const;
-
-        class Participant {
-        public:
-            enum class Vote { kUnknown, kAbort, kCommit };
-            enum class Ack { kNone, kCommit };
-
-            Vote vote{Vote::kUnknown};
-            Ack ack{Ack::kNone};
-            boost::optional<Timestamp> prepareTimestamp{boost::none};
-        };
-
-    private:
-        void _recordParticipant(const ShardId& shardId);
-        void _validate(const std::set<ShardId>& participants);
-
-        bool _fullListReceived{false};
-        std::map<ShardId, Participant> _participants;
+    enum class CoordinatorState {
+        // The initial state prior to receiving the participant list from the router.
+        kInit,
+        // The coordinator is sending prepare and processing responses.
+        kPreparing,
+        // The coordinator is sending commit messages and waiting for responses.
+        kCommitting,
+        // The coordinator is sending abort messages and waiting for responses.
+        kAborting,
+        // The coordinator has received commit/abort acknowledgements from all participants.
+        kDone,
     };
+
+    /**
+     * The first time this is called, it asynchronously begins the two-phase commit process for the
+     * transaction that this coordinator is responsible for, and returns a future that will be
+     * resolved when a commit or abort decision has been made and persisted.
+     *
+     * Subsequent calls will not re-run the commit process, but instead return a future that will be
+     * resolved when the original commit process that was kicked off comes to a decision. If the
+     * original commit process has completed, returns a ready future containing the final decision.
+     */
+    SharedSemiFuture<txn::CommitDecision> runCommit(const std::vector<ShardId>& participantShards);
+
+    /**
+     * To be used to continue coordinating a transaction on step up.
+     */
+    void continueCommit(const TransactionCoordinatorDocument& doc);
+
+    /**
+     * Returns a future that will be signaled when the transaction has completely finished
+     * committing or aborting (i.e. when commit/abort acknowledgements have been received from all
+     * participants, or the coordinator commit process is aborted locally for some reason).
+     *
+     * Unlike runCommit, this will not kick off the commit process if it has not already begun.
+     */
+    Future<void> onCompletion();
+
+    /**
+     * Gets a Future that will contain the decision that the coordinator reaches. Note that this
+     * will never be signaled unless runCommit has been called.
+     *
+     * TODO (SERVER-37364): Remove this when it is no longer needed by the coordinator service.
+     */
+    SharedSemiFuture<txn::CommitDecision> getDecision();
+
+    /**
+     * If runCommit has not yet been called, this will transition this coordinator object to
+     * the 'done' state, effectively making it impossible for two-phase commit to be run for this
+     * coordinator.
+     *
+     * Called when a transaction with a higher transaction number is received on this session.
+     */
+    void cancelIfCommitNotYetStarted();
 
 private:
-    stdx::mutex _mutex;
-    ParticipantList _participantList;
-    StateMachine _stateMachine;
+    /**
+     * Expects the participant list to already be majority-committed.
+     *
+     * 1. Sends prepare and collect the votes (i.e., responses), retrying requests as needed.
+     * 2. Based on the votes, makes a commit or abort decision.
+     * 3. If the decision is to commit, calculates the commit Timestamp.
+     * 4. Writes the decision and waits for the decision to become majority-committed.
+     */
+    Future<CoordinatorCommitDecision> _runPhaseOne(const std::vector<ShardId>& participantShards);
+
+    /**
+     * Expects the decision to already be majority-committed.
+     *
+     * 1. Send the decision (commit or abort) until receiving all acks (i.e., responses),
+     *    retrying requests as needed.
+     * 2. Delete the coordinator's durable state without waiting for the delete to become
+     *    majority-committed.
+     */
+    Future<void> _runPhaseTwo(const std::vector<ShardId>& participantShards,
+                              const CoordinatorCommitDecision& decision);
+
+    /**
+    * Asynchronously sends the commit decision to all participants (commit or abort), resolving the
+    * returned future when all participants have acknowledged the decision.
+    */
+    Future<void> _sendDecisionToParticipants(const std::vector<ShardId>& participantShards,
+                                             CoordinatorCommitDecision coordinatorDecision);
+
+    /**
+     * Helper for handling errors that occur during either phase of commit coordination.
+     */
+    void _handleCompletionStatus(Status s);
+
+    /**
+     * Notifies all callers of onCompletion that the commit process has completed by fulfilling
+     * their promises, and transitions the state to done.
+     *
+     * NOTE: Unlocks the lock passed in in order to fulfill the promises.
+     *
+     * TODO (SERVER-38346): Used SharedSemiFuture to simplify this implementation.
+     */
+    void _transitionToDone(stdx::unique_lock<stdx::mutex> lk) noexcept;
+
+    // Shortcut to the service context under which this coordinator runs
+    ServiceContext* const _serviceContext;
+
+    // Context object used to perform and track the state of asynchronous operations on behalf of
+    // this coordinator.
+    TransactionCoordinatorDriver _driver;
+
+    // The lsid + transaction number that this coordinator is coordinating
+    const LogicalSessionId _lsid;
+    const TxnNumber _txnNumber;
+
+    // Protects the state below
+    mutable stdx::mutex _mutex;
+
+    // Stores the current state of the coordinator in the commit process.
+    CoordinatorState _state{CoordinatorState::kInit};
+
+    // Promise which will contain the final decision made by the coordinator (whether to commit or
+    // abort). This is only known once all responses to prepare have been received from all
+    // participants, and the collective decision has been majority persisted to
+    // config.transactionCommitDecisions.
+    SharedPromise<txn::CommitDecision> _finalDecisionPromise;
+
+    // A list of all promises corresponding to futures that were returned to callers of
+    // onCompletion.
+    //
+    // TODO (SERVER-38346): Remove this when SharedSemiFuture supports continuations.
+    std::vector<Promise<void>> _completionPromises;
 };
 
-inline StringBuilder& operator<<(StringBuilder& sb,
-                                 const TransactionCoordinator::StateMachine::State& state) {
-    using State = TransactionCoordinator::StateMachine::State;
+inline logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& stream,
+                                            const TransactionCoordinator::CoordinatorState& state) {
+    using State = TransactionCoordinator::CoordinatorState;
+    // clang-format off
     switch (state) {
-        // clang-format off
-        case State::kWaitingForParticipantList:     return sb << "kWaitingForParticipantlist";
-        case State::kWaitingForVotes:               return sb << "kWaitingForVotes";
-        case State::kAborted:                       return sb << "kAborted";
-        case State::kWaitingForCommitAcks:          return sb << "kWaitingForCommitAcks";
-        case State::kCommitted:                     return sb << "kCommitted";
-        case State::kBroken:                        return sb << "kBroken";
-        // clang-format on
-        default:
-            MONGO_UNREACHABLE;
+        case State::kInit:  stream.stream() << "kInit"; break;
+        case State::kPreparing:   stream.stream() << "kPreparing"; break;
+        case State::kAborting: stream.stream() << "kAborting"; break;
+        case State::kCommitting: stream.stream() << "kCommitting"; break;
+        case State::kDone: stream.stream() << "kDone"; break;
     };
+    // clang-format on
+    return stream;
 }
 
-inline std::ostream& operator<<(std::ostream& os,
-                                const TransactionCoordinator::StateMachine::State& state) {
-    StringBuilder sb;
-    sb << state;
-    return os << sb.str();
-}
-
-inline StringBuilder& operator<<(StringBuilder& sb,
-                                 const TransactionCoordinator::StateMachine::Event& event) {
-    using Event = TransactionCoordinator::StateMachine::Event;
-    switch (event) {
-        // clang-format off
-        case Event::kRecvVoteAbort:         return sb << "kRecvVoteAbort";
-        case Event::kRecvVoteCommit:        return sb << "kRecvVoteCommit";
-        case Event::kRecvParticipantList:   return sb << "kRecvParticipantList";
-        case Event::kRecvFinalVoteCommit:   return sb << "kRecvFinalVoteCommit";
-        case Event::kRecvFinalCommitAck:    return sb << "kRecvFinalCommitAck";
-        // clang-format on
-        default:
-            MONGO_UNREACHABLE;
+inline logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& stream,
+                                            const txn::CommitDecision& decision) {
+    // clang-format off
+    switch (decision) {
+        case txn::CommitDecision::kCommit:     stream.stream() << "kCommit"; break;
+        case txn::CommitDecision::kAbort:      stream.stream() << "kAbort"; break;
+        case txn::CommitDecision::kCanceled:   stream.stream() << "kCanceled"; break;
     };
+    // clang-format on
+    return stream;
 }
-
-inline std::ostream& operator<<(std::ostream& os,
-                                const TransactionCoordinator::StateMachine::Event& event) {
-    StringBuilder sb;
-    sb << event;
-    return os << sb.str();
-}
-
 }  // namespace mongo

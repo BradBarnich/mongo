@@ -1,29 +1,31 @@
-/*
- *    Copyright (C) 2013 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault;
@@ -59,195 +61,10 @@ using std::endl;
 using std::string;
 using std::vector;
 
-ShellGlobalParams shellGlobalParams;
-
 // SERVER-36807: Limit --setShellParameter to SetParameters we know we want to expose.
 const std::set<std::string> kSetShellParameterWhitelist = {
     "disabledSecureAllocatorDomains",
 };
-
-Status addMongoShellOptions(moe::OptionSection* options) {
-    options->addOptionChaining(
-        "shell", "shell", moe::Switch, "run the shell after executing files");
-
-    options->addOptionChaining("nodb",
-                               "nodb",
-                               moe::Switch,
-                               "don't connect to mongod on startup - no 'db address' arg expected");
-
-    options->addOptionChaining(
-        "norc", "norc", moe::Switch, "will not run the \".mongorc.js\" file on start up");
-
-    options->addOptionChaining("quiet", "quiet", moe::Switch, "be less chatty");
-
-    options->addOptionChaining("port", "port", moe::String, "port to connect to");
-
-    options->addOptionChaining("host", "host", moe::String, "server to connect to");
-
-    options->addOptionChaining("eval", "eval", moe::String, "evaluate javascript");
-
-    options
-        ->addOptionChaining(
-            "objcheck", "objcheck", moe::Switch, "inspect client data for validity on receipt")
-        .hidden()
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("noobjcheck");
-
-    options
-        ->addOptionChaining("noobjcheck",
-                            "noobjcheck",
-                            moe::Switch,
-                            "do NOT inspect client data for validity on receipt (DEFAULT)")
-        .hidden()
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("objcheck");
-
-    moe::OptionSection authenticationOptions("Authentication Options");
-
-    authenticationOptions.addOptionChaining(
-        "username", "username,u", moe::String, "username for authentication");
-
-    authenticationOptions
-        .addOptionChaining("password", "password,p", moe::String, "password for authentication")
-        .setImplicit(moe::Value(std::string("")));
-
-    authenticationOptions
-        .addOptionChaining("authenticationDatabase",
-                           "authenticationDatabase",
-                           moe::String,
-                           "user source (defaults to dbname)")
-        .setDefault(moe::Value(std::string("")));
-
-    authenticationOptions.addOptionChaining("authenticationMechanism",
-                                            "authenticationMechanism",
-                                            moe::String,
-                                            "authentication mechanism");
-
-    authenticationOptions
-        .addOptionChaining("gssapiServiceName",
-                           "gssapiServiceName",
-                           moe::String,
-                           "Service name to use when authenticating using GSSAPI/Kerberos")
-        .setDefault(moe::Value(saslDefaultServiceName.toString()));
-
-    authenticationOptions.addOptionChaining(
-        "gssapiHostName",
-        "gssapiHostName",
-        moe::String,
-        "Remote host name to use for purpose of GSSAPI/Kerberos authentication");
-
-    options->addSection(authenticationOptions).transitional_ignore();
-
-    options->addOptionChaining("help", "help,h", moe::Switch, "show this usage information");
-
-    options->addOptionChaining("version", "version", moe::Switch, "show version information");
-
-    options->addOptionChaining("verbose", "verbose", moe::Switch, "increase verbosity");
-
-    options->addOptionChaining(
-        "ipv6", "ipv6", moe::Switch, "enable IPv6 support (disabled by default)");
-
-    options
-        ->addOptionChaining("disableJavaScriptJIT",
-                            "disableJavaScriptJIT",
-                            moe::Switch,
-                            "disable the Javascript Just In Time compiler")
-        .incompatibleWith("enableJavaScriptJIT");
-
-    options
-        ->addOptionChaining("enableJavaScriptJIT",
-                            "enableJavaScriptJIT",
-                            moe::Switch,
-                            "enable the Javascript Just In Time compiler")
-        .incompatibleWith("disableJavaScriptJIT");
-
-    options
-        ->addOptionChaining("disableJavaScriptProtection",
-                            "disableJavaScriptProtection",
-                            moe::Switch,
-                            "allow automatic JavaScript function marshalling")
-        .incompatibleWith("enableJavaScriptProtection");
-
-    options
-        ->addOptionChaining("enableJavaScriptProtection",
-                            "enableJavaScriptProtection",
-                            moe::Switch,
-                            "disable automatic JavaScript function marshalling (defaults to true)")
-        .hidden()
-        .incompatibleWith("disableJavaScriptProtection");
-
-    options->addOptionChaining("dbaddress", "dbaddress", moe::String, "dbaddress")
-        .hidden()
-        .positional(1, 1);
-
-    options->addOptionChaining("files", "files", moe::StringVector, "files")
-        .hidden()
-        .positional(2, -1);
-
-    // for testing, kill op will also be disabled automatically if the tests starts a mongo
-    // program
-    options->addOptionChaining("nokillop", "nokillop", moe::Switch, "nokillop").hidden();
-
-    // for testing, will kill op without prompting
-    options->addOptionChaining("autokillop", "autokillop", moe::Switch, "autokillop").hidden();
-
-    options
-        ->addOptionChaining("useLegacyWriteOps",
-                            "useLegacyWriteOps",
-                            moe::Switch,
-                            "use legacy write ops instead of write commands")
-        .hidden();
-
-    options
-        ->addOptionChaining("writeMode",
-                            "writeMode",
-                            moe::String,
-                            "mode to determine how writes are done:"
-                            " commands, compatibility, legacy")
-        .hidden();
-
-    options
-        ->addOptionChaining("readMode",
-                            "readMode",
-                            moe::String,
-                            "mode to determine how .find() queries are done:"
-                            " commands, compatibility, legacy")
-        .hidden();
-
-    options->addOptionChaining(
-        "retryWrites",
-        "retryWrites",
-        moe::Switch,
-        "automatically retry write operations upon transient network errors");
-
-    options->addOptionChaining("disableImplicitSessions",
-                               "disableImplicitSessions",
-                               moe::Switch,
-                               "do not automatically create and use implicit sessions");
-
-    options
-        ->addOptionChaining(
-            "rpcProtocols", "rpcProtocols", moe::String, " none, opQueryOnly, opMsgOnly, all")
-        .hidden();
-
-    auto ret = addMessageCompressionOptions(options, true);
-    if (!ret.isOK()) {
-        return ret;
-    }
-
-    options->addOptionChaining(
-        "jsHeapLimitMB", "jsHeapLimitMB", moe::Int, "set the js scope's heap size limit");
-
-    options
-        ->addOptionChaining("setShellParameter",
-                            "setShellParameter",
-                            moe::StringMap,
-                            "Set a configurable parameter")
-        .composing()
-        .hidden();
-
-    return Status::OK();
-}
 
 std::string getMongoShellHelp(StringData name, const moe::OptionSection& options) {
     StringBuilder sb;
@@ -312,16 +129,11 @@ Status storeMongoShellOptions(const moe::Environment& params,
         shellGlobalParams.dbhost = params["host"].as<string>();
     }
 
-    if (params.count("eval")) {
-        shellGlobalParams.script = params["eval"].as<string>();
-    }
-
     if (params.count("username")) {
         shellGlobalParams.username = params["username"].as<string>();
     }
 
     if (params.count("password")) {
-        shellGlobalParams.usingPassword = true;
         shellGlobalParams.password = params["password"].as<string>();
     }
 
@@ -341,17 +153,18 @@ Status storeMongoShellOptions(const moe::Environment& params,
         shellGlobalParams.gssapiHostName = params["gssapiHostName"].as<string>();
     }
 
-    if (params.count("shell")) {
-        shellGlobalParams.runShell = true;
+    if (params.count("net.compression.compressors")) {
+        auto compressors = params["net.compression.compressors"].as<string>();
+        if (compressors != "disabled") {
+            shellGlobalParams.networkMessageCompressors = std::move(compressors);
+        }
     }
+
     if (params.count("nodb")) {
         shellGlobalParams.nodb = true;
     }
     if (params.count("disableJavaScriptProtection")) {
         shellGlobalParams.javascriptProtection = false;
-    }
-    if (params.count("norc")) {
-        shellGlobalParams.norc = true;
     }
     if (params.count("disableJavaScriptJIT")) {
         shellGlobalParams.nojit = true;
@@ -361,12 +174,6 @@ Status storeMongoShellOptions(const moe::Environment& params,
     }
     if (params.count("files")) {
         shellGlobalParams.files = params["files"].as<vector<string>>();
-    }
-    if (params.count("nokillop")) {
-        mongo::shell_utils::_nokillop = true;
-    }
-    if (params.count("autokillop")) {
-        shellGlobalParams.autoKillOp = true;
     }
     if (params.count("useLegacyWriteOps")) {
         shellGlobalParams.writeMode = "legacy";
@@ -388,9 +195,6 @@ Status storeMongoShellOptions(const moe::Environment& params,
                           << "'. Valid modes are: {commands, compatibility, legacy}");
         }
         shellGlobalParams.readMode = mode;
-    }
-    if (params.count("retryWrites")) {
-        shellGlobalParams.shouldRetryWrites = true;
     }
     if (params.count("disableImplicitSessions")) {
         shellGlobalParams.shouldUseImplicitSessions = false;
@@ -456,37 +260,55 @@ Status storeMongoShellOptions(const moe::Environment& params,
 
         auto cs = cs_status.getValue();
         auto uriOptions = cs.getOptions();
-        StringBuilder sb;
-        sb << "ERROR: Cannot specify ";
 
-        if (!shellGlobalParams.username.empty() && !cs.getUser().empty() &&
-            shellGlobalParams.username != cs.getUser()) {
-            sb << "different usernames";
-        } else if (!shellGlobalParams.password.empty() && !cs.getPassword().empty() &&
-                   shellGlobalParams.password != cs.getPassword()) {
-            sb << "different passwords";
-        } else if (!shellGlobalParams.authenticationMechanism.empty() &&
-                   uriOptions.count("authMechanism") &&
-                   uriOptions["authMechanism"] != shellGlobalParams.authenticationMechanism) {
-            sb << "different authentication mechanisms";
-        } else if (!shellGlobalParams.authenticationDatabase.empty() &&
-                   uriOptions.count("authSource") &&
-                   uriOptions["authSource"] != shellGlobalParams.authenticationDatabase) {
-            sb << "different authentication databases ";
-        } else if (shellGlobalParams.gssapiServiceName != saslDefaultServiceName &&
-                   uriOptions.count("gssapiServiceName")) {
-            sb << "the GSSAPI service name";
-        } else {
-            return Status::OK();
-        }
+        auto handleURIOptions = [&] {
+            StringBuilder sb;
+            sb << "ERROR: Cannot specify ";
 
-        sb << " in connection URI and as a command-line option";
-        return Status(ErrorCodes::InvalidOptions, sb.str());
+            if (!shellGlobalParams.username.empty() && !cs.getUser().empty() &&
+                shellGlobalParams.username != cs.getUser()) {
+                sb << "different usernames";
+            } else if (!shellGlobalParams.password.empty() && !cs.getPassword().empty() &&
+                       shellGlobalParams.password != cs.getPassword()) {
+                sb << "different passwords";
+            } else if (!shellGlobalParams.authenticationMechanism.empty() &&
+                       uriOptions.count("authMechanism") &&
+                       uriOptions["authMechanism"] != shellGlobalParams.authenticationMechanism) {
+                sb << "different authentication mechanisms";
+            } else if (!shellGlobalParams.authenticationDatabase.empty() &&
+                       uriOptions.count("authSource") &&
+                       uriOptions["authSource"] != shellGlobalParams.authenticationDatabase) {
+                sb << "different authentication databases";
+            } else if (shellGlobalParams.gssapiServiceName != saslDefaultServiceName &&
+                       uriOptions.count("gssapiServiceName")) {
+                sb << "the GSSAPI service name";
+            } else if (!shellGlobalParams.networkMessageCompressors.empty() &&
+                       uriOptions.count("compressors") &&
+                       uriOptions["compressors"] != shellGlobalParams.networkMessageCompressors) {
+                sb << "different network message compressors";
+            } else {
+                return Status::OK();
+            }
+
+            sb << " in connection URI and as a command-line option";
+            return Status(ErrorCodes::InvalidOptions, sb.str());
+        };
+
+        auto uriStatus = handleURIOptions();
+        if (!uriStatus.isOK())
+            return uriStatus;
+
+        if (uriOptions.count("compressors"))
+            shellGlobalParams.networkMessageCompressors = uriOptions["compressors"];
     }
 
-    auto ret = storeMessageCompressionOptions(params);
-    if (!ret.isOK())
-        return ret;
+    if (!shellGlobalParams.networkMessageCompressors.empty()) {
+        const auto ret =
+            storeMessageCompressionOptions(shellGlobalParams.networkMessageCompressors);
+        if (!ret.isOK()) {
+            return ret;
+        }
+    }
 
     if (params.count("setShellParameter")) {
         auto ssp = params["setShellParameter"].as<std::map<std::string, std::string>>();
@@ -516,53 +338,4 @@ Status storeMongoShellOptions(const moe::Environment& params,
     return Status::OK();
 }
 
-void redactPasswordOptions(int argc, char** argv) {
-    constexpr auto kLongPasswordOption = "--password"_sd;
-    constexpr auto kShortPasswordOption = "-p"_sd;
-    for (int i = 0; i < argc; ++i) {
-        StringData arg(argv[i]);
-        if (arg.startsWith(kShortPasswordOption)) {
-            char* toRedact = nullptr;
-            // Handle -p password
-            if ((arg == kShortPasswordOption) && (i + 1 < argc)) {
-                toRedact = argv[++i];
-                // Handle -ppassword
-            } else {
-                toRedact = argv[i] + kShortPasswordOption.size();
-            }
-
-            invariant(toRedact);
-            // The arg should be null-terminated, replace everything up to \0 to 'x'
-            while (*toRedact) {
-                *toRedact++ = 'x';
-            }
-        }
-        if (arg.startsWith(kLongPasswordOption)) {
-            char* toRedact = nullptr;
-            // Handle --password password
-            if ((arg == kLongPasswordOption) && (i + 1 < argc)) {
-                toRedact = argv[++i];
-                // Handle --password=password
-            } else if (arg.size() != kLongPasswordOption.size()) {
-                toRedact = argv[i] + kLongPasswordOption.size();
-                // It's not valid to do --passwordpassword, make sure there's an = separator
-                invariant(*(toRedact++) == '=');
-            }
-
-            // If there's nothing to redact, just exit
-            if (!toRedact) {
-                continue;
-            }
-
-            // The arg should be null-terminated, replace everything up to \0 to 'x'
-            while (*toRedact) {
-                *toRedact++ = 'x';
-            }
-        } else if (MongoURI::isMongoURI(arg)) {
-            auto reformedURI = MongoURI::redact(arg);
-            auto length = arg.size();
-            ::strncpy(argv[i], reformedURI.data(), length);
-        }
-    }
-}
 }  // namespace mongo

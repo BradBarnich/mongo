@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
@@ -384,7 +386,12 @@ StatusWith<SSLX509Name> extractSubjectName(::CFDictionaryRef dict) {
         }
     }
 
-    return SSLX509Name(std::move(ret));
+    SSLX509Name subjectName = SSLX509Name(std::move(ret));
+    Status normalize = subjectName.normalizeStrings();
+    if (!normalize.isOK()) {
+        return normalize;
+    }
+    return subjectName;
 }
 
 StatusWith<mongo::Date_t> extractValidityDate(::CFDictionaryRef dict,
@@ -1151,8 +1158,9 @@ SSLManagerApple::SSLManagerApple(const SSLParams& params, bool isServer)
     if (isServer) {
         uassertStatusOK(initSSLContext(&_serverCtx, params, ConnectionDirection::kIncoming));
         if (_serverCtx.certs) {
-            _sslConfiguration.serverSubjectName = uassertStatusOK(certificateGetSubject(
-                _serverCtx.certs.get(), &_sslConfiguration.serverCertificateExpirationDate));
+            uassertStatusOK(
+                _sslConfiguration.setServerSubjectName(uassertStatusOK(certificateGetSubject(
+                    _serverCtx.certs.get(), &_sslConfiguration.serverCertificateExpirationDate))));
             static auto task =
                 CertificateExpirationMonitor(_sslConfiguration.serverCertificateExpirationDate);
         }
@@ -1439,6 +1447,11 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerApple::parseAndValidatePeerCe
     const auto peerSubjectName = std::move(swPeerSubjectName.getValue());
     LOG(2) << "Accepted TLS connection from peer: " << peerSubjectName;
 
+    // If this is a server and client and server certificate are the same, log a warning.
+    if (_sslConfiguration.serverSubjectName() == peerSubjectName) {
+        warning() << "Client connecting with server's own TLS certificate";
+    }
+
     if (remoteHost.empty()) {
         // If this is an SSL server context (on a mongod/mongos)
         // parse any client roles out of the client certificate.
@@ -1546,21 +1559,18 @@ int SSLManagerApple::SSL_shutdown(SSLConnectionInterface* conn) {
 // Global variable indicating if this is a server or a client instance
 bool isSSLServer = false;
 
-namespace {
-SimpleMutex sslManagerMtx;
-SSLManagerInterface* theSSLManager = nullptr;
-}  // namespace
+extern SSLManagerInterface* theSSLManager;
 
 std::unique_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
     return stdx::make_unique<SSLManagerApple>(params, isServer);
 }
 
-MONGO_INITIALIZER(SSLManager)(InitializerContext*) {
+MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("EndStartupOptionHandling"))
+(InitializerContext*) {
     kMongoDBRolesOID = ::CFStringCreateWithCString(
         nullptr, mongodbRolesOID.identifier.c_str(), ::kCFStringEncodingUTF8);
 
-    stdx::lock_guard<SimpleMutex> lck(sslManagerMtx);
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
         theSSLManager = new SSLManagerApple(sslGlobalParams, isSSLServer);
     }
@@ -1568,11 +1578,3 @@ MONGO_INITIALIZER(SSLManager)(InitializerContext*) {
 }
 
 }  // namespace mongo
-
-mongo::SSLManagerInterface* mongo::getSSLManager() {
-    stdx::lock_guard<SimpleMutex> lck(sslManagerMtx);
-    if (theSSLManager) {
-        return theSSLManager;
-    }
-    return nullptr;
-}

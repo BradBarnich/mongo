@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -46,10 +48,9 @@
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/index_create.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -66,7 +67,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_update.h"
-#include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
@@ -118,6 +118,7 @@ StatusWith<int> StorageInterfaceImpl::getRollbackID(OperationContext* opCtx) {
 }
 
 StatusWith<int> StorageInterfaceImpl::initializeRollbackID(OperationContext* opCtx) {
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
     auto status = createCollection(opCtx, _rollbackIdNss, CollectionOptions());
     if (!status.isOK()) {
         return status;
@@ -372,7 +373,37 @@ Status StorageInterfaceImpl::insertDocuments(OperationContext* opCtx,
 }
 
 Status StorageInterfaceImpl::dropReplicatedDatabases(OperationContext* opCtx) {
-    Database::dropAllDatabasesExceptLocal(opCtx);
+    Lock::GlobalWrite globalWriteLock(opCtx);
+
+    std::vector<std::string> dbNames;
+    opCtx->getServiceContext()->getStorageEngine()->listDatabases(&dbNames);
+    invariant(!dbNames.empty());
+    log() << "dropReplicatedDatabases - dropping " << dbNames.size() << " databases";
+
+    ReplicationCoordinator::get(opCtx)->dropAllSnapshots();
+
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto hasLocalDatabase = false;
+    for (const auto& dbName : dbNames) {
+        if (dbName == "local") {
+            hasLocalDatabase = true;
+            continue;
+        }
+        writeConflictRetry(opCtx, "dropReplicatedDatabases", dbName, [&] {
+            if (auto db = databaseHolder->getDb(opCtx, dbName)) {
+                databaseHolder->dropDb(opCtx, db);
+            } else {
+                // This is needed since dropDatabase can't be rolled back.
+                // This is safe be replaced by "invariant(db);dropDatabase(opCtx, db);" once fixed.
+                log() << "dropReplicatedDatabases - database disappeared after retrieving list of "
+                         "database names but before drop: "
+                      << dbName;
+            }
+        });
+    }
+    invariant(hasLocalDatabase, "local database missing");
+    log() << "dropReplicatedDatabases - dropped " << dbNames.size() << " databases";
+
     return Status::OK();
 }
 
@@ -401,7 +432,6 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
                                               const NamespaceString& nss,
                                               const CollectionOptions& options) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::createCollection", nss.ns(), [&] {
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetOrCreateDb databaseWriteGuard(opCtx, nss.db(), MODE_X);
         auto db = databaseWriteGuard.getDb();
         invariant(db);
@@ -424,7 +454,6 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
 
 Status StorageInterfaceImpl::dropCollection(OperationContext* opCtx, const NamespaceString& nss) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::dropCollection", nss.ns(), [&] {
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetDb autoDB(opCtx, nss.db(), MODE_X);
         if (!autoDB.getDb()) {
             // Database does not exist - nothing to do.
@@ -489,11 +518,6 @@ Status StorageInterfaceImpl::renameCollection(OperationContext* opCtx,
         if (!status.isOK()) {
             return status;
         }
-
-        auto newColl = autoDB.getDb()->getCollection(opCtx, toNS);
-        if (newColl->uuid()) {
-            UUIDCatalog::get(opCtx).onRenameCollection(opCtx, newColl, newColl->uuid().get());
-        }
         wunit.commit();
         return status;
     });
@@ -533,7 +557,7 @@ Status StorageInterfaceImpl::setIndexIsMultikey(OperationContext* opCtx,
                                         << nss.ns()
                                         << " to set to multikey.");
         }
-        collection->getIndexCatalog()->getIndex(idx)->setIndexIsMultikey(opCtx, paths);
+        collection->getIndexCatalog()->setMultikeyPaths(opCtx, idx, paths);
         wunit.commit();
         return Status::OK();
     });
@@ -544,10 +568,10 @@ namespace {
 /**
  * Returns DeleteStageParams for deleteOne with fetch.
  */
-DeleteStageParams makeDeleteStageParamsForDeleteDocuments() {
-    DeleteStageParams deleteStageParams;
-    deleteStageParams.isMulti = true;
-    deleteStageParams.returnDeleted = true;
+std::unique_ptr<DeleteStageParams> makeDeleteStageParamsForDeleteDocuments() {
+    auto deleteStageParams = std::make_unique<DeleteStageParams>();
+    deleteStageParams->isMulti = true;
+    deleteStageParams->returnDeleted = true;
     return deleteStageParams;
 }
 
@@ -614,7 +638,7 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
                 auto indexCatalog = collection->getIndexCatalog();
                 invariant(indexCatalog);
                 bool includeUnfinishedIndexes = false;
-                IndexDescriptor* indexDescriptor =
+                const IndexDescriptor* indexDescriptor =
                     indexCatalog->findIndexByName(opCtx, *indexName, includeUnfinishedIndexes);
                 if (!indexDescriptor) {
                     return Result(ErrorCodes::IndexNotFound,
@@ -678,7 +702,6 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
                 case PlanExecutor::IS_EOF:
                     return Result(docs);
                 case PlanExecutor::FAILURE:
-                case PlanExecutor::DEAD:
                     return WorkingSetCommon::getMemberObjectStatus(out);
                 default:
                     MONGO_UNREACHABLE;
@@ -880,10 +903,8 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
         // We can create an UpdateRequest now that the collection's namespace has been resolved, in
         // the event it was specified as a UUID.
         UpdateRequest request(collection->ns());
-        UpdateLifecycleImpl lifeCycle(collection->ns());
         request.setQuery(query);
         request.setUpdates(update);
-        request.setLifecycle(&lifeCycle);
         request.setUpsert(true);
         invariant(!request.isMulti());  // This follows from using an exact _id query.
         invariant(!request.shouldReturnAnyDocs());
@@ -922,10 +943,8 @@ Status StorageInterfaceImpl::putSingleton(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           const TimestampedBSONObj& update) {
     UpdateRequest request(nss);
-    UpdateLifecycleImpl lifeCycle(nss);
     request.setQuery({});
     request.setUpdates(update.obj);
-    request.setLifecycle(&lifeCycle);
     request.setUpsert(true);
     return _updateWithQuery(opCtx, request, update.timestamp);
 }
@@ -935,10 +954,8 @@ Status StorageInterfaceImpl::updateSingleton(OperationContext* opCtx,
                                              const BSONObj& query,
                                              const TimestampedBSONObj& update) {
     UpdateRequest request(nss);
-    UpdateLifecycleImpl lifeCycle(nss);
     request.setQuery(query);
     request.setUpdates(update.obj);
-    request.setLifecycle(&lifeCycle);
     invariant(!request.isUpsert());
     return _updateWithQuery(opCtx, request, update.timestamp);
 }
@@ -1135,8 +1152,12 @@ Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {
     return Status::OK();
 }
 
-void StorageInterfaceImpl::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) {
+void StorageInterfaceImpl::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
+                                                                   bool primaryOnly) {
     Lock::GlobalLock lk(opCtx, MODE_IS);
+    if (primaryOnly &&
+        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase(opCtx, "admin"))
+        return;
     Collection* oplog;
     {
         // We don't want to be holding the collection lock while blocking, to avoid deadlocks.
@@ -1192,6 +1213,16 @@ bool StorageInterfaceImpl::supportsDocLocking(ServiceContext* serviceCtx) const 
 
 Timestamp StorageInterfaceImpl::getAllCommittedTimestamp(ServiceContext* serviceCtx) const {
     return serviceCtx->getStorageEngine()->getAllCommittedTimestamp();
+}
+
+Timestamp StorageInterfaceImpl::getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const {
+    return serviceCtx->getStorageEngine()->getOldestOpenReadTimestamp();
+}
+
+Timestamp StorageInterfaceImpl::getPointInTimeReadTimestamp(OperationContext* opCtx) const {
+    auto readTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+    invariant(readTimestamp);
+    return *readTimestamp;
 }
 
 }  // namespace repl

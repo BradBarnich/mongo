@@ -1,29 +1,31 @@
+
 /**
- * Copyright (c) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 
@@ -3245,6 +3247,99 @@ const char* ExpressionOr::getOpName() const {
     return "$or";
 }
 
+namespace {
+/**
+ * Helper for ExpressionPow to determine wither base^exp can be represented in a 64 bit int.
+ *
+ *'base' and 'exp' are both integers. Assumes 'exp' is in the range [0, 63].
+ */
+bool representableAsLong(long long base, long long exp) {
+    invariant(exp <= 63);
+    invariant(exp >= 0);
+    struct MinMax {
+        long long min;
+        long long max;
+    };
+
+    // Array indices correspond to exponents 0 through 63. The values in each index are the min
+    // and max bases, respectively, that can be raised to that exponent without overflowing a
+    // 64-bit int. For max bases, this was computed by solving for b in
+    // b = (2^63-1)^(1/exp) for exp = [0, 63] and truncating b. To calculate min bases, for even
+    // exps the equation  used was b = (2^63-1)^(1/exp), and for odd exps the equation used was
+    // b = (-2^63)^(1/exp). Since the magnitude of long min is greater than long max, the
+    // magnitude of some of the min bases raised to odd exps is greater than the corresponding
+    // max bases raised to the same exponents.
+
+    static const MinMax kBaseLimits[] = {
+        {std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max()},  // 0
+        {std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max()},
+        {-3037000499LL, 3037000499LL},
+        {-2097152, 2097151},
+        {-55108, 55108},
+        {-6208, 6208},
+        {-1448, 1448},
+        {-512, 511},
+        {-234, 234},
+        {-128, 127},
+        {-78, 78},  // 10
+        {-52, 52},
+        {-38, 38},
+        {-28, 28},
+        {-22, 22},
+        {-18, 18},
+        {-15, 15},
+        {-13, 13},
+        {-11, 11},
+        {-9, 9},
+        {-8, 8},  // 20
+        {-8, 7},
+        {-7, 7},
+        {-6, 6},
+        {-6, 6},
+        {-5, 5},
+        {-5, 5},
+        {-5, 5},
+        {-4, 4},
+        {-4, 4},
+        {-4, 4},  // 30
+        {-4, 4},
+        {-3, 3},
+        {-3, 3},
+        {-3, 3},
+        {-3, 3},
+        {-3, 3},
+        {-3, 3},
+        {-3, 3},
+        {-3, 3},
+        {-2, 2},  // 40
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},  // 50
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},
+        {-2, 2},  // 60
+        {-2, 2},
+        {-2, 2},
+        {-2, 1}};
+
+    return base >= kBaseLimits[exp].min && base <= kBaseLimits[exp].max;
+};
+}
+
 /* ----------------------- ExpressionPow ---------------------------- */
 
 intrusive_ptr<Expression> ExpressionPow::create(
@@ -3295,128 +3390,77 @@ Value ExpressionPow::evaluate(const Document& root) const {
         return Value(std::pow(baseDouble, expDouble));
     }
 
-    // base and exp are both integers.
-
-    auto representableAsLong = [](long long base, long long exp) {
-        // If exp is greater than 63 and base is not -1, 0, or 1, the result will overflow.
-        // If exp is negative and the base is not -1 or 1, the result will be fractional.
-        if (exp < 0 || exp > 63) {
-            return std::abs(base) == 1 || base == 0;
+    // If either number is a long, return a long. If both numbers are ints, then return an int if
+    // the result fits or a long if it is too big.
+    const auto formatResult = [baseType, expType](long long res) {
+        if (baseType == NumberLong || expType == NumberLong) {
+            return Value(res);
         }
-
-        struct MinMax {
-            long long min;
-            long long max;
-        };
-
-        // Array indices correspond to exponents 0 through 63. The values in each index are the min
-        // and max bases, respectively, that can be raised to that exponent without overflowing a
-        // 64-bit int. For max bases, this was computed by solving for b in
-        // b = (2^63-1)^(1/exp) for exp = [0, 63] and truncating b. To calculate min bases, for even
-        // exps the equation  used was b = (2^63-1)^(1/exp), and for odd exps the equation used was
-        // b = (-2^63)^(1/exp). Since the magnitude of long min is greater than long max, the
-        // magnitude of some of the min bases raised to odd exps is greater than the corresponding
-        // max bases raised to the same exponents.
-
-        static const MinMax kBaseLimits[] = {
-            {std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max()},  // 0
-            {std::numeric_limits<long long>::min(), std::numeric_limits<long long>::max()},
-            {-3037000499LL, 3037000499LL},
-            {-2097152, 2097151},
-            {-55108, 55108},
-            {-6208, 6208},
-            {-1448, 1448},
-            {-512, 511},
-            {-234, 234},
-            {-128, 127},
-            {-78, 78},  // 10
-            {-52, 52},
-            {-38, 38},
-            {-28, 28},
-            {-22, 22},
-            {-18, 18},
-            {-15, 15},
-            {-13, 13},
-            {-11, 11},
-            {-9, 9},
-            {-8, 8},  // 20
-            {-8, 7},
-            {-7, 7},
-            {-6, 6},
-            {-6, 6},
-            {-5, 5},
-            {-5, 5},
-            {-5, 5},
-            {-4, 4},
-            {-4, 4},
-            {-4, 4},  // 30
-            {-4, 4},
-            {-3, 3},
-            {-3, 3},
-            {-3, 3},
-            {-3, 3},
-            {-3, 3},
-            {-3, 3},
-            {-3, 3},
-            {-3, 3},
-            {-2, 2},  // 40
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},  // 50
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},
-            {-2, 2},  // 60
-            {-2, 2},
-            {-2, 2},
-            {-2, 1}};
-
-        return base >= kBaseLimits[exp].min && base <= kBaseLimits[exp].max;
+        return Value::createIntOrLong(res);
     };
 
-    long long baseLong = baseVal.getLong();
-    long long expLong = expVal.getLong();
+    const long long baseLong = baseVal.getLong();
+    const long long expLong = expVal.getLong();
 
-    // If the result cannot be represented as a long, return a double. Otherwise if either number is
-    // a long, return a long. If both numbers are ints, then return an int if the result fits or a
-    // long if it is too big.
-    if (!representableAsLong(baseLong, expLong)) {
+    // Use this when the result cannot be represented as a long.
+    const auto computeDoubleResult = [baseLong, expLong]() {
         return Value(std::pow(baseLong, expLong));
+    };
+
+    // Avoid doing repeated multiplication or using std::pow if the base is -1, 0, or 1.
+    if (baseLong == 0) {
+        if (expLong == 0) {
+            // 0^0 = 1.
+            return formatResult(1);
+        } else if (expLong > 0) {
+            // 0^x where x > 0 is 0.
+            return formatResult(0);
+        }
+
+        // We should have checked earlier that 0 to a negative power is banned.
+        MONGO_UNREACHABLE;
+    } else if (baseLong == 1) {
+        return formatResult(1);
+    } else if (baseLong == -1) {
+        // -1^0 = -1^2 = -1^4 = -1^6 ... = 1
+        // -1^1 = -1^3 = -1^5 = -1^7 ... = -1
+        return formatResult((expLong % 2 == 0) ? 1 : -1);
+    } else if (expLong > 63 || expLong < 0) {
+        // If the base is not 0, 1, or -1 and the exponent is too large, or negative,
+        // the result cannot be represented as a long.
+        return computeDoubleResult();
     }
 
-    long long result = 1;
-
-    // When 'baseLong' == -1 and 'expLong' is < 0 the following for loop will never run because
-    // 'expLong' will always be less than 0 so result will always be 1. This is not always correct
-    // because the result can potentially be -1. ex: 'baselong' = -1 'expLong' = -5 then result
-    // should be -1.
-    if (baseLong == -1 && expLong < 0) {
-        expLong = expLong % 2 == 0 ? 2 : 1;
+    // It's still possible that the result cannot be represented as a long. If that's the case,
+    // return a double.
+    if (!representableAsLong(baseLong, expLong)) {
+        return computeDoubleResult();
     }
 
-    // Use repeated multiplication, since pow() casts args to doubles which could result in loss of
-    // precision if arguments are very large.
-    for (int i = 0; i < expLong; i++) {
-        result *= baseLong;
-    }
+    // Use repeated multiplication, since pow() casts args to doubles which could result in
+    // loss of precision if arguments are very large.
+    const auto computeWithRepeatedMultiplication = [](long long base, long long exp) {
+        long long result = 1;
 
-    if (baseType == NumberLong || expType == NumberLong) {
-        return Value(result);
-    }
-    return Value::createIntOrLong(result);
+        while (exp > 1) {
+            if (exp % 2 == 1) {
+                result *= base;
+                exp--;
+            }
+            // 'exp' is now guaranteed to be even.
+            base *= base;
+            exp /= 2;
+        }
+
+        if (exp) {
+            invariant(exp == 1);
+            result *= base;
+        }
+
+        return result;
+    };
+
+    return formatResult(computeWithRepeatedMultiplication(baseLong, expLong));
 }
 
 REGISTER_EXPRESSION(pow, ExpressionPow::parse);
@@ -5166,7 +5210,7 @@ private:
                     << "Conversion would overflow target type in $convert with no onError value: "
                     << inputDouble,
                 inputDouble >= std::numeric_limits<long long>::lowest() &&
-                    inputDouble < ExpressionConvert::kLongLongMaxPlusOneAsDouble);
+                    inputDouble < BSONElement::kLongLongMaxPlusOneAsDouble);
 
         return Value(static_cast<long long>(inputDouble));
     }
@@ -5346,9 +5390,6 @@ Expression::Parser makeConversionAlias(const StringData shortcutName, BSONType t
 }
 
 }  // namespace
-
-const double ExpressionConvert::kLongLongMaxPlusOneAsDouble =
-    scalbn(1, std::numeric_limits<long long>::digits);
 
 REGISTER_EXPRESSION(convert, ExpressionConvert::parse);
 

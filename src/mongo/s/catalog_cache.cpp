@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -41,6 +43,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -119,6 +122,10 @@ CatalogCache::~CatalogCache() = default;
 
 StatusWith<CachedDatabaseInfo> CatalogCache::getDatabase(OperationContext* opCtx,
                                                          StringData dbName) {
+    invariant(!opCtx->lockState() || !opCtx->lockState()->isLocked(),
+              "Do not hold a lock while refreshing the catalog cache. Doing so would potentially "
+              "hold the lock during a network call, and can lead to a deadlock as described in "
+              "SERVER-37398.");
     try {
         while (true) {
             stdx::unique_lock<stdx::mutex> ul(_mutex);
@@ -194,6 +201,10 @@ StatusWith<CachedCollectionRoutingInfo> CatalogCache::getCollectionRoutingInfoAt
 
 CatalogCache::RefreshResult CatalogCache::_getCollectionRoutingInfoAt(
     OperationContext* opCtx, const NamespaceString& nss, boost::optional<Timestamp> atClusterTime) {
+    invariant(!opCtx->lockState() || !opCtx->lockState()->isLocked(),
+              "Do not hold a lock while refreshing the catalog cache. Doing so would potentially "
+              "hold the lock during a network call, and can lead to a deadlock as described in "
+              "SERVER-37398.");
     // This default value can cause a single unnecessary extra refresh if this thread did do the
     // refresh but the refresh failed, or if the database or collection was not found, but only if
     // the caller is getCollectionRoutingInfoWithRefresh with the parameter
@@ -357,6 +368,37 @@ void CatalogCache::onStaleShardVersion(CachedCollectionRoutingInfo&& ccriToInval
     }
 }
 
+void CatalogCache::checkEpochOrThrow(const NamespaceString& nss,
+                                     ChunkVersion targetCollectionVersion) const {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    const auto itDb = _collectionsByDb.find(nss.db());
+    uassert(StaleConfigInfo(nss, targetCollectionVersion, boost::none),
+            str::stream() << "could not act as router for " << nss.ns()
+                          << ", no entry for database "
+                          << nss.db(),
+            itDb != _collectionsByDb.end());
+
+    auto itColl = itDb->second.find(nss.ns());
+    uassert(StaleConfigInfo(nss, targetCollectionVersion, boost::none),
+            str::stream() << "could not act as router for " << nss.ns()
+                          << ", no entry for collection.",
+            itColl != itDb->second.end());
+
+    uassert(StaleConfigInfo(nss, targetCollectionVersion, boost::none),
+            str::stream() << "could not act as router for " << nss.ns() << ", wanted "
+                          << targetCollectionVersion.toString()
+                          << ", but found the collection was unsharded",
+            itColl->second->routingInfo);
+
+    auto foundVersion = itColl->second->routingInfo->getVersion();
+    uassert(StaleConfigInfo(nss, targetCollectionVersion, foundVersion),
+            str::stream() << "could not act as router for " << nss.ns() << ", wanted "
+                          << targetCollectionVersion.toString()
+                          << ", but found "
+                          << foundVersion.toString(),
+            foundVersion.epoch() == targetCollectionVersion.epoch());
+}
+
 void CatalogCache::invalidateDatabaseEntry(const StringData dbName) {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
     auto itDbEntry = _databases.find(dbName);
@@ -379,6 +421,17 @@ void CatalogCache::invalidateShardedCollection(const NamespaceString& nss) {
         itDb->second[nss.ns()] = std::make_shared<CollectionRoutingInfoEntry>();
     }
     itDb->second[nss.ns()]->needsRefresh = true;
+}
+
+void CatalogCache::purgeCollection(const NamespaceString& nss) {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+
+    auto itDb = _collectionsByDb.find(nss.db());
+    if (itDb == _collectionsByDb.end()) {
+        return;
+    }
+
+    itDb->second.erase(nss.ns());
 }
 
 void CatalogCache::purgeDatabase(StringData dbName) {
@@ -490,7 +543,7 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
                                               std::shared_ptr<CollectionRoutingInfoEntry> collEntry,
                                               NamespaceString const& nss,
                                               int refreshAttempt) {
-    const auto existingRoutingInfo = std::move(collEntry->routingInfo);
+    const auto existingRoutingInfo = collEntry->routingInfo;
 
     // If we have an existing chunk manager, the refresh is considered "incremental", regardless of
     // how many chunks are in the differential
@@ -609,6 +662,10 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
         stdx::lock_guard<stdx::mutex> lg(_mutex);
         onRefreshFailed(lg, status);
     }
+
+    // The routing info for this collection shouldn't change, as other threads may try to use the
+    // CatalogCache while we are waiting for the refresh to complete.
+    invariant(collEntry->routingInfo.get() == existingRoutingInfo.get());
 }
 
 void CatalogCache::Stats::report(BSONObjBuilder* builder) const {

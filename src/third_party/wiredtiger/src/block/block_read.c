@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -94,8 +94,8 @@ __wt_bm_read(WT_BM *bm, WT_SESSION_IMPL *session,
 	 * In diagnostic mode, verify the block we're about to read isn't on
 	 * the available list, or for live systems, the discard list.
 	 */
-	WT_RET(__wt_block_misplaced(
-	    session, block, "read", offset, size, bm->is_live));
+	WT_RET(__wt_block_misplaced(session,
+	    block, "read", offset, size, bm->is_live, __func__, __LINE__));
 #endif
 	/* Read the block. */
 	WT_RET(
@@ -120,7 +120,7 @@ __wt_bm_corrupt_dump(WT_SESSION_IMPL *session,
 	WT_DECL_RET;
 	size_t chunk, i, nchunks;
 
-#define	WT_CORRUPT_FMT	"{%" PRIuMAX ", %" PRIu32 ", %" PRIu32 "}"
+#define	WT_CORRUPT_FMT	"{%" PRIuMAX ", %" PRIu32 ", %#" PRIx32 "}"
 	if (buf->size == 0) {
 		__wt_errx(session,
 		    WT_CORRUPT_FMT ": empty buffer, no dump available",
@@ -226,7 +226,7 @@ __wt_block_read_off(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	uint32_t page_checksum;
 
 	__wt_verbose(session, WT_VERB_READ,
-	    "off %" PRIuMAX ", size %" PRIu32 ", checksum %" PRIu32,
+	    "off %" PRIuMAX ", size %" PRIu32 ", checksum %#" PRIx32,
 	    (uintmax_t)offset, size, checksum);
 
 	WT_STAT_CONN_INCR(session, block_read);
@@ -276,8 +276,8 @@ __wt_block_read_off(WT_SESSION_IMPL *session, WT_BLOCK *block,
 			__wt_errx(session,
 			    "%s: read checksum error for %" PRIu32 "B block at "
 			    "offset %" PRIuMAX ": calculated block checksum "
-			    "of %" PRIu32 " doesn't match expected checksum "
-			    "of %" PRIu32,
+			    "of %#" PRIx32 " doesn't match expected checksum "
+			    "of %#" PRIx32,
 			    block->name,
 			    size, (uintmax_t)offset, page_checksum, checksum);
 	} else
@@ -285,8 +285,8 @@ __wt_block_read_off(WT_SESSION_IMPL *session, WT_BLOCK *block,
 			__wt_errx(session,
 			    "%s: read checksum error for %" PRIu32 "B block at "
 			    "offset %" PRIuMAX ": block header checksum "
-			    "of %" PRIu32 " doesn't match expected checksum "
-			    "of %" PRIu32,
+			    "of %#" PRIx32 " doesn't match expected checksum "
+			    "of %#" PRIx32,
 			    block->name,
 			    size, (uintmax_t)offset, swap.checksum, checksum);
 
@@ -298,6 +298,5 @@ __wt_block_read_off(WT_SESSION_IMPL *session, WT_BLOCK *block,
 	F_SET(S2C(session), WT_CONN_DATA_CORRUPTION);
 	if (block->verify || F_ISSET(session, WT_SESSION_QUIET_CORRUPT_FILE))
 		return (WT_ERROR);
-	WT_PANIC_RET(
-	    session, WT_ERROR, "%s: fatal read error", block->name);
+	WT_PANIC_RET(session, WT_ERROR, "%s: fatal read error", block->name);
 }

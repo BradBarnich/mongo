@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -107,7 +109,7 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
                                    const HostAndPort& source,
                                    const NamespaceString& sourceNss,
                                    const CollectionOptions& options,
-                                   const CallbackFn& onCompletion,
+                                   CallbackFn onCompletion,
                                    StorageInterface* storageInterface,
                                    const int batchSize)
     : _executor(executor),
@@ -116,7 +118,7 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
       _sourceNss(sourceNss),
       _destNss(_sourceNss),
       _options(options),
-      _onCompletion(onCompletion),
+      _onCompletion(std::move(onCompletion)),
       _storageInterface(storageInterface),
       _countScheduler(_executor,
                       RemoteCommandRequest(
@@ -153,9 +155,10 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
       _indexSpecs(),
       _documentsToInsert(),
       _dbWorkTaskRunner(_dbWorkThreadPool),
-      _scheduleDbWorkFn([this](const executor::TaskExecutor::CallbackFn& work) {
-          auto task = [ this, work ](OperationContext * opCtx,
-                                     const Status& status) noexcept->TaskRunner::NextAction {
+      _scheduleDbWorkFn([this](executor::TaskExecutor::CallbackFn work) {
+          auto task = [ this, work = std::move(work) ](
+                          OperationContext * opCtx,
+                          const Status& status) mutable noexcept->TaskRunner::NextAction {
               try {
                   work(executor::TaskExecutor::CallbackArgs(nullptr, {}, status, opCtx));
               } catch (...) {
@@ -163,7 +166,7 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
               }
               return TaskRunner::NextAction::kDisposeOperationContext;
           };
-          _dbWorkTaskRunner.schedule(task);
+          _dbWorkTaskRunner.schedule(std::move(task));
           return executor::TaskExecutor::CallbackHandle();
       }),
       _createClientFn([] { return stdx::make_unique<DBClientConnection>(); }),
@@ -182,7 +185,7 @@ CollectionCloner::CollectionCloner(executor::TaskExecutor* executor,
     uassert(50953,
             "Missing collection UUID in CollectionCloner, collection name: " + sourceNss.ns(),
             _options.uuid);
-    uassert(ErrorCodes::BadValue, "callback function cannot be null", onCompletion);
+    uassert(ErrorCodes::BadValue, "callback function cannot be null", _onCompletion);
     uassert(ErrorCodes::BadValue, "storage interface cannot be null", storageInterface);
     uassert(
         50954, "collectionClonerBatchSize must be non-negative.", _collectionClonerBatchSize >= 0);
@@ -290,9 +293,9 @@ void CollectionCloner::waitForDbWorker() {
     _dbWorkTaskRunner.join();
 }
 
-void CollectionCloner::setScheduleDbWorkFn_forTest(const ScheduleDbWorkFn& scheduleDbWorkFn) {
+void CollectionCloner::setScheduleDbWorkFn_forTest(ScheduleDbWorkFn scheduleDbWorkFn) {
     LockGuard lk(_mutex);
-    _scheduleDbWorkFn = scheduleDbWorkFn;
+    _scheduleDbWorkFn = std::move(scheduleDbWorkFn);
 }
 
 void CollectionCloner::setCreateClientFn_forTest(const CreateClientFn& createClientFn) {
@@ -512,6 +515,7 @@ void CollectionCloner::_runQuery(const executor::TaskExecutor::CallbackArgs& cal
         queryStateOK = _queryState == QueryState::kNotStarted;
         if (queryStateOK) {
             _queryState = QueryState::kRunning;
+            _clientConnection = _createClientFn();
         }
     }
     if (!queryStateOK) {
@@ -532,7 +536,6 @@ void CollectionCloner::_runQuery(const executor::TaskExecutor::CallbackArgs& cal
         }
     }
 
-    _clientConnection = _createClientFn();
     Status clientConnectionStatus = _clientConnection->connect(_source, StringData());
     if (!clientConnectionStatus.isOK()) {
         _finishCallback(clientConnectionStatus);
@@ -550,13 +553,18 @@ void CollectionCloner::_runQuery(const executor::TaskExecutor::CallbackArgs& cal
     auto onCompletionGuard =
         std::make_shared<OnCompletionGuard>(cancelRemainingWorkInLock, finishCallbackFn);
 
+    // readOnce is available on 4.2 sync sources only.  Initially we don't know FCV, so
+    // we won't use the readOnce feature, but once the admin database is cloned we will use it.
+    // The admin database is always cloned first, so all user data should use readOnce.
+    const bool readOnceAvailable = serverGlobalParams.featureCompatibility.getVersionUnsafe() ==
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42;
     try {
         _clientConnection->query(
             [this, onCompletionGuard](DBClientCursorBatchIterator& iter) {
                 _handleNextBatch(onCompletionGuard, iter);
             },
             NamespaceStringOrUUID(_sourceNss.db().toString(), *_options.uuid),
-            Query(),
+            readOnceAvailable ? QUERY("query" << BSONObj() << "$readOnce" << true) : Query(),
             nullptr /* fieldsToReturn */,
             QueryOption_NoCursorTimeout | QueryOption_SlaveOk |
                 (collectionClonerUsesExhaust ? QueryOption_Exhaust : 0),
@@ -566,10 +574,14 @@ void CollectionCloner::_runQuery(const executor::TaskExecutor::CallbackArgs& cal
                                                                   << _sourceNss.ns());
         stdx::unique_lock<stdx::mutex> lock(_mutex);
         if (queryStatus.code() == ErrorCodes::OperationFailed ||
-            queryStatus.code() == ErrorCodes::CursorNotFound) {
+            queryStatus.code() == ErrorCodes::CursorNotFound ||
+            queryStatus.code() == ErrorCodes::QueryPlanKilled) {
             // With these errors, it's possible the collection was dropped while we were
             // cloning.  If so, we'll execute the drop during oplog application, so it's OK to
             // just stop cloning.
+            //
+            // A 4.2 node should only ever raise QueryPlanKilled, but an older node could raise
+            // OperationFailed or CursorNotFound.
             _verifyCollectionWasDropped(lock, queryStatus, onCompletionGuard);
             return;
         } else if (queryStatus.code() != ErrorCodes::NamespaceNotFound) {

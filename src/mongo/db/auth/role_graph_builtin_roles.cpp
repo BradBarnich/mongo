@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/auth/role_graph.h"
@@ -183,7 +185,6 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::getParameter
         << ActionType::getShardMap
         << ActionType::hostInfo
-        << ActionType::listCursors // clusterManager gets this also
         << ActionType::listDatabases
         << ActionType::listSessions // clusterManager gets this also
         << ActionType::listShards  // clusterManager gets this also
@@ -209,6 +210,7 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::applicationMessage  // clusterManager gets this also
         << ActionType::connPoolSync
         << ActionType::cpuProfiler
+        << ActionType::dropConnections
         << ActionType::logRotate
         << ActionType::setParameter
         << ActionType::shutdown
@@ -221,7 +223,8 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::killAnySession
         << ActionType::killop
         << ActionType::replSetResizeOplog
-        << ActionType::resync;  // clusterManager gets this also
+        << ActionType::resync  // clusterManager gets this also
+        << ActionType::trafficRecord;
 
     // hostManager role actions that target the database resource
     hostManagerRoleDatabaseActions
@@ -239,7 +242,6 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::resync  // hostManager gets this also
         << ActionType::addShard 
         << ActionType::removeShard
-        << ActionType::listCursors // clusterManager gets this also
         << ActionType::listSessions  // clusterMonitor gets this also
         << ActionType::listShards  // clusterMonitor gets this also
         << ActionType::flushRouterConfig  // hostManager gets this also
@@ -329,6 +331,10 @@ void addReadWriteAnyDbPrivileges(PrivilegeVector* privileges) {
 void addUserAdminAnyDbPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyNormalResource(), userAdminRoleActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forDatabaseName("local"), userAdminRoleActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forDatabaseName("config"), userAdminRoleActions));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forClusterResource(), ActionType::listDatabases));
     Privilege::addPrivilegeToPrivilegeVector(
@@ -527,6 +533,7 @@ void addQueryableBackupPrivileges(PrivilegeVector* privileges) {
 void addBackupPrivileges(PrivilegeVector* privileges) {
     ActionSet clusterActions;
     clusterActions << ActionType::appendOplogNote;  // For BRS
+    clusterActions << ActionType::serverStatus;     // For push based initial sync
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forClusterResource(), clusterActions));
 

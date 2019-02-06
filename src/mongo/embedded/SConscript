@@ -1,6 +1,6 @@
 # -*- mode: python; -*-
 
-# -*- mode: python; -*-
+import re
 
 Import("env")
 Import("get_option")
@@ -15,6 +15,7 @@ env.AppendUnique(
 # they can both use it.
 
 frameworksEnv = env.Clone()
+
 def mongo_export_file_generator(target, source, env, for_signature):
     if env.ToolchainIs('msvc'):
         script = env.File(env.subst("${TARGET.base}.def", target=target))
@@ -29,29 +30,35 @@ def mongo_export_file_generator(target, source, env, for_signature):
         pass
 frameworksEnv['MONGO_EXPORT_FILE_SHLINKFLAGS'] = mongo_export_file_generator
 
+# We need to set our bundle version in the plist file, but the format
+# is contrained to major.minor.patch. So trim off any '-pre' or '-rc'
+# information from the MONGO_VERSION and rename it to
+# MONGO_BUNDLE_VERSION.
+frameworksEnv['PLIST_MONGO_BUNDLE_VERSION'] = env['MONGO_VERSION'].split('-')[0]
+
+# Similarly, we need to derive a MinimumOSVersion based on the
+# -mXXX-version-minimum flag. Really, we should pull this out into an
+# SCons flag like OSX_DEPLOYMENT_TARGET so we don't need to grub
+# around in the flags.
+frameworksEnv['PLIST_MINIMUM_OS_VERSION'] = "0.0"
+for flag in frameworksEnv['CCFLAGS']:
+    if re.search('-m[a-z]+-version-min', flag):
+        frameworksEnv['PLIST_MINIMUM_OS_VERSION'] = flag.split('=')[1]
+        break
+
 env.SConscript(
     dirs=[
         'mongo_embedded',
         'mongoc_embedded',
+        'stitch_support',
     ],
     exports={
         'env' : frameworksEnv,
     },
 )
 
-if get_option('install-mode') == 'hygienic':
-    env.AutoInstall(
-        '',
-        source=[
-            'LICENSE-Embedded.txt',
-        ],
-        INSTALL_ALIAS=[
-            'embedded-dev',
-        ],
-    )
-
 yamlEnv = env.Clone()
-yamlEnv.InjectThirdPartyIncludePaths(libraries=['yaml'])
+yamlEnv.InjectThirdParty(libraries=['yaml'])
 
 env.Library(
     target='embedded',
@@ -64,6 +71,7 @@ env.Library(
         'embedded_options.cpp',
         'embedded_options_init.cpp',
         'embedded_options_parser_init.cpp',
+        'index_builds_coordinator_embedded.cpp',
         'logical_session_cache_factory_embedded.cpp',
         'periodic_runner_embedded.cpp',
         'process_interface_factory_embedded.cpp',
@@ -84,6 +92,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
         '$BUILD_DIR/mongo/db/commands/standalone',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/logical_session_cache',
         '$BUILD_DIR/mongo/db/logical_session_cache_impl',
         '$BUILD_DIR/mongo/db/op_observer_impl',

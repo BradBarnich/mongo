@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -33,12 +35,15 @@
 
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/queued_data_stage.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/logical_clock.h"
@@ -90,9 +95,25 @@ protected:
     }
 
     void addIndex(const IndexSpec& spec) {
-        DBDirectClient client(&_opCtx);
-        client.createIndex(ns(), spec);
-        client.getLastError();
+        BSONObjBuilder builder(spec.toBSON());
+        builder.append("v", int(IndexDescriptor::kLatestIndexVersion));
+        builder.append("ns", ns());
+        auto specObj = builder.obj();
+
+        MultiIndexBlock indexer(&_opCtx, _collection);
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            uassertStatusOK(indexer.init(specObj));
+            wunit.commit();
+        }
+        uassertStatusOK(indexer.insertAllDocumentsInCollection());
+        uassertStatusOK(indexer.drainBackgroundWrites());
+        uassertStatusOK(indexer.checkConstraints());
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            uassertStatusOK(indexer.commit());
+            wunit.commit();
+        }
     }
 
     void insert(const char* s) {
@@ -239,7 +260,7 @@ protected:
         _client.update(ns, Query(q), o, upsert);
     }
     bool error() {
-        return !_client.getPrevError().getField("err").isNull();
+        return !_client.getLastError().empty();
     }
 
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
@@ -280,10 +301,10 @@ public:
         cursor.reset();
 
         {
-            // Check internal server handoff to getmore.
-            dbtests::WriteContextForTests ctx(&_opCtx, ns);
+            // Check that a cursor has been registered with the global cursor manager, and has
+            // already returned its first batch of results.
             auto pinnedCursor = unittest::assertGet(
-                ctx.getCollection()->getCursorManager()->pinCursor(&_opCtx, cursorId));
+                CursorManager::getGlobalCursorManager()->pinCursor(&_opCtx, cursorId));
             ASSERT_EQUALS(std::uint64_t(2), pinnedCursor.getCursor()->nReturnedSoFar());
         }
 
@@ -346,6 +367,8 @@ public:
         _client.dropCollection("unittests.querytests.GetMoreInvalidRequest");
     }
     void run() {
+        auto startNumCursors = CursorManager::getGlobalCursorManager()->numCursors();
+
         // Create a collection with some data.
         const char* ns = "unittests.querytests.GetMoreInvalidRequest";
         for (int i = 0; i < 1000; ++i) {
@@ -364,20 +387,16 @@ public:
             ++count;
         }
 
-        // Send a get more with a namespace that is incorrect ('spoofed') for this cursor id.
-        // This is the invalaid get more request described in the comment preceding this class.
+        // Send a getMore with a namespace that is incorrect ('spoofed') for this cursor id.
         ASSERT_THROWS(
             _client.getMore("unittests.querytests.GetMoreInvalidRequest_WRONG_NAMESPACE_FOR_CURSOR",
                             cursor->getCursorId()),
             AssertionException);
 
-        // Check that the cursor still exists
-        {
-            AutoGetCollectionForReadCommand ctx(&_opCtx, NamespaceString(ns));
-            ASSERT(1 == ctx.getCollection()->getCursorManager()->numCursors());
-            ASSERT_OK(
-                ctx.getCollection()->getCursorManager()->pinCursor(&_opCtx, cursorId).getStatus());
-        }
+        // Check that the cursor still exists.
+        ASSERT_EQ(startNumCursors + 1, CursorManager::getGlobalCursorManager()->numCursors());
+        ASSERT_OK(
+            CursorManager::getGlobalCursorManager()->pinCursor(&_opCtx, cursorId).getStatus());
 
         // Check that the cursor can be iterated until all documents are returned.
         while (cursor->more()) {
@@ -385,6 +404,9 @@ public:
             ++count;
         }
         ASSERT_EQUALS(1000, count);
+
+        // The cursor should no longer exist, since we exhausted it.
+        ASSERT_EQ(startNumCursors, CursorManager::getGlobalCursorManager()->numCursors());
     }
 };
 
@@ -1258,11 +1280,7 @@ public:
     }
 
     size_t numCursorsOpen() {
-        AutoGetCollectionForReadCommand ctx(&_opCtx, NamespaceString(_ns));
-        Collection* collection = ctx.getCollection();
-        if (!collection)
-            return 0;
-        return collection->getCursorManager()->numCursors();
+        return CursorManager::getGlobalCursorManager()->numCursors();
     }
 
     const char* ns() {
@@ -1329,8 +1347,8 @@ public:
             ASSERT_OK(
                 collectionOptions.parse(fromjson("{ capped : true, size : 2000, max: 10000 }"),
                                         CollectionOptions::parseForCommand));
-            ASSERT(
-                Database::userCreateNS(&_opCtx, ctx.db(), ns(), collectionOptions, false).isOK());
+            NamespaceString nss(ns());
+            ASSERT(ctx.db()->userCreateNS(&_opCtx, nss, collectionOptions, false).isOK());
             wunit.commit();
         }
 

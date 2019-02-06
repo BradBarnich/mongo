@@ -1,30 +1,33 @@
 // bsonelement.h
 
-/*    Copyright 2009 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -354,6 +357,11 @@ public:
      *  very small doubles -> LLONG_MIN  */
     long long safeNumberLong() const;
 
+    /** This safeNumberLongForHash() function does the same thing as safeNumberLong, but it
+     *  preserves edge-case behavior from older versions.
+     */
+    long long safeNumberLongForHash() const;
+
     /** Retrieve decimal value for the element safely. */
     Decimal128 numberDecimal() const;
 
@@ -483,7 +491,7 @@ public:
         // BinData: <int len> <byte subtype> <byte[len] data>
         verify(type() == BinData);
         unsigned char c = (value() + 4)[0];
-        return (BinDataType)c;
+        return static_cast<BinDataType>(c);
     }
 
     std::vector<uint8_t> _binDataVector() const {
@@ -696,8 +704,23 @@ public:
 
     std::string _asCode() const;
 
-    template <typename T>
-    bool coerce(T* out) const;
+    bool coerce(std::string* out) const;
+    bool coerce(int* out) const;
+    bool coerce(long long* out) const;
+    bool coerce(double* out) const;
+    bool coerce(bool* out) const;
+    bool coerce(Decimal128* out) const;
+    bool coerce(std::vector<std::string>* out) const;
+
+    /**
+     * Constant double representation of 2^63, the smallest value that will overflow a long long.
+     *
+     * It is not safe to obtain this value by casting std::numeric_limits<long long>::max() to
+     * double, because the conversion loses precision, and the C++ standard leaves it up to the
+     * implementation to decide whether to round up to 2^63 or round down to the next representable
+     * value (2^63 - 2^10).
+     */
+    static const double kLongLongMaxPlusOneAsDouble;
 
 private:
     const char* data;
@@ -833,7 +856,7 @@ inline long long BSONElement::safeNumberLong() const {
             if (std::isnan(d)) {
                 return 0;
             }
-            if (d > (double)std::numeric_limits<long long>::max()) {
+            if (!(d < kLongLongMaxPlusOneAsDouble)) {
                 return std::numeric_limits<long long>::max();
             }
             if (d < std::numeric_limits<long long>::min()) {
@@ -857,6 +880,38 @@ inline long long BSONElement::safeNumberLong() const {
         default:
             return numberLong();
     }
+}
+
+/**
+ * This safeNumberLongForHash() function does the same thing as safeNumberLong, but it preserves
+ * edge-case behavior from older versions. It's provided for use by hash functions that need to
+ * maintain compatibility with older versions. Don't make any changes to safeNumberLong() without
+ * ensuring that this function (which is implemented in terms of safeNumberLong()) has exactly the
+ * same behavior.
+ *
+ * Historically, safeNumberLong() used a check that would consider 2^63 to be safe to cast to
+ * int64_t, but that value actually overflows. That overflow is preserved here.
+ *
+ * The new safeNumberLong() function uses a tight bound, allowing it to correctly clamp double 2^63
+ * to the max 64-bit int (2^63 - 1).
+ */
+inline long long BSONElement::safeNumberLongForHash() const {
+    if (NumberDouble == type()) {
+        double d = numberDouble();
+        if (std::isnan(d)) {
+            return 0;
+        }
+        if (d > (double)std::numeric_limits<long long>::max()) {
+            return std::numeric_limits<long long>::max();
+        }
+        if (d < std::numeric_limits<long long>::min()) {
+            return std::numeric_limits<long long>::min();
+        }
+        return (long long)d;
+    }
+
+    // safeNumberLong() and safeNumberLongForHash() have identical behavior for non-long value.
+    return safeNumberLong();
 }
 
 inline BSONElement::BSONElement() {

@@ -228,7 +228,7 @@ assert("queryPlanner" in explain.stages[0].$cursor);
 // Basic count.
 explain = t.explain().count();
 assert.commandWorked(explain);
-assert(planHasStage(db, explain.queryPlanner.winningPlan, "COUNT"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "RECORD_STORE_FAST_COUNT"));
 
 // Tests for applySkipLimit argument to .count. When we don't apply the skip, we
 // count one result. When we do apply the skip we count zero.
@@ -265,12 +265,12 @@ assert.commandWorked(t.dropIndex({c: 1}));
 
 explain = t.explain().distinct('_id');
 assert.commandWorked(explain);
-assert(planHasStage(db, explain.queryPlanner.winningPlan, "PROJECTION"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "PROJECTION_COVERED"));
 assert(planHasStage(db, explain.queryPlanner.winningPlan, "DISTINCT_SCAN"));
 
 explain = t.explain().distinct('a');
 assert.commandWorked(explain);
-assert(planHasStage(db, explain.queryPlanner.winningPlan, "PROJECTION"));
+assert(planHasStage(db, explain.queryPlanner.winningPlan, "PROJECTION_COVERED"));
 assert(planHasStage(db, explain.queryPlanner.winningPlan, "DISTINCT_SCAN"));
 
 explain = t.explain().distinct('b');

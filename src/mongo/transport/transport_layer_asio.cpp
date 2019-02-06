@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -54,9 +56,11 @@
 #endif
 
 // session_asio.h has some header dependencies that require it to be the last header.
+
 #ifdef __linux__
 #include "mongo/transport/baton_asio_linux.h"
 #endif
+
 #include "mongo/transport/session_asio.h"
 
 namespace mongo {
@@ -77,7 +81,7 @@ public:
 
     void cancel(const BatonHandle& baton = nullptr) override {
         // If we have a baton try to cancel that.
-        if (baton && baton->cancelTimer(*this)) {
+        if (baton && baton->networking() && baton->networking()->cancelTimer(*this)) {
             LOG(2) << "Canceled via baton, skipping asio cancel.";
             return;
         }
@@ -88,8 +92,9 @@ public:
 
 
     Future<void> waitUntil(Date_t expiration, const BatonHandle& baton = nullptr) override {
-        if (baton) {
-            return _asyncWait([&] { return baton->waitUntil(*this, expiration); }, baton);
+        if (baton && baton->networking()) {
+            return _asyncWait([&] { return baton->networking()->waitUntil(*this, expiration); },
+                              baton);
         } else {
             return _asyncWait([&] { _timer->expires_at(expiration.toSystemTimePoint()); });
         }
@@ -103,7 +108,9 @@ private:
 
             armTimer();
             return _timer->async_wait(UseFuture{}).tapError([timer = _timer](const Status& status) {
-                LOG(2) << "Timer received error: " << status;
+                if (status != ErrorCodes::CallbackCanceled) {
+                    LOG(2) << "Timer received error: " << status;
+                }
             });
 
         } catch (asio::system_error& ex) {
@@ -116,11 +123,11 @@ private:
         cancel(baton);
 
         auto pf = makePromiseFuture<void>();
-        armTimer().getAsync([sp = pf.promise.share()](Status status) mutable {
+        armTimer().getAsync([p = std::move(pf.promise)](Status status) mutable {
             if (status.isOK()) {
-                sp.emplaceValue();
+                p.emplaceValue();
             } else {
-                sp.setError(status);
+                p.setError(status);
             }
         });
 
@@ -178,9 +185,9 @@ public:
 
     void schedule(ScheduleMode mode, Task task) override {
         if (mode == kDispatch) {
-            _ioContext.dispatch(std::move(task));
+            asio::dispatch(_ioContext, std::move(task));
         } else {
-            _ioContext.post(std::move(task));
+            asio::post(_ioContext, std::move(task));
         }
     }
 
@@ -257,8 +264,20 @@ public:
         return &_endpoint;
     }
 
+    const Endpoint* operator->() const noexcept {
+        return &_endpoint;
+    }
+
     Endpoint& operator*() noexcept {
         return _endpoint;
+    }
+
+    const Endpoint& operator*() const noexcept {
+        return _endpoint;
+    }
+
+    bool operator<(const WrappedEndpoint& rhs) const noexcept {
+        return _endpoint < rhs._endpoint;
     }
 
     const std::string& toString() const {
@@ -508,7 +527,7 @@ Future<SessionHandle> TransportLayerASIO::asyncConnect(HostAndPort peer,
               resolver(context),
               peer(std::move(peer)) {}
 
-        AtomicBool done{false};
+        AtomicWord<bool> done{false};
         Promise<SessionHandle> promise;
 
         stdx::mutex mutex;
@@ -638,8 +657,9 @@ Status TransportLayerASIO::setup() {
     _listenerPort = _listenerOptions.port;
     WrappedResolver resolver(*_acceptorReactor);
 
+    // Self-deduplicating list of unique endpoint addresses.
+    std::set<WrappedEndpoint> endpoints;
     for (auto& ip : listenAddrs) {
-        std::error_code ec;
         if (ip.empty()) {
             warning() << "Skipping empty bind address";
             continue;
@@ -652,68 +672,68 @@ Status TransportLayerASIO::setup() {
             continue;
         }
         auto& addrs = swAddrs.getValue();
+        endpoints.insert(addrs.begin(), addrs.end());
+    }
 
-        for (auto& addr : addrs) {
+    for (auto& addr : endpoints) {
 #ifndef _WIN32
-            if (addr.family() == AF_UNIX) {
-                if (::unlink(addr.toString().c_str()) == -1 && errno != ENOENT) {
-                    error() << "Failed to unlink socket file " << addr.toString().c_str() << " "
-                            << errnoWithDescription(errno);
-                    fassertFailedNoTrace(40486);
-                }
+        if (addr.family() == AF_UNIX) {
+            if (::unlink(addr.toString().c_str()) == -1 && errno != ENOENT) {
+                error() << "Failed to unlink socket file " << addr.toString().c_str() << " "
+                        << errnoWithDescription(errno);
+                fassertFailedNoTrace(40486);
             }
-#endif
-            if (addr.family() == AF_INET6 && !_listenerOptions.enableIPv6) {
-                error() << "Specified ipv6 bind address, but ipv6 is disabled";
-                fassertFailedNoTrace(40488);
-            }
-
-            GenericAcceptor acceptor(*_acceptorReactor);
-            acceptor.open(addr->protocol());
-            acceptor.set_option(GenericAcceptor::reuse_address(true));
-            if (addr.family() == AF_INET6) {
-                acceptor.set_option(asio::ip::v6_only(true));
-            }
-
-            acceptor.non_blocking(true, ec);
-            if (ec) {
-                return errorCodeToStatus(ec);
-            }
-
-            acceptor.bind(*addr, ec);
-            if (ec) {
-                return errorCodeToStatus(ec);
-            }
-
-#ifndef _WIN32
-            if (addr.family() == AF_UNIX) {
-                if (::chmod(addr.toString().c_str(), serverGlobalParams.unixSocketPermissions) ==
-                    -1) {
-                    error() << "Failed to chmod socket file " << addr.toString().c_str() << " "
-                            << errnoWithDescription(errno);
-                    fassertFailedNoTrace(40487);
-                }
-            }
-#endif
-            if (_listenerOptions.port == 0 &&
-                (addr.family() == AF_INET || addr.family() == AF_INET6)) {
-                if (_listenerPort != _listenerOptions.port) {
-                    return Status(ErrorCodes::BadValue,
-                                  "Port 0 (ephemeral port) is not allowed when"
-                                  " listening on multiple IP interfaces");
-                }
-                std::error_code ec;
-                auto endpoint = acceptor.local_endpoint(ec);
-                if (ec) {
-                    return errorCodeToStatus(ec);
-                }
-                _listenerPort = endpointToHostAndPort(endpoint).port();
-            }
-
-            sockaddr_storage sa;
-            memcpy(&sa, addr->data(), addr->size());
-            _acceptors.emplace_back(SockAddr(sa, addr->size()), std::move(acceptor));
         }
+#endif
+        if (addr.family() == AF_INET6 && !_listenerOptions.enableIPv6) {
+            error() << "Specified ipv6 bind address, but ipv6 is disabled";
+            fassertFailedNoTrace(40488);
+        }
+
+        GenericAcceptor acceptor(*_acceptorReactor);
+        acceptor.open(addr->protocol());
+        acceptor.set_option(GenericAcceptor::reuse_address(true));
+        if (addr.family() == AF_INET6) {
+            acceptor.set_option(asio::ip::v6_only(true));
+        }
+
+        std::error_code ec;
+        acceptor.non_blocking(true, ec);
+        if (ec) {
+            return errorCodeToStatus(ec);
+        }
+
+        acceptor.bind(*addr, ec);
+        if (ec) {
+            return errorCodeToStatus(ec);
+        }
+
+#ifndef _WIN32
+        if (addr.family() == AF_UNIX) {
+            if (::chmod(addr.toString().c_str(), serverGlobalParams.unixSocketPermissions) == -1) {
+                error() << "Failed to chmod socket file " << addr.toString().c_str() << " "
+                        << errnoWithDescription(errno);
+                fassertFailedNoTrace(40487);
+            }
+        }
+#endif
+        if (_listenerOptions.port == 0 && (addr.family() == AF_INET || addr.family() == AF_INET6)) {
+            if (_listenerPort != _listenerOptions.port) {
+                return Status(ErrorCodes::BadValue,
+                              "Port 0 (ephemeral port) is not allowed when"
+                              " listening on multiple IP interfaces");
+            }
+            std::error_code ec;
+            auto endpoint = acceptor.local_endpoint(ec);
+            if (ec) {
+                return errorCodeToStatus(ec);
+            }
+            _listenerPort = endpointToHostAndPort(endpoint).port();
+        }
+
+        sockaddr_storage sa;
+        memcpy(&sa, addr->data(), addr->size());
+        _acceptors.emplace_back(SockAddr(sa, addr->size()), std::move(acceptor));
     }
 
     if (_acceptors.empty() && _listenerOptions.isIngress()) {
@@ -722,26 +742,25 @@ Status TransportLayerASIO::setup() {
 
 #ifdef MONGO_CONFIG_SSL
     const auto& sslParams = getSSLGlobalParams();
-    auto sslManager = getSSLManager();
 
     if (_sslMode() != SSLParams::SSLMode_disabled && _listenerOptions.isIngress()) {
         _ingressSSLContext = stdx::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
 
         Status status =
-            sslManager->initSSLContext(_ingressSSLContext->native_handle(),
-                                       sslParams,
-                                       SSLManagerInterface::ConnectionDirection::kIncoming);
+            getSSLManager()->initSSLContext(_ingressSSLContext->native_handle(),
+                                            sslParams,
+                                            SSLManagerInterface::ConnectionDirection::kIncoming);
         if (!status.isOK()) {
             return status;
         }
     }
 
-    if (_listenerOptions.isEgress() && sslManager) {
+    if (_listenerOptions.isEgress() && getSSLManager()) {
         _egressSSLContext = stdx::make_unique<asio::ssl::context>(asio::ssl::context::sslv23);
         Status status =
-            sslManager->initSSLContext(_egressSSLContext->native_handle(),
-                                       sslParams,
-                                       SSLManagerInterface::ConnectionDirection::kOutgoing);
+            getSSLManager()->initSSLContext(_egressSSLContext->native_handle(),
+                                            sslParams,
+                                            SSLManagerInterface::ConnectionDirection::kOutgoing);
         if (!status.isOK()) {
             return status;
         }
@@ -759,6 +778,7 @@ Status TransportLayerASIO::start() {
         for (auto& acceptor : _acceptors) {
             acceptor.second.listen(serverGlobalParams.listenBacklog);
             _acceptConnection(acceptor.second);
+            log() << "Listening on " << acceptor.first.getAddr();
         }
 
         _listenerThread = stdx::thread([this] {
@@ -858,8 +878,8 @@ SSLParams::SSLModes TransportLayerASIO::_sslMode() const {
 }
 #endif
 
-BatonHandle TransportLayerASIO::makeBaton(OperationContext* opCtx) {
 #ifdef __linux__
+BatonHandle TransportLayerASIO::makeBaton(OperationContext* opCtx) const {
     auto baton = std::make_shared<BatonASIO>(opCtx);
 
     {
@@ -868,11 +888,9 @@ BatonHandle TransportLayerASIO::makeBaton(OperationContext* opCtx) {
         opCtx->setBaton(baton);
     }
 
-    return std::move(baton);
-#else
-    return nullptr;
-#endif
+    return baton;
 }
+#endif
 
 }  // namespace transport
 }  // namespace mongo

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2008-2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,7 +40,6 @@
 #include "mongo/bson/bsonelement_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
@@ -48,6 +49,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
@@ -56,7 +58,6 @@
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
-#include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/bgsync.h"
@@ -70,7 +71,11 @@
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/storage/remove_saver.h"
+#include "mongo/db/transaction_participant.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -227,10 +232,6 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
     if (isNestedApplyOpsCommand) {
         if (!ourObj.hasField("ts")) {
             bob.appendTimestamp("ts");
-        }
-        if (!ourObj.hasField("h")) {
-            long long dummyHash = 0;
-            bob.append("h", dummyHash);
         }
     }
     bob.appendElements(ourObj);
@@ -742,7 +743,7 @@ void dropCollection(OperationContext* opCtx,
                     Collection* collection,
                     Database* db) {
     if (RollbackImpl::shouldCreateDataFiles()) {
-        Helpers::RemoveSaver removeSaver("rollback", "", nss.ns());
+        RemoveSaver removeSaver("rollback", "", nss.ns());
 
         // Performs a collection scan and writes all documents in the collection to disk
         // in order to keep an archive of items that were rolled back.
@@ -762,11 +763,10 @@ void dropCollection(OperationContext* opCtx,
         }
 
         // If we exited the above for loop with any other execState than IS_EOF, this means that
-        // a FAILURE or DEAD state was returned. If a DEAD state occurred, the collection or
-        // database that we are attempting to save may no longer be valid. If a FAILURE state
-        // was returned, either an unrecoverable error was thrown by exec, or we attempted to
-        // retrieve data that could not be provided by the PlanExecutor. In both of these cases
-        // it is necessary for a full resync of the server.
+        // a FAILURE state was returned. If a FAILURE state was returned, either an unrecoverable
+        // error was thrown by exec, or we attempted to retrieve data that could not be provided
+        // by the PlanExecutor. In both of these cases it is necessary for a full resync of the
+        // server.
 
         if (execState != PlanExecutor::IS_EOF) {
             if (execState == PlanExecutor::FAILURE &&
@@ -843,7 +843,8 @@ void rollbackRenameCollection(OperationContext* opCtx, UUID uuid, RenameCollecti
     log() << "Attempting to rename collection with UUID: " << uuid << ", from: " << info.renameFrom
           << ", to: " << info.renameTo;
     Lock::DBLock dbLock(opCtx, dbName, MODE_X);
-    auto db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbName);
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->openDb(opCtx, dbName);
     invariant(db);
 
     auto status = renameCollectionForRollback(opCtx, info.renameTo, uuid);
@@ -892,7 +893,7 @@ Status _syncRollback(OperationContext* opCtx,
 
     // Find the UUID of the transactions collection. An OperationContext is required because the
     // UUID is not known at compile time, so the SessionCatalog needs to load the collection.
-    how.transactionTableUUID = SessionCatalog::getTransactionTableUUID(opCtx);
+    how.transactionTableUUID = MongoDSessionCatalog::getTransactionTableUUID(opCtx);
 
     log() << "Finding the Common Point";
     try {
@@ -1140,7 +1141,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
             Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
 
-            auto db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, nss.db().toString());
+            auto databaseHolder = DatabaseHolder::get(opCtx);
+            auto db = databaseHolder->openDb(opCtx, nss.db().toString());
             invariant(db);
 
             Collection* collection = UUIDCatalog::get(opCtx).lookupCollectionByUUID(uuid);
@@ -1252,13 +1254,13 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         // while rolling back createCollection operations.
 
         const auto& uuid = nsAndGoodVersionsByDocID.first;
-        unique_ptr<Helpers::RemoveSaver> removeSaver;
+        unique_ptr<RemoveSaver> removeSaver;
         invariant(!fixUpInfo.collectionsToDrop.count(uuid));
 
         NamespaceString nss = catalog.lookupNSSByUUID(uuid);
 
         if (RollbackImpl::shouldCreateDataFiles()) {
-            removeSaver = std::make_unique<Helpers::RemoveSaver>("rollback", "", nss.ns());
+            removeSaver = std::make_unique<RemoveSaver>("rollback", "", nss.ns());
         }
 
         const auto& goodVersionsByDocID = nsAndGoodVersionsByDocID.second;
@@ -1389,8 +1391,6 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                     request.setUpdates(idAndDoc.second);
                     request.setGod();
                     request.setUpsert();
-                    UpdateLifecycleImpl updateLifecycle(nss);
-                    request.setLifecycle(&updateLifecycle);
 
                     update(opCtx, ctx.db(), request);
                 }
@@ -1404,6 +1404,21 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
     log() << "Rollback deleted " << deletes << " documents and updated " << updates
           << " documents.";
+
+    // When majority read concern is disabled, the stable timestamp may be ahead of the common
+    // point. Force the stable timestamp back to the common point.
+    if (!serverGlobalParams.enableMajorityReadConcern) {
+        const bool force = true;
+        log() << "Forcing the stable timestamp to " << fixUpInfo.commonPoint.getTimestamp();
+        opCtx->getServiceContext()->getStorageEngine()->setStableTimestamp(
+            fixUpInfo.commonPoint.getTimestamp(), boost::none, force);
+
+        // We must wait for a checkpoint before truncating oplog, so that if we crash after
+        // truncating oplog, we are guaranteed to recover from a checkpoint that includes all of the
+        // writes performed during the rollback.
+        log() << "Waiting for a stable checkpoint";
+        opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable();
+    }
 
     log() << "Truncating the oplog at " << fixUpInfo.commonPoint.toString() << " ("
           << fixUpInfo.commonPointOurDiskloc << "), non-inclusive";
@@ -1425,7 +1440,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         oplogCollection->cappedTruncateAfter(opCtx, fixUpInfo.commonPointOurDiskloc, false);
     }
 
-    Status status = getGlobalAuthorizationManager()->initialize(opCtx);
+    Status status = AuthorizationManager::get(opCtx->getServiceContext())->initialize(opCtx);
     if (!status.isOK()) {
         severe() << "Failed to reinitialize auth data after rollback: " << redact(status);
         fassertFailedNoTrace(40496);
@@ -1433,15 +1448,28 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
     // If necessary, clear the memory of existing sessions.
     if (fixUpInfo.refetchTransactionDocs) {
-        SessionCatalog::get(opCtx)->invalidateSessions(opCtx, boost::none);
+        MongoDSessionCatalog::invalidateSessions(opCtx, boost::none);
     }
 
     if (auto validator = LogicalTimeValidator::get(opCtx)) {
         validator->resetKeyManagerCache();
     }
 
+    // The code below will force the config server to update its shard registry.
+    // Otherwise it may have the stale data that has been just rolled back.
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        if (auto shardRegistry = Grid::get(opCtx)->shardRegistry()) {
+            auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+            ON_BLOCK_EXIT([ argsCopy = readConcernArgs, &readConcernArgs ] {
+                readConcernArgs = std::move(argsCopy);
+            });
+            readConcernArgs = repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
+            shardRegistry->reload(opCtx);
+        }
+    }
+
     // Reload the lastAppliedOpTime and lastDurableOpTime value in the replcoord and the
-    // lastAppliedHash value in bgsync to reflect our new last op. The rollback common point does
+    // lastApplied value in bgsync to reflect our new last op. The rollback common point does
     // not necessarily represent a consistent database state. For example, on a secondary, we may
     // have rolled back to an optime that fell in the middle of an oplog application batch. We make
     // the database consistent again after rollback by applying ops forward until we reach
@@ -1490,8 +1518,9 @@ void rollback(OperationContext* opCtx,
     // then.
 
     {
-        Lock::GlobalWrite globalWrite(opCtx);
-        auto status = replCoord->setFollowerMode(MemberState::RS_ROLLBACK);
+        ReplicationStateTransitionLockGuard transitionGuard(opCtx);
+
+        auto status = replCoord->setFollowerModeStrict(opCtx, MemberState::RS_ROLLBACK);
         if (!status.isOK()) {
             log() << "Cannot transition from " << replCoord->getMemberState().toString() << " to "
                   << MemberState(MemberState::RS_ROLLBACK).toString() << causedBy(status);

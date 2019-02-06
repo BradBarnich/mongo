@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2009 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 // CHECK_LOG_REDACTION
 
@@ -340,21 +342,20 @@ void CurOp::setGenericOpRequestDetails(OperationContext* opCtx,
     _ns = nss.ns();
 }
 
-ProgressMeter& CurOp::setMessage_inlock(const char* msg,
-                                        std::string name,
-                                        unsigned long long progressMeterTotal,
-                                        int secondsBetween) {
-    if (progressMeterTotal) {
-        if (_progressMeter.isActive()) {
-            error() << "old _message: " << redact(_message) << " new message:" << redact(msg);
-            verify(!_progressMeter.isActive());
-        }
-        _progressMeter.reset(progressMeterTotal, secondsBetween);
-        _progressMeter.setName(name);
-    } else {
-        _progressMeter.finished();
+void CurOp::setMessage_inlock(StringData message) {
+    if (_progressMeter.isActive()) {
+        error() << "old _message: " << redact(_message) << " new message:" << redact(message);
+        verify(!_progressMeter.isActive());
     }
-    _message = msg;
+    _message = message.toString();  // copy
+}
+
+ProgressMeter& CurOp::setProgress_inlock(StringData message,
+                                         unsigned long long progressMeterTotal,
+                                         int secondsBetween) {
+    setMessage_inlock(message);
+    _progressMeter.reset(progressMeterTotal, secondsBetween);
+    _progressMeter.setName(message);
     return _progressMeter;
 }
 
@@ -405,6 +406,7 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
 
     if (shouldLogOp || (shouldSample && _debug.executionTimeMicros > slowMs * 1000LL)) {
         auto lockerInfo = opCtx->lockState()->getLockerInfo(_lockStatsBase);
+        _debug.storageStats = opCtx->recoveryUnit()->getOperationStatistics();
         log(component) << _debug.report(client, *this, (lockerInfo ? &lockerInfo->stats : nullptr));
     }
 
@@ -473,6 +475,37 @@ void appendAsObjOrString(StringData name,
 }
 }  // namespace
 
+BSONObj CurOp::truncateAndSerializeGenericCursor(GenericCursor* cursor,
+                                                 boost::optional<size_t> maxQuerySize) {
+    // This creates a new builder to truncate the object that will go into the curOp output. In
+    // order to make sure the object is not too large but not truncate the comment, we only
+    // truncate the originatingCommand and not the entire cursor.
+    if (maxQuerySize) {
+        BSONObjBuilder tempObj;
+        appendAsObjOrString(
+            "truncatedObj", cursor->getOriginatingCommand().get(), maxQuerySize, &tempObj);
+        auto originatingCommand = tempObj.done().getObjectField("truncatedObj");
+        cursor->setOriginatingCommand(originatingCommand.getOwned());
+    }
+    // lsid, ns, and planSummary exist in the top level curop object, so they need to be temporarily
+    // removed from the cursor object to avoid duplicating information.
+    auto lsid = cursor->getLsid();
+    auto ns = cursor->getNs();
+    auto originalPlanSummary(cursor->getPlanSummary() ? boost::optional<std::string>(
+                                                            cursor->getPlanSummary()->toString())
+                                                      : boost::none);
+    cursor->setLsid(boost::none);
+    cursor->setNs(boost::none);
+    cursor->setPlanSummary(boost::none);
+    auto serialized = cursor->toBSON();
+    cursor->setLsid(lsid);
+    cursor->setNs(ns);
+    if (originalPlanSummary) {
+        cursor->setPlanSummary(StringData(*originalPlanSummary));
+    }
+    return serialized;
+}
+
 void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
     if (_start) {
         builder->append("secs_running", durationCount<Seconds>(elapsedTimeTotal()));
@@ -495,23 +528,8 @@ void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
     }
 
     if (_genericCursor) {
-        // This creates a new builder to truncate the object that will go into the curOp output. In
-        // order to make sure the object is not too large but not truncate the comment, we only
-        // truncate the originatingCommand and not the entire cursor.
-        BSONObjBuilder tempObj;
-        appendAsObjOrString(
-            "truncatedObj", _genericCursor->getOriginatingCommand().get(), maxQuerySize, &tempObj);
-        auto originatingCommand = tempObj.done().getObjectField("truncatedObj");
-        _genericCursor->setOriginatingCommand(originatingCommand.getOwned());
-        // lsid and ns exist in the top level curop object, so they need to be temporarily
-        // removed from the cursor object to avoid duplicating information.
-        auto lsid = _genericCursor->getLsid();
-        auto ns = _genericCursor->getNs();
-        _genericCursor->setLsid(boost::none);
-        _genericCursor->setNs(boost::none);
-        builder->append("cursor", _genericCursor->toBSON());
-        _genericCursor->setLsid(lsid);
-        _genericCursor->setNs(ns);
+        builder->append("cursor",
+                        truncateAndSerializeGenericCursor(&(*_genericCursor), maxQuerySize));
     }
 
     if (!_message.empty()) {
@@ -646,7 +664,6 @@ string OpDebug::report(Client* client,
     OPDEBUG_TOSTRING_HELP_BOOL(upsert);
     OPDEBUG_TOSTRING_HELP_BOOL(cursorExhausted);
 
-    OPDEBUG_TOSTRING_HELP_OPTIONAL("nmoved", additiveMetrics.nmoved);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("keysInserted", additiveMetrics.keysInserted);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("keysDeleted", additiveMetrics.keysDeleted);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("prepareReadConflicts", additiveMetrics.prepareReadConflicts);
@@ -657,7 +674,10 @@ string OpDebug::report(Client* client,
 
     if (queryHash) {
         s << " queryHash:" << unsignedIntToFixedLengthHex(*queryHash);
+        invariant(planCacheKey);
+        s << " planCacheKey:" << unsignedIntToFixedLengthHex(*planCacheKey);
     }
+
     if (!errInfo.isOK()) {
         s << " ok:" << 0;
         if (!errInfo.reason().empty()) {
@@ -675,6 +695,10 @@ string OpDebug::report(Client* client,
         BSONObjBuilder locks;
         lockStats->report(&locks);
         s << " locks:" << locks.obj().toString();
+    }
+
+    if (storageStats) {
+        s << " storage:" << storageStats->toBSON().toString();
     }
 
     if (iscommand) {
@@ -731,7 +755,6 @@ void OpDebug::append(const CurOp& curop,
     OPDEBUG_APPEND_BOOL(upsert);
     OPDEBUG_APPEND_BOOL(cursorExhausted);
 
-    OPDEBUG_APPEND_OPTIONAL("nmoved", additiveMetrics.nmoved);
     OPDEBUG_APPEND_OPTIONAL("keysInserted", additiveMetrics.keysInserted);
     OPDEBUG_APPEND_OPTIONAL("keysDeleted", additiveMetrics.keysDeleted);
     OPDEBUG_APPEND_OPTIONAL("prepareReadConflicts", additiveMetrics.prepareReadConflicts);
@@ -742,11 +765,17 @@ void OpDebug::append(const CurOp& curop,
 
     if (queryHash) {
         b.append("queryHash", unsignedIntToFixedLengthHex(*queryHash));
+        invariant(planCacheKey);
+        b.append("planCacheKey", unsignedIntToFixedLengthHex(*planCacheKey));
     }
 
     {
         BSONObjBuilder locks(b.subobjStart("locks"));
         lockStats.report(&locks);
+    }
+
+    if (storageStats) {
+        b.append("storage", storageStats->toBSON());
     }
 
     if (!errInfo.isOK()) {
@@ -807,7 +836,6 @@ void OpDebug::AdditiveMetrics::add(const AdditiveMetrics& otherMetrics) {
     nModified = addOptionalLongs(nModified, otherMetrics.nModified);
     ninserted = addOptionalLongs(ninserted, otherMetrics.ninserted);
     ndeleted = addOptionalLongs(ndeleted, otherMetrics.ndeleted);
-    nmoved = addOptionalLongs(nmoved, otherMetrics.nmoved);
     keysInserted = addOptionalLongs(keysInserted, otherMetrics.keysInserted);
     keysDeleted = addOptionalLongs(keysDeleted, otherMetrics.keysDeleted);
     prepareReadConflicts =
@@ -819,8 +847,7 @@ bool OpDebug::AdditiveMetrics::equals(const AdditiveMetrics& otherMetrics) {
     return keysExamined == otherMetrics.keysExamined && docsExamined == otherMetrics.docsExamined &&
         nMatched == otherMetrics.nMatched && nModified == otherMetrics.nModified &&
         ninserted == otherMetrics.ninserted && ndeleted == otherMetrics.ndeleted &&
-        nmoved == otherMetrics.nmoved && keysInserted == otherMetrics.keysInserted &&
-        keysDeleted == otherMetrics.keysDeleted &&
+        keysInserted == otherMetrics.keysInserted && keysDeleted == otherMetrics.keysDeleted &&
         prepareReadConflicts == otherMetrics.prepareReadConflicts &&
         writeConflicts == otherMetrics.writeConflicts;
 }
@@ -846,13 +873,6 @@ void OpDebug::AdditiveMetrics::incrementKeysDeleted(long long n) {
     *keysDeleted += n;
 }
 
-void OpDebug::AdditiveMetrics::incrementNmoved(long long n) {
-    if (!nmoved) {
-        nmoved = 0;
-    }
-    *nmoved += n;
-}
-
 void OpDebug::AdditiveMetrics::incrementNinserted(long long n) {
     if (!ninserted) {
         ninserted = 0;
@@ -867,7 +887,7 @@ void OpDebug::AdditiveMetrics::incrementPrepareReadConflicts(long long n) {
     *prepareReadConflicts += n;
 }
 
-string OpDebug::AdditiveMetrics::report() {
+string OpDebug::AdditiveMetrics::report() const {
     StringBuilder s;
 
     OPDEBUG_TOSTRING_HELP_OPTIONAL("keysExamined", keysExamined);
@@ -876,7 +896,6 @@ string OpDebug::AdditiveMetrics::report() {
     OPDEBUG_TOSTRING_HELP_OPTIONAL("nModified", nModified);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("ninserted", ninserted);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("ndeleted", ndeleted);
-    OPDEBUG_TOSTRING_HELP_OPTIONAL("nmoved", nmoved);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("keysInserted", keysInserted);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("keysDeleted", keysDeleted);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("prepareReadConflicts", prepareReadConflicts);

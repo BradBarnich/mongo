@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -220,15 +222,6 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
                                               query.getQueryRequest().getFilter(),
                                               query.getQueryRequest().getCollation());
 
-    if (auto txnRouter = TransactionRouter::get(opCtx)) {
-        txnRouter->computeAtClusterTime(opCtx,
-                                        false,
-                                        shardIds,
-                                        query.nss(),
-                                        query.getQueryRequest().getFilter(),
-                                        query.getQueryRequest().getCollation());
-    }
-
     // Construct the query and parameters.
 
     ClusterClientCursorParams params(query.nss(), readPref);
@@ -426,7 +419,7 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
     // Re-target and re-send the initial find command to the shards until we have established the
     // shard version.
     for (size_t retries = 1; retries <= kMaxRetries; ++retries) {
-        auto routingInfoStatus = catalogCache->getCollectionRoutingInfo(opCtx, query.nss());
+        auto routingInfoStatus = getCollectionRoutingInfoForTxnCmd(opCtx, query.nss());
         if (routingInfoStatus == ErrorCodes::NamespaceNotFound) {
             // If the database doesn't exist, we successfully return an empty result set without
             // creating a cursor.
@@ -460,8 +453,11 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
 
             if (auto txnRouter = TransactionRouter::get(opCtx)) {
                 // A transaction can always continue on a stale version error during find because
-                // the operation must be idempotent.
-                txnRouter->onStaleShardOrDbError(kFindCmdName);
+                // the operation must be idempotent. Reset the default global read timestamp so the
+                // retry's routing table reflects the chunk placement after the refresh (no-op if
+                // the transaction is not running with snapshot read concern).
+                txnRouter->onStaleShardOrDbError(opCtx, kFindCmdName, ex.toStatus());
+                txnRouter->setDefaultAtClusterTime(opCtx);
             }
         }
     }
@@ -542,11 +538,11 @@ void validateTxnNumber(OperationContext* opCtx,
 void validateOperationSessionInfo(OperationContext* opCtx,
                                   const GetMoreRequest& request,
                                   ClusterCursorManager::PinnedCursor* cursor) {
-    ScopeGuard returnCursorGuard = MakeGuard(
+    auto returnCursorGuard = makeGuard(
         [cursor] { cursor->returnCursor(ClusterCursorManager::CursorState::NotExhausted); });
     validateLSID(opCtx, request, cursor);
     validateTxnNumber(opCtx, request, cursor);
-    returnCursorGuard.Dismiss();
+    returnCursorGuard.dismiss();
 }
 
 StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
@@ -599,6 +595,8 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     long long batchSize = request.batchSize.value_or(0);
     long long startingFrom = pinnedCursor.getValue().getNumReturnedSoFar();
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
+    BSONObj postBatchResumeToken;
+    bool stashedResult = false;
 
     while (!FindCommon::enoughForGetMore(batchSize, batch.size())) {
         auto context = batch.empty()
@@ -636,6 +634,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         if (!FindCommon::haveSpaceForNext(
                 *next.getValue().getResult(), batch.size(), bytesBuffered)) {
             pinnedCursor.getValue().queueResult(*next.getValue().getResult());
+            stashedResult = true;
             break;
         }
 
@@ -644,6 +643,20 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         bytesBuffered +=
             (next.getValue().getResult()->objsize() + kPerDocumentOverheadBytesUpperBound);
         batch.push_back(std::move(*next.getValue().getResult()));
+
+        // Update the postBatchResumeToken. For non-$changeStream aggregations, this will be empty.
+        postBatchResumeToken = pinnedCursor.getValue().getPostBatchResumeToken();
+    }
+
+    // If the cursor has been exhausted, we will communicate this by returning a CursorId of zero.
+    auto idToReturn =
+        (cursorState == ClusterCursorManager::CursorState::Exhausted ? CursorId(0)
+                                                                     : request.cursorid);
+
+    // For empty batches, or in the case where the final result was added to the batch rather than
+    // being stashed, we update the PBRT here to ensure that it is the most recent available.
+    if (idToReturn && !stashedResult) {
+        postBatchResumeToken = pinnedCursor.getValue().getPostBatchResumeToken();
     }
 
     pinnedCursor.getValue().setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
@@ -651,10 +664,6 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     // Upon successful completion, transfer ownership of the cursor back to the cursor manager. If
     // the cursor has been exhausted, the cursor manager will clean it up for us.
     pinnedCursor.getValue().returnCursor(cursorState);
-
-    CursorId idToReturn = (cursorState == ClusterCursorManager::CursorState::Exhausted)
-        ? CursorId(0)
-        : request.cursorid;
 
     // Set nReturned and whether the cursor has been exhausted.
     CurOp::get(opCtx)->debug().cursorExhausted = (idToReturn == 0);
@@ -667,7 +676,8 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
             "waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch");
     }
 
-    return CursorResponse(request.nss, idToReturn, std::move(batch), startingFrom);
+    return CursorResponse(
+        request.nss, idToReturn, std::move(batch), startingFrom, boost::none, postBatchResumeToken);
 }
 
 }  // namespace mongo

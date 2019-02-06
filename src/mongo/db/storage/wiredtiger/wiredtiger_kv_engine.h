@@ -1,26 +1,27 @@
 // wiredtiger_kv_engine.h
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -67,6 +68,8 @@ struct WiredTigerFileVersion {
 class WiredTigerKVEngine final : public KVEngine {
 public:
     static const int kDefaultJournalDelayMillis;
+    static StringData kTableUriPrefix;
+
     WiredTigerKVEngine(const std::string& canonicalName,
                        const std::string& path,
                        ClockSource* cs,
@@ -77,112 +80,117 @@ public:
                        bool repair,
                        bool readOnly);
 
-    virtual ~WiredTigerKVEngine();
+    ~WiredTigerKVEngine();
 
     void setRecordStoreExtraOptions(const std::string& options);
     void setSortedDataInterfaceExtraOptions(const std::string& options);
 
-    virtual bool supportsDocLocking() const override;
+    bool supportsDocLocking() const override;
 
-    virtual bool supportsDirectoryPerDB() const override;
+    bool supportsDirectoryPerDB() const override;
 
-    virtual bool isDurable() const override {
+    bool isDurable() const override {
         return _durable;
     }
 
-    virtual bool isEphemeral() const override {
+    bool isEphemeral() const override {
         return _ephemeral;
     }
 
-    virtual RecoveryUnit* newRecoveryUnit() override;
+    RecoveryUnit* newRecoveryUnit() override;
 
-    virtual Status createRecordStore(OperationContext* opCtx,
-                                     StringData ns,
-                                     StringData ident,
-                                     const CollectionOptions& options) override {
+    Status createRecordStore(OperationContext* opCtx,
+                             StringData ns,
+                             StringData ident,
+                             const CollectionOptions& options) override {
         return createGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
     }
 
-    virtual std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
-                                                        StringData ns,
-                                                        StringData ident,
-                                                        const CollectionOptions& options) override {
+    std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
+                                                StringData ns,
+                                                StringData ident,
+                                                const CollectionOptions& options) override {
         return getGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
     }
 
-    virtual Status createSortedDataInterface(OperationContext* opCtx,
-                                             StringData ident,
-                                             const IndexDescriptor* desc) override {
+    std::unique_ptr<RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
+                                                          StringData ident) override;
+
+    Status createSortedDataInterface(OperationContext* opCtx,
+                                     StringData ident,
+                                     const IndexDescriptor* desc) override {
         return createGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
     }
 
-    virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
-                                                        StringData ident,
-                                                        const IndexDescriptor* desc) override {
+    SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
+                                                StringData ident,
+                                                const IndexDescriptor* desc) override {
         return getGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
     }
 
-    virtual Status createGroupedRecordStore(OperationContext* opCtx,
-                                            StringData ns,
+    Status createGroupedRecordStore(OperationContext* opCtx,
+                                    StringData ns,
+                                    StringData ident,
+                                    const CollectionOptions& options,
+                                    KVPrefix prefix) override;
+
+    std::unique_ptr<RecordStore> getGroupedRecordStore(OperationContext* opCtx,
+                                                       StringData ns,
+                                                       StringData ident,
+                                                       const CollectionOptions& options,
+                                                       KVPrefix prefix) override;
+
+    Status createGroupedSortedDataInterface(OperationContext* opCtx,
                                             StringData ident,
-                                            const CollectionOptions& options,
+                                            const IndexDescriptor* desc,
                                             KVPrefix prefix) override;
 
-    virtual std::unique_ptr<RecordStore> getGroupedRecordStore(OperationContext* opCtx,
-                                                               StringData ns,
-                                                               StringData ident,
-                                                               const CollectionOptions& options,
-                                                               KVPrefix prefix) override;
+    SortedDataInterface* getGroupedSortedDataInterface(OperationContext* opCtx,
+                                                       StringData ident,
+                                                       const IndexDescriptor* desc,
+                                                       KVPrefix prefix) override;
 
-    virtual Status createGroupedSortedDataInterface(OperationContext* opCtx,
-                                                    StringData ident,
-                                                    const IndexDescriptor* desc,
-                                                    KVPrefix prefix) override;
+    Status dropIdent(OperationContext* opCtx, StringData ident) override;
 
-    virtual SortedDataInterface* getGroupedSortedDataInterface(OperationContext* opCtx,
-                                                               StringData ident,
-                                                               const IndexDescriptor* desc,
-                                                               KVPrefix prefix) override;
+    void alterIdentMetadata(OperationContext* opCtx,
+                            StringData ident,
+                            const IndexDescriptor* desc) override;
 
-    virtual Status dropIdent(OperationContext* opCtx, StringData ident) override;
+    Status okToRename(OperationContext* opCtx,
+                      StringData fromNS,
+                      StringData toNS,
+                      StringData ident,
+                      const RecordStore* originalRecordStore) const override;
 
-    virtual void alterIdentMetadata(OperationContext* opCtx,
-                                    StringData ident,
-                                    const IndexDescriptor* desc) override;
+    int flushAllFiles(OperationContext* opCtx, bool sync) override;
 
-    virtual Status okToRename(OperationContext* opCtx,
-                              StringData fromNS,
-                              StringData toNS,
-                              StringData ident,
-                              const RecordStore* originalRecordStore) const override;
+    Status beginBackup(OperationContext* opCtx) override;
 
-    virtual int flushAllFiles(OperationContext* opCtx, bool sync) override;
+    void endBackup(OperationContext* opCtx) override;
 
-    virtual Status beginBackup(OperationContext* opCtx) override;
+    StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) override;
 
-    virtual void endBackup(OperationContext* opCtx) override;
+    void endNonBlockingBackup(OperationContext* opCtx) override;
 
-    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(
+    virtual StatusWith<std::vector<std::string>> extendBackupCursor(
         OperationContext* opCtx) override;
-
-    virtual void endNonBlockingBackup(OperationContext* opCtx) override;
 
     virtual Status hotBackup(const std::string& path) override;
 
-    virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) override;
+    int64_t getIdentSize(OperationContext* opCtx, StringData ident) override;
 
-    virtual Status repairIdent(OperationContext* opCtx, StringData ident) override;
+    Status repairIdent(OperationContext* opCtx, StringData ident) override;
 
-    virtual Status recoverOrphanedIdent(OperationContext* opCtx,
-                                        StringData ns,
-                                        StringData ident,
-                                        const CollectionOptions& options) override;
+    Status recoverOrphanedIdent(OperationContext* opCtx,
+                                StringData ns,
+                                StringData ident,
+                                const CollectionOptions& options) override;
 
-    virtual bool hasIdent(OperationContext* opCtx, StringData ident) const override;
+    bool hasIdent(OperationContext* opCtx, StringData ident) const override;
 
     std::vector<std::string> getAllIdents(OperationContext* opCtx) const override;
 
-    virtual void cleanShutdown() override;
+    void cleanShutdown() override;
 
     SnapshotManager* getSnapshotManager() const final {
         return &_sessionCache->snapshotManager();
@@ -190,27 +198,28 @@ public:
 
     void setJournalListener(JournalListener* jl) final;
 
-    virtual void setStableTimestamp(Timestamp stableTimestamp,
-                                    boost::optional<Timestamp> maximumTruncationTimestamp) override;
+    void setStableTimestamp(Timestamp stableTimestamp,
+                            boost::optional<Timestamp> maximumTruncationTimestamp,
+                            bool force) override;
 
-    virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
+    void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
-    virtual void setOldestTimestampFromStable() override;
+    void setOldestTimestampFromStable() override;
 
     /**
      * Sets the oldest timestamp for which the storage engine must maintain snapshot history
      * through. If force is true, oldest will be set to the given input value, unmodified, even if
      * it is backwards in time from the last oldest timestamp (accomodating initial sync).
      */
-    virtual void setOldestTimestamp(Timestamp newOldestTimestamp, bool force) override;
+    void setOldestTimestamp(Timestamp newOldestTimestamp, bool force) override;
 
-    virtual bool supportsRecoverToStableTimestamp() const override;
+    bool supportsRecoverToStableTimestamp() const override;
 
-    virtual bool supportsRecoveryTimestamp() const override;
+    bool supportsRecoveryTimestamp() const override;
 
-    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
+    StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
 
-    virtual boost::optional<Timestamp> getRecoveryTimestamp() const override;
+    boost::optional<Timestamp> getRecoveryTimestamp() const override;
 
     /**
      * Returns a stable timestamp value that is guaranteed to exist on recoverToStableTimestamp.
@@ -224,9 +233,11 @@ public:
      * or before the last checkpoint. Everything before this value is guaranteed to be persisted on
      * disk. This supports replication recovery on restart.
      */
-    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
+    boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
 
-    virtual Timestamp getAllCommittedTimestamp() const override;
+    Timestamp getAllCommittedTimestamp() const override;
+
+    Timestamp getOldestOpenReadTimestamp() const override;
 
     bool supportsReadConcernSnapshot() const final override;
 
@@ -304,12 +315,9 @@ public:
 
     static void appendGlobalStats(BSONObjBuilder& b);
 
-    /**
-     * These are timestamp access functions for serverStatus to be able to report the actual
-     * snapshot window size.
-     */
-    Timestamp getStableTimestamp() const;
-    Timestamp getOldestTimestamp() const;
+    Timestamp getStableTimestamp() const override;
+    Timestamp getOldestTimestamp() const override;
+    Timestamp getCheckpointTimestamp() const override;
 
     Timestamp getInitialDataTimestamp() const;
 
@@ -347,7 +355,12 @@ public:
      */
     Timestamp getPinnedOplog() const;
 
+    ClockSource* getClockSource() const {
+        return _clockSource;
+    }
+
 private:
+    class WiredTigerSessionSweeper;
     class WiredTigerJournalFlusher;
     class WiredTigerCheckpointThread;
 
@@ -432,6 +445,7 @@ private:
     // timestamp.
     const bool _keepDataHistory = true;
 
+    std::unique_ptr<WiredTigerSessionSweeper> _sessionSweeper;
     std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
     std::unique_ptr<WiredTigerCheckpointThread> _checkpointThread;
 
@@ -445,6 +459,9 @@ private:
     mutable Date_t _previousCheckedDropsQueued;
 
     std::unique_ptr<WiredTigerSession> _backupSession;
+    WT_CURSOR* _backupCursor;
+    mutable stdx::mutex _oplogPinnedByBackupMutex;
+    boost::optional<Timestamp> _oplogPinnedByBackup;
     Timestamp _recoveryTimestamp;
 
     // Tracks the stable and oldest timestamps we've set on the storage engine.

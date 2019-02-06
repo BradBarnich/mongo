@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,24 +28,54 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/biggie/store.h"
-#include "mongo/platform/basic.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
-#include <iostream>
 
 namespace mongo {
 namespace biggie {
-namespace {
 
-using StringStore = RadixStore<std::string, std::string>;
 using value_type = StringStore::value_type;
 
 class RadixStoreTest : public unittest::Test {
+public:
+    virtual ~RadixStoreTest() {
+        checkValid(thisStore);
+        checkValid(parallelStore);
+        checkValid(otherStore);
+        checkValid(baseStore);
+        checkValid(expected);
+    }
+
+    StringStore::Head* getRootAddress() const {
+        return thisStore._root.get();
+    }
+
+    int getRootCount() const {
+        return thisStore._root.use_count();
+    }
+
+    bool hasPreviousVersion() const {
+        return thisStore._root->hasPreviousVersion();
+    }
+
+    void checkValid(StringStore& store) const {
+        size_t actualSize = 0;
+        size_t actualDataSize = 0;
+        std::string lastKey = "";
+        for (auto& item : store) {
+            ASSERT_GT(item.first, lastKey);
+            actualDataSize += item.second.size();
+            actualSize++;
+        }
+        ASSERT_EQ(store.size(), actualSize);
+        ASSERT_EQ(store.dataSize(), actualDataSize);
+    }
+
 protected:
     StringStore thisStore;
+    StringStore parallelStore;
     StringStore otherStore;
     StringStore baseStore;
     StringStore expected;
@@ -88,6 +120,278 @@ TEST_F(RadixStoreTest, SimpleIteratorAssignmentTest) {
 
     thisIter = otherStore.begin();
     ASSERT_TRUE(thisIter == otherIter);
+}
+
+TEST_F(RadixStoreTest, IteratorRevalidateOneTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("foo", "2");
+    value_type value3 = std::make_pair("bar", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+
+    StringStore::const_iterator thisIter = thisStore.begin();
+    ASSERT_EQ((*thisIter).first, "foo");
+    thisIter++;
+    ASSERT_EQ((*thisIter).first, "food");
+
+    thisStore.insert(value_type(value3));
+    ASSERT_TRUE(thisIter != thisStore.end());
+    ASSERT_EQ((*thisIter).first, "food");
+}
+
+TEST_F(RadixStoreTest, IteratorRevalidateTwoTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("foo", "2");
+    value_type value3 = std::make_pair("zebra", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+    thisStore.insert(value_type(value3));
+
+    StringStore::const_iterator thisIter = thisStore.begin();
+    ASSERT_EQ((*thisIter).first, "foo");
+    thisIter++;
+    ASSERT_EQ((*thisIter).first, "food");
+    thisStore.erase("food");
+
+    ASSERT_EQ((*thisIter).first, "zebra");
+}
+
+TEST_F(RadixStoreTest, IteratorRevalidateThreeTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("foo", "2");
+    value_type value3 = std::make_pair("zebra", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+    thisStore.insert(value_type(value3));
+
+    StringStore::const_iterator thisIter = thisStore.begin();
+    ASSERT_EQ((*thisIter).first, "foo");
+    thisIter++;
+    ASSERT_EQ((*thisIter).first, "food");
+    thisStore.erase("zebra");
+
+    ASSERT_EQ((*thisIter).first, "food");
+}
+
+TEST_F(RadixStoreTest, IteratorRevalidateFourTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("grass", "2");
+    value_type value3 = std::make_pair("zebra", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value3));
+
+    StringStore::const_iterator thisIter = thisStore.begin();
+    ASSERT_EQ((*thisIter).first, "food");
+    thisStore.erase("food");
+    thisStore.insert(value_type(value2));
+
+    ASSERT_EQ((*thisIter).first, "grass");
+}
+
+TEST_F(RadixStoreTest, IteratorRevalidateFiveTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("grass", "2");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+
+    StringStore::const_iterator thisIter = thisStore.begin();
+    ASSERT_EQ((*thisIter).first, "food");
+    thisStore.erase("food");
+    thisStore.insert(value_type(value1));
+
+    ASSERT_EQ((*thisIter).first, "food");
+}
+
+TEST_F(RadixStoreTest, IteratorRevalidateSixTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("grass", "2");
+    value_type value3 = std::make_pair("food", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+
+    StringStore::const_iterator thisIter = thisStore.begin();
+    ASSERT_EQ((*thisIter).first, "food");
+    thisStore.update(value_type(value3));
+
+    ASSERT_EQ((*thisIter).first, "food");
+    ASSERT_EQ((*thisIter).second, "3");
+}
+
+TEST_F(RadixStoreTest, IteratorRevalidateSevenTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("grass", "2");
+    value_type value3 = std::make_pair("zebra", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+    thisStore.insert(value_type(value3));
+
+    StringStore::const_iterator thisIter = thisStore.begin();
+    ASSERT_EQ((*thisIter).first, "food");
+    thisStore.erase("food");
+    thisStore.erase("grass");
+
+    ASSERT_EQ((*thisIter).first, "zebra");
+}
+
+TEST_F(RadixStoreTest, IteratorRevalidateEightTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("grass", "2");
+    value_type value3 = std::make_pair("zebra", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+    thisStore.insert(value_type(value3));
+
+    StringStore::const_iterator thisIter = thisStore.begin();
+    ASSERT_EQ((*thisIter).first, "food");
+    thisStore.erase("food");
+    thisStore.erase("grass");
+    thisStore.erase("zebra");
+
+    ASSERT_TRUE(thisIter == thisStore.end());
+}
+
+TEST_F(RadixStoreTest, ReverseIteratorRevalidateOneTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("foo", "2");
+    value_type value3 = std::make_pair("bar", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+
+    StringStore::const_reverse_iterator thisIter = thisStore.rbegin();
+    ASSERT_EQ((*thisIter).first, "food");
+    thisIter++;
+    ASSERT_EQ((*thisIter).first, "foo");
+
+    thisStore.insert(value_type(value3));
+    ASSERT_TRUE(thisIter != thisStore.rend());
+    ASSERT_EQ((*thisIter).first, "foo");
+}
+
+TEST_F(RadixStoreTest, ReverseIteratorRevalidateTwoTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("foo", "2");
+    value_type value3 = std::make_pair("zebra", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+    thisStore.insert(value_type(value3));
+
+    StringStore::const_reverse_iterator thisIter = thisStore.rbegin();
+    ASSERT_EQ((*thisIter).first, "zebra");
+    thisIter++;
+    ASSERT_EQ((*thisIter).first, "food");
+    thisStore.erase("food");
+
+    ASSERT_EQ((*thisIter).first, "foo");
+}
+
+TEST_F(RadixStoreTest, ReverseIteratorRevalidateThreeTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("foo", "2");
+    value_type value3 = std::make_pair("zebra", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+    thisStore.insert(value_type(value3));
+
+    StringStore::const_reverse_iterator thisIter = thisStore.rbegin();
+    ASSERT_EQ((*thisIter).first, "zebra");
+    thisIter++;
+    ASSERT_EQ((*thisIter).first, "food");
+    thisStore.erase("foo");
+
+    ASSERT_EQ((*thisIter).first, "food");
+}
+
+TEST_F(RadixStoreTest, ReverseIteratorRevalidateFourTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("grass", "2");
+    value_type value3 = std::make_pair("zebra", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value3));
+
+    StringStore::const_reverse_iterator thisIter = thisStore.rbegin();
+    ASSERT_EQ((*thisIter).first, "zebra");
+    thisStore.erase("zebra");
+    thisStore.insert(value_type(value2));
+
+    ASSERT_EQ((*thisIter).first, "grass");
+}
+
+TEST_F(RadixStoreTest, ReverseIteratorRevalidateFiveTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("grass", "2");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+
+    StringStore::const_reverse_iterator thisIter = thisStore.rbegin();
+    ASSERT_EQ((*thisIter).first, "grass");
+    thisStore.erase("grass");
+    thisStore.insert(value_type(value2));
+
+    ASSERT_EQ((*thisIter).first, "grass");
+}
+
+TEST_F(RadixStoreTest, ReverseIteratorRevalidateSixTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("grass", "2");
+    value_type value3 = std::make_pair("grass", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+
+    StringStore::const_reverse_iterator thisIter = thisStore.rbegin();
+    ASSERT_EQ((*thisIter).first, "grass");
+    thisStore.update(value_type(value3));
+
+    ASSERT_EQ((*thisIter).first, "grass");
+    ASSERT_EQ((*thisIter).second, "3");
+}
+
+TEST_F(RadixStoreTest, ReverseIteratorRevalidateSevenTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("grass", "2");
+    value_type value3 = std::make_pair("zebra", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+    thisStore.insert(value_type(value3));
+
+    StringStore::const_reverse_iterator thisIter = thisStore.rbegin();
+    ASSERT_EQ((*thisIter).first, "zebra");
+    thisStore.erase("food");
+    thisStore.erase("grass");
+
+    ASSERT_EQ((*thisIter).first, "zebra");
+}
+
+TEST_F(RadixStoreTest, ReverseIteratorRevalidateEightTest) {
+    value_type value1 = std::make_pair("food", "1");
+    value_type value2 = std::make_pair("grass", "2");
+    value_type value3 = std::make_pair("zebra", "3");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+    thisStore.insert(value_type(value3));
+
+    StringStore::const_reverse_iterator thisIter = thisStore.rbegin();
+    ASSERT_EQ((*thisIter).first, "zebra");
+    thisStore.erase("food");
+    thisStore.erase("grass");
+    thisStore.erase("zebra");
+
+    ASSERT_TRUE(thisIter == thisStore.rend());
 }
 
 TEST_F(RadixStoreTest, InsertInCopyFromRootTest) {
@@ -405,6 +709,21 @@ TEST_F(RadixStoreTest, UpdateTest) {
     ASSERT_TRUE(it2 == thisStore.end());
 }
 
+TEST_F(RadixStoreTest, DuplicateKeyTest) {
+    std::string msg1 = "Hello, world!";
+    std::string msg2 = msg1 + "!!";
+    value_type value1 = std::make_pair("msg", msg1);
+    value_type value2 = std::make_pair("msg", msg2);
+
+    ASSERT(thisStore.insert(value_type(value1)).second);
+    ASSERT_EQ(thisStore.size(), 1u);
+    ASSERT_EQ(thisStore.dataSize(), msg1.size());
+
+    ASSERT(!thisStore.insert(value_type(value2)).second);
+    ASSERT_EQ(thisStore.size(), 1u);
+    ASSERT_EQ(thisStore.dataSize(), msg1.size());
+}
+
 TEST_F(RadixStoreTest, UpdateLeafOnSharedNodeTest) {
     value_type value1 = std::make_pair("foo", "1");
     value_type value2 = std::make_pair("bar", "2");
@@ -619,7 +938,7 @@ TEST_F(RadixStoreTest, EraseNonLeafNodeWithSharedParent) {
 
     otherStore = thisStore;
 
-    StringStore::size_type success = otherStore.erase(value3.first);
+    bool success = otherStore.erase(value3.first);
 
     ASSERT_TRUE(success);
     ASSERT_EQ(thisStore.size(), StringStore::size_type(4));
@@ -885,6 +1204,15 @@ TEST_F(RadixStoreTest, MergeNoModifications) {
     ASSERT_EQ(expected.dataSize(), StringStore::size_type(2));
     ASSERT_EQ(thisStore.dataSize(), StringStore::size_type(2));
     ASSERT_EQ(baseStore.dataSize(), StringStore::size_type(2));
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 2);
 }
 
 TEST_F(RadixStoreTest, MergeNoModificationsSharedKeyPrefix) {
@@ -911,6 +1239,15 @@ TEST_F(RadixStoreTest, MergeNoModificationsSharedKeyPrefix) {
     ASSERT_EQ(expected.dataSize(), StringStore::size_type(2));
     ASSERT_EQ(thisStore.dataSize(), StringStore::size_type(2));
     ASSERT_EQ(baseStore.dataSize(), StringStore::size_type(2));
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 2);
 }
 
 TEST_F(RadixStoreTest, MergeModifications) {
@@ -926,24 +1263,36 @@ TEST_F(RadixStoreTest, MergeModifications) {
     thisStore = baseStore;
     otherStore = baseStore;
 
+    ASSERT_EQ(baseStore.size(), StringStore::size_type(2));
+    ASSERT_EQ(thisStore.size(), StringStore::size_type(2));
+    ASSERT_EQ(otherStore.size(), StringStore::size_type(2));
+
     thisStore.update(value_type(value2));
+    ASSERT_EQ(thisStore.dataSize(), StringStore::size_type(5));
 
     otherStore.update(value_type(value4));
+    ASSERT_EQ(otherStore.dataSize(), StringStore::size_type(5));
 
     expected.insert(value_type(value2));
     expected.insert(value_type(value4));
+    ASSERT_EQ(expected.dataSize(), StringStore::size_type(8));
 
     thisStore.merge3(baseStore, otherStore);
 
     ASSERT_TRUE(thisStore == expected);
 
-    ASSERT_EQ(expected.size(), StringStore::size_type(2));
-    ASSERT_EQ(thisStore.size(), StringStore::size_type(2));
-    ASSERT_EQ(baseStore.size(), StringStore::size_type(2));
-
     ASSERT_EQ(expected.dataSize(), StringStore::size_type(8));
     ASSERT_EQ(thisStore.dataSize(), StringStore::size_type(8));
     ASSERT_EQ(baseStore.dataSize(), StringStore::size_type(2));
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 2);
 }
 
 TEST_F(RadixStoreTest, MergeDeletions) {
@@ -976,6 +1325,15 @@ TEST_F(RadixStoreTest, MergeDeletions) {
     ASSERT_EQ(expected.dataSize(), StringStore::size_type(2));
     ASSERT_EQ(thisStore.dataSize(), StringStore::size_type(2));
     ASSERT_EQ(baseStore.dataSize(), StringStore::size_type(4));
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 2);
 }
 
 TEST_F(RadixStoreTest, MergeInsertions) {
@@ -1009,6 +1367,15 @@ TEST_F(RadixStoreTest, MergeInsertions) {
     ASSERT_EQ(expected.dataSize(), StringStore::size_type(4));
     ASSERT_EQ(thisStore.dataSize(), StringStore::size_type(4));
     ASSERT_EQ(baseStore.dataSize(), StringStore::size_type(2));
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 4);
 }
 
 TEST_F(RadixStoreTest, MergeConflictingPathCompressedKeys) {
@@ -1041,6 +1408,15 @@ TEST_F(RadixStoreTest, MergeConflictingPathCompressedKeys) {
     ASSERT_EQ(otherStore.dataSize(), StringStore::size_type(2));
     ASSERT_EQ(thisStore.dataSize(), StringStore::size_type(3));
     ASSERT_EQ(baseStore.dataSize(), StringStore::size_type(1));
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 3);
 }
 
 TEST_F(RadixStoreTest, MergeConflictingPathCompressedKeys2) {
@@ -1074,6 +1450,15 @@ TEST_F(RadixStoreTest, MergeConflictingPathCompressedKeys2) {
     ASSERT_EQ(thisStore.dataSize(), StringStore::size_type(2));
     ASSERT_EQ(baseStore.dataSize(), StringStore::size_type(1));
     ASSERT_EQ(expected.dataSize(), StringStore::size_type(2));
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 2);
 }
 
 TEST_F(RadixStoreTest, MergeEmptyInsertionOther) {
@@ -1095,6 +1480,15 @@ TEST_F(RadixStoreTest, MergeEmptyInsertionOther) {
     ASSERT_EQ(otherStore.dataSize(), StringStore::size_type(3));
     ASSERT_EQ(thisStore.dataSize(), StringStore::size_type(3));
     ASSERT_EQ(baseStore.dataSize(), StringStore::size_type(0));
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 1);
 }
 
 TEST_F(RadixStoreTest, MergeEmptyInsertionThis) {
@@ -1116,6 +1510,15 @@ TEST_F(RadixStoreTest, MergeEmptyInsertionThis) {
     ASSERT_EQ(otherStore.dataSize(), StringStore::size_type(0));
     ASSERT_EQ(thisStore.dataSize(), StringStore::size_type(3));
     ASSERT_EQ(baseStore.dataSize(), StringStore::size_type(0));
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 1);
 }
 
 TEST_F(RadixStoreTest, MergeInsertionDeletionModification) {
@@ -1162,6 +1565,15 @@ TEST_F(RadixStoreTest, MergeInsertionDeletionModification) {
     ASSERT_EQ(thisStore.dataSize(), StringStore::size_type(15));
     ASSERT_EQ(baseStore.dataSize(), StringStore::size_type(12));
     ASSERT_EQ(expected.dataSize(), StringStore::size_type(15));
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 4);
 }
 
 TEST_F(RadixStoreTest, MergeConflictingModifications) {
@@ -1238,6 +1650,15 @@ TEST_F(RadixStoreTest, UpperBoundTest) {
     StringStore::const_iterator iter = thisStore.upper_bound(value2.first);
     ASSERT_EQ(iter->first, "baz");
 
+    iter++;
+    ASSERT_EQ(iter->first, "foo");
+
+    iter++;
+    ASSERT_EQ(iter->first, "fools");
+
+    iter++;
+    ASSERT_TRUE(iter == thisStore.end());
+
     iter = thisStore.upper_bound(value4.first);
     ASSERT_TRUE(iter == thisStore.end());
 
@@ -1250,6 +1671,7 @@ TEST_F(RadixStoreTest, LowerBoundTest) {
     value_type value2 = std::make_pair("bad", "2");
     value_type value3 = std::make_pair("foo", "3");
     value_type value4 = std::make_pair("fools", "4");
+    value_type value5 = std::make_pair("baz", "5");
 
     thisStore.insert(value_type(value3));
     thisStore.insert(value_type(value1));
@@ -1261,6 +1683,18 @@ TEST_F(RadixStoreTest, LowerBoundTest) {
 
     ++iter;
     ASSERT_EQ(iter->first, value2.first);
+
+    iter = thisStore.lower_bound("bac");
+    ASSERT_EQ(iter->first, "bad");
+
+    iter++;
+    ASSERT_EQ(iter->first, "foo");
+
+    iter++;
+    ASSERT_EQ(iter->first, "fools");
+
+    iter++;
+    ASSERT_TRUE(iter == thisStore.end());
 
     iter = thisStore.lower_bound("baz");
     ASSERT_TRUE(iter == thisStore.find("foo"));
@@ -1274,6 +1708,10 @@ TEST_F(RadixStoreTest, LowerBoundTest) {
 
     iter = thisStore.lower_bound("three");
     ASSERT_TRUE(iter == thisStore.end());
+
+    thisStore.insert(value_type(value5));
+    iter = thisStore.lower_bound("bah");
+    ASSERT_TRUE(iter == thisStore.find("baz"));
 }
 
 TEST_F(RadixStoreTest, LowerBoundTestSmallerThanExistingPrefix) {
@@ -1358,7 +1796,7 @@ TEST_F(RadixStoreTest, BasicInsertFindDeleteNullCharacter) {
     ASSERT_TRUE(iter != thisStore.end());
     ASSERT_EQ(iter->first, value1.first);
 
-    ASSERT_EQ(thisStore.erase(std::string("ab\0", 3)), StringStore::size_type(1));
+    ASSERT_TRUE(thisStore.erase(std::string("ab\0", 3)));
     ASSERT_EQ(thisStore.size(), StringStore::size_type(1));
 
     iter = thisStore.find(std::string("ab\0", 3));
@@ -1611,6 +2049,449 @@ TEST_F(RadixStoreTest, PathCompressionTest) {
               "\n food*"
               "\n  ie*\n");
 }
-}  // namespace
-}  // mongo namespace
+
+TEST_F(RadixStoreTest, MergeOneTest) {
+    value_type value1 = std::make_pair("<collection-1-first", "1");
+    value_type value2 = std::make_pair("<collection-1-second", "2");
+    value_type value3 = std::make_pair("<_catalog", "catalog");
+    value_type value4 = std::make_pair("<collection-2-first", "1");
+    value_type value5 = std::make_pair("<collection-2-second", "2");
+    value_type value6 = std::make_pair("<collection-1-second", "20");
+    value_type value7 = std::make_pair("<collection-1-second", "30");
+
+    baseStore.insert(value_type(value1));
+    baseStore.insert(value_type(value2));
+    baseStore.insert(value_type(value3));
+
+    otherStore = baseStore;
+    thisStore = baseStore;
+    parallelStore = baseStore;
+
+    thisStore.update(value_type(value6));
+    thisStore.update(value_type(value7));
+
+    parallelStore.insert(value_type(value5));
+    parallelStore.insert(value_type(value4));
+
+    parallelStore.merge3(baseStore, otherStore);
+    thisStore.merge3(baseStore, parallelStore);
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 5);
+}
+
+TEST_F(RadixStoreTest, MergeTwoTest) {
+    value_type value1 = std::make_pair("<collection-1-first", "1");
+    value_type value2 = std::make_pair("<collection-1-second", "2");
+    value_type value3 = std::make_pair("<_catalog", "catalog");
+    value_type value4 = std::make_pair("<_index", "index");
+    value_type value5 = std::make_pair("<collection-1-third", "1");
+    value_type value6 = std::make_pair("<collection-1-forth", "2");
+    value_type value7 = std::make_pair("<collection-1-first", "20");
+    value_type value8 = std::make_pair("<collection-1-second", "30");
+
+    baseStore.insert(value_type(value3));
+    baseStore.insert(value_type(value4));
+
+    otherStore = baseStore;
+    thisStore = baseStore;
+    parallelStore = baseStore;
+
+    parallelStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+
+    parallelStore.merge3(baseStore, otherStore);
+    thisStore.merge3(baseStore, parallelStore);
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 4);
+}
+
+TEST_F(RadixStoreTest, MergeThreeTest) {
+    value_type value1 = std::make_pair("<collection-1-first", "1");
+    value_type value2 = std::make_pair("<collection-1-second", "2");
+    value_type value3 = std::make_pair("<_catalog", "catalog");
+    value_type value4 = std::make_pair("<_index", "index");
+    value_type value5 = std::make_pair("<collection-1-third", "1");
+    value_type value6 = std::make_pair("<collection-1-forth", "2");
+    value_type value7 = std::make_pair("<collection-1-first", "20");
+    value_type value8 = std::make_pair("<collection-1-second", "30");
+
+    baseStore.insert(value_type(value3));
+    baseStore.insert(value_type(value4));
+
+    otherStore = baseStore;
+    thisStore = baseStore;
+    parallelStore = baseStore;
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+    thisStore.update(value_type(value7));
+    thisStore.update(value_type(value8));
+    thisStore.insert(value_type(value5));
+    thisStore.insert(value_type(value6));
+
+    thisStore.merge3(baseStore, otherStore);
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 6);
+}
+
+TEST_F(RadixStoreTest, MergeFourTest) {
+    value_type value1 = std::make_pair("<collection-1-first", "1");
+    value_type value2 = std::make_pair("<collection-1-second", "2");
+    value_type value3 = std::make_pair("<_catalog", "catalog");
+    value_type value4 = std::make_pair("<_index", "index");
+    value_type value5 = std::make_pair("<collection-1-third", "1");
+    value_type value6 = std::make_pair("<collection-1-forth", "2");
+    value_type value7 = std::make_pair("<collection-1-first", "20");
+    value_type value8 = std::make_pair("<collection-1-second", "30");
+
+    baseStore.insert(value_type(value1));
+    baseStore.insert(value_type(value3));
+    baseStore.insert(value_type(value4));
+
+    otherStore = baseStore;
+    thisStore = baseStore;
+
+    otherStore.insert(value_type(value2));
+    otherStore.update(value_type(value7));
+
+    thisStore.merge3(baseStore, otherStore);
+
+    int itemsVisited = 0;
+    StringStore::const_iterator thisIter = thisStore.begin();
+    while (thisIter != thisStore.end()) {
+        itemsVisited++;
+        thisIter++;
+    }
+
+    ASSERT_EQ(itemsVisited, 4);
+}
+
+TEST_F(RadixStoreTest, MergeFiveTest) {
+    value_type value1 = std::make_pair("<collection-1-first", "1");
+    value_type value2 = std::make_pair("<collection-1-second", "2");
+    value_type value3 = std::make_pair("<_catalog", "catalog");
+    value_type value4 = std::make_pair("<_index", "index");
+    value_type value5 = std::make_pair("<collection-1-third", "1");
+    value_type value6 = std::make_pair("<collection-1-forth", "2");
+    value_type value7 = std::make_pair("<collection-1-first", "20");
+    value_type value8 = std::make_pair("<collection-1-second", "30");
+
+    baseStore.insert(value_type(value1));
+    baseStore.insert(value_type(value3));
+    baseStore.insert(value_type(value4));
+
+    otherStore = baseStore;
+    thisStore = baseStore;
+
+    otherStore.update(value_type(value7));
+    thisStore.update(value_type(value7));
+
+    ASSERT_THROWS(thisStore.merge3(baseStore, otherStore), merge_conflict_exception);
+}
+
+TEST_F(RadixStoreTest, MergeSixTest) {
+    value_type value1 = std::make_pair("<collection-1-first", "1");
+    value_type value2 = std::make_pair("<collection-1-second", "2");
+    value_type value3 = std::make_pair("<_catalog", "catalog");
+    value_type value4 = std::make_pair("<_index", "index");
+    value_type value5 = std::make_pair("<collection-1-third", "1");
+    value_type value6 = std::make_pair("<collection-1-forth", "2");
+    value_type value7 = std::make_pair("<collection-1-first", "20");
+    value_type value8 = std::make_pair("<collection-1-second", "30");
+
+    baseStore.insert(value_type(value1));
+    baseStore.insert(value_type(value3));
+    baseStore.insert(value_type(value4));
+
+    otherStore = baseStore;
+    thisStore = baseStore;
+
+    otherStore.update(value_type(value7));
+    otherStore.insert(value_type(value2));
+
+    thisStore.update(value_type(value7));
+
+    ASSERT_THROWS(thisStore.merge3(baseStore, otherStore), merge_conflict_exception);
+}
+
+TEST_F(RadixStoreTest, MergeSevenTest) {
+    value_type value1 = std::make_pair("<collection-1", "1");
+    value_type value2 = std::make_pair("<collection-2", "2");
+
+    baseStore.insert(value_type(value1));
+
+    otherStore = baseStore;
+    thisStore = baseStore;
+
+    otherStore.insert(value_type(value2));
+
+    thisStore.merge3(baseStore, otherStore);
+
+    expected.insert(value_type(value1));
+    expected.insert(value_type(value2));
+
+    ASSERT_TRUE(thisStore == expected);
+    ASSERT_TRUE(thisStore.size() == 2);
+    ASSERT_TRUE(thisStore.dataSize() == 2);
+}
+
+TEST_F(RadixStoreTest, SizeTest) {
+    value_type value1 = std::make_pair("<index", ".");
+    value_type value2 = std::make_pair("<collection", "..");
+    value_type value3 = std::make_pair("<collection-1", "...");
+    value_type value4 = std::make_pair("<collection-2", "....");
+
+    thisStore.insert(value_type(value1));
+    ASSERT_TRUE(thisStore.size() == 1);
+    ASSERT_TRUE(thisStore.dataSize() == 1);
+
+    thisStore.insert(value_type(value2));
+    ASSERT_TRUE(thisStore.size() == 2);
+    ASSERT_TRUE(thisStore.dataSize() == 3);
+
+    thisStore.insert(value_type(value3));
+    ASSERT_TRUE(thisStore.size() == 3);
+    ASSERT_TRUE(thisStore.dataSize() == 6);
+
+    thisStore.insert(value_type(value4));
+    ASSERT_TRUE(thisStore.size() == 4);
+    ASSERT_TRUE(thisStore.dataSize() == 10);
+
+    thisStore.erase(value2.first);
+    ASSERT_TRUE(thisStore.size() == 3);
+    ASSERT_TRUE(thisStore.dataSize() == 8);
+
+    thisStore.erase(value4.first);
+    ASSERT_TRUE(thisStore.size() == 2);
+    ASSERT_TRUE(thisStore.dataSize() == 4);
+
+    thisStore.erase(value1.first);
+    ASSERT_TRUE(thisStore.size() == 1);
+    ASSERT_TRUE(thisStore.dataSize() == 3);
+
+    thisStore.erase(value3.first);
+    ASSERT_TRUE(thisStore.size() == 0);
+    ASSERT_TRUE(thisStore.dataSize() == 0);
+
+    thisStore.insert(value_type(value4));
+    ASSERT_TRUE(thisStore.size() == 1);
+    ASSERT_TRUE(thisStore.dataSize() == 4);
+
+    thisStore.insert(value_type(value3));
+    ASSERT_TRUE(thisStore.size() == 2);
+    ASSERT_TRUE(thisStore.dataSize() == 7);
+
+    thisStore.insert(value_type(value2));
+    ASSERT_TRUE(thisStore.size() == 3);
+    ASSERT_TRUE(thisStore.dataSize() == 9);
+
+    thisStore.insert(value_type(value1));
+    ASSERT_TRUE(thisStore.size() == 4);
+    ASSERT_TRUE(thisStore.dataSize() == 10);
+}
+
+TEST_F(RadixStoreTest, CannotRevalidateExhaustedCursor) {
+    value_type value1 = std::make_pair("a", "1");
+    value_type value2 = std::make_pair("b", "2");
+
+    thisStore.insert(value_type(value1));
+
+    auto it = thisStore.begin();
+    it++;
+
+    // 'it' should be exhausted.
+    ASSERT_TRUE(it == thisStore.end());
+
+    thisStore.insert(value_type(value2));
+
+    // 'it' should still be exhausted even though we have a new tree version available.
+    ASSERT_TRUE(it == thisStore.end());
+}
+
+TEST_F(RadixStoreTest, AvoidComparingDifferentTreeVersions) {
+    value_type value = std::make_pair("a", "1");
+    value_type value2 = std::make_pair("b", "2");
+    value_type updated = std::make_pair("a", "10");
+
+    thisStore.insert(value_type(value));
+    thisStore.insert(value_type(value2));
+
+    {
+        auto it = thisStore.begin();
+
+        // Updating value1 causes a new tree to be made since it's shared with the cursor.
+        thisStore.update(value_type(updated));
+
+        auto it2 = thisStore.begin();
+
+        it.repositionIfChanged();
+        ASSERT_TRUE(it2 == it);
+    }
+
+    {
+        auto it = thisStore.begin();
+
+        // Updating value1 causes a new tree to be made since it's shared with the cursor.
+        thisStore.erase("a");
+
+        auto it2 = thisStore.begin();
+
+        it.repositionIfChanged();
+        ASSERT_TRUE(it2->first == "b");
+        ASSERT_TRUE(it2 == it);
+    }
+}
+
+TEST_F(RadixStoreTest, TreeUniqueness) {
+    value_type value1 = std::make_pair("a", "1");
+    value_type value2 = std::make_pair("b", "2");
+    value_type value3 = std::make_pair("c", "3");
+    value_type value4 = std::make_pair("d", "4");
+
+    auto rootAddr = getRootAddress();
+    thisStore.insert(value_type(value1));
+
+    // Neither the address or count should change.
+    ASSERT_EQUALS(rootAddr, getRootAddress());
+    ASSERT_EQUALS(1, getRootCount());
+
+    thisStore.insert(value_type(value2));
+    ASSERT_EQUALS(rootAddr, getRootAddress());
+    ASSERT_EQUALS(1, getRootCount());
+
+    {
+        // Make the tree shared.
+        auto it = thisStore.begin();
+        ASSERT_EQUALS(rootAddr, getRootAddress());
+        ASSERT_EQUALS(2, getRootCount());
+
+        // Inserting should make a copy of the tree.
+        thisStore.insert(value_type(value3));
+
+        // The root's address should change.
+        ASSERT_NOT_EQUALS(rootAddr, getRootAddress());
+        rootAddr = getRootAddress();
+
+        // Count should remain 2 because of _nextVersion
+        ASSERT_EQUALS(2, getRootCount());
+
+        // Inserting again shouldn't make a copy because the cursor hasn't been updated
+        thisStore.insert(value_type(value4));
+        ASSERT_EQUALS(rootAddr, getRootAddress());
+        ASSERT_EQUALS(2, getRootCount());
+
+        // Use the pointer to reposition it on the new tree.
+        *it;
+        ASSERT_EQUALS(rootAddr, getRootAddress());
+        ASSERT_EQUALS(2, getRootCount());
+
+        thisStore.erase("d");
+        ASSERT_NOT_EQUALS(rootAddr, getRootAddress());
+        rootAddr = getRootAddress();
+        ASSERT_EQUALS(2, getRootCount());
+    }
+
+    ASSERT_EQUALS(rootAddr, getRootAddress());
+    ASSERT_EQUALS(1, getRootCount());
+
+    thisStore.erase("c");
+    thisStore.erase("b");
+    thisStore.erase("a");
+
+    ASSERT_EQUALS(rootAddr, getRootAddress());
+    ASSERT_EQUALS(1, getRootCount());
+}
+
+TEST_F(RadixStoreTest, HasPreviousVersionFlagTest) {
+    value_type value1 = std::make_pair("a", "1");
+    value_type value2 = std::make_pair("b", "2");
+    value_type value3 = std::make_pair("c", "3");
+
+    ASSERT_FALSE(hasPreviousVersion());
+    thisStore.insert(value_type(value1));
+
+    {
+        auto it = thisStore.begin();
+        ASSERT_FALSE(hasPreviousVersion());
+    }
+
+    ASSERT_FALSE(hasPreviousVersion());
+
+    {
+        auto it = thisStore.begin();
+        ASSERT_FALSE(hasPreviousVersion());
+
+        thisStore.insert(value_type(value2));
+        ASSERT_TRUE(hasPreviousVersion());
+    }
+
+    ASSERT_FALSE(hasPreviousVersion());
+    thisStore.erase("b");
+
+    // Use multiple cursors
+    {
+        auto it = thisStore.begin();
+        auto it2 = thisStore.begin();
+        ASSERT_FALSE(hasPreviousVersion());
+
+        thisStore.insert(value_type(value2));
+        ASSERT_TRUE(hasPreviousVersion());
+
+        *it;  // Change to repositionIfChanged when merging (SERVER-38262 in master);
+        ASSERT_TRUE(hasPreviousVersion());
+
+        *it2;
+        ASSERT_FALSE(hasPreviousVersion());
+
+        thisStore.insert(value_type(value3));
+        ASSERT_TRUE(hasPreviousVersion());
+
+        *it;
+    }
+
+    ASSERT_FALSE(hasPreviousVersion());
+}
+
+TEST_F(RadixStoreTest, LowerBoundEndpoint) {
+    value_type value1 = std::make_pair("AAA", "1");
+    value_type value2 = std::make_pair("\xff\xff\xff", "2");
+
+    thisStore.insert(value_type(value1));
+    thisStore.insert(value_type(value2));
+
+    auto it = thisStore.lower_bound("AAA");
+    ASSERT_TRUE(it->first == "AAA");
+
+    it = thisStore.lower_bound("\xff\xff");
+    ASSERT_TRUE(it->first == "\xff\xff\xff");
+
+    it = thisStore.lower_bound("\xff\xff\xff");
+    ASSERT_TRUE(it->first == "\xff\xff\xff");
+
+    it = thisStore.lower_bound("\xff\xff\xff\xff");
+    ASSERT_TRUE(it == thisStore.end());
+}
+
 }  // biggie namespace
+}  // mongo namespace

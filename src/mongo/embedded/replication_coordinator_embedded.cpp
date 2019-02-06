@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -95,7 +97,11 @@ Status ReplicationCoordinatorEmbedded::checkCanServeReadsFor_UNSAFE(OperationCon
     return Status::OK();
 }
 
-bool ReplicationCoordinatorEmbedded::isInPrimaryOrSecondaryState() const {
+bool ReplicationCoordinatorEmbedded::isInPrimaryOrSecondaryState(OperationContext* opCtx) const {
+    return false;
+}
+
+bool ReplicationCoordinatorEmbedded::isInPrimaryOrSecondaryState_UNSAFE() const {
     return false;
 }
 
@@ -157,6 +163,11 @@ void ReplicationCoordinatorEmbedded::clearSyncSourceBlacklist() {
 }
 
 Status ReplicationCoordinatorEmbedded::setFollowerMode(const MemberState&) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+Status ReplicationCoordinatorEmbedded::setFollowerModeStrict(OperationContext* opCtx,
+                                                             const MemberState&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -228,6 +239,11 @@ Status ReplicationCoordinatorEmbedded::waitUntilOpTimeForReadUntil(OperationCont
     UASSERT_NOT_IMPLEMENTED;
 }
 
+Status ReplicationCoordinatorEmbedded::awaitOpTimeCommitted(OperationContext* opCtx,
+                                                            OpTime opTime) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorEmbedded::awaitReplication(
     OperationContext*, const OpTime&, const WriteConcernOptions&) {
     UASSERT_NOT_IMPLEMENTED;
@@ -245,6 +261,10 @@ OID ReplicationCoordinatorEmbedded::getElectionId() {
 }
 
 int ReplicationCoordinatorEmbedded::getMyId() const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+HostAndPort ReplicationCoordinatorEmbedded::getMyHostAndPort() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -333,6 +353,17 @@ Status ReplicationCoordinatorEmbedded::checkIfWriteConcernCanBeSatisfied(
     UASSERT_NOT_IMPLEMENTED;
 }
 
+Status ReplicationCoordinatorEmbedded::checkIfCommitQuorumCanBeSatisfied(
+    const CommitQuorumOptions& commitQuorum) const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+StatusWith<bool> ReplicationCoordinatorEmbedded::checkIfCommitQuorumIsSatisfied(
+    const CommitQuorumOptions& commitQuorum,
+    const std::vector<HostAndPort>& commitReadyMembers) const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 Status ReplicationCoordinatorEmbedded::checkReplEnabledForCommand(BSONObjBuilder*) {
     return Status(ErrorCodes::NoReplicationEnabled, "no replication on embedded");
 }
@@ -383,10 +414,6 @@ Status ReplicationCoordinatorEmbedded::processHeartbeatV1(const ReplSetHeartbeat
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::summarizeAsHtml(ReplSetHtmlSummary*) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
 long long ReplicationCoordinatorEmbedded::getTerm() {
     UASSERT_NOT_IMPLEMENTED;
 }
@@ -412,16 +439,19 @@ Status ReplicationCoordinatorEmbedded::stepUpIfEligible(bool skipDryRun) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-ReplSettings::IndexPrefetchConfig ReplicationCoordinatorEmbedded::getIndexPrefetchConfig() const {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-void ReplicationCoordinatorEmbedded::setIndexPrefetchConfig(
-    const ReplSettings::IndexPrefetchConfig) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
 void ReplicationCoordinatorEmbedded::signalDropPendingCollectionsRemovedFromStorage() {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+boost::optional<Timestamp> ReplicationCoordinatorEmbedded::getRecoveryTimestamp() {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+bool ReplicationCoordinatorEmbedded::setContainsArbiter() const {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+void ReplicationCoordinatorEmbedded::attemptToAdvanceStableTimestamp() {
     UASSERT_NOT_IMPLEMENTED;
 }
 

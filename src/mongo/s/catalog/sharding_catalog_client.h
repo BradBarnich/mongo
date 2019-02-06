@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -202,7 +204,8 @@ public:
                                                          repl::ReadConcernLevel readConcern) = 0;
 
     /**
-     * Retrieves all tags for the specified collection.
+     * Retrieves all zones defined for the specified collection. The returned vector is sorted based
+     * on the min key of the zones.
      *
      * Returns a !OK status if an error occurs.
      */
@@ -265,33 +268,6 @@ public:
                                            const ChunkVersion& lastChunkVersion,
                                            const WriteConcernOptions& writeConcern,
                                            repl::ReadConcernLevel readConcern) = 0;
-
-    /**
-     * Writes a diagnostic event to the action log.
-     */
-    virtual Status logAction(OperationContext* opCtx,
-                             const std::string& what,
-                             const std::string& ns,
-                             const BSONObj& detail) = 0;
-
-    /**
-     * Writes a diagnostic event to the change log.
-     */
-    virtual Status logChangeChecked(OperationContext* opCtx,
-                                    const std::string& what,
-                                    const std::string& ns,
-                                    const BSONObj& detail,
-                                    const WriteConcernOptions& writeConcern) = 0;
-
-    void logChange(OperationContext* const opCtx,
-                   const std::string& what,
-                   const std::string& ns,
-                   const BSONObj& detail,
-                   const WriteConcernOptions& writeConcern) {
-        // It is safe to ignore the results of `logChangeChecked` in many cases, as the
-        // failure to log a change is often of no consequence.
-        logChangeChecked(opCtx, what, ns, detail, writeConcern).ignore();
-    }
 
     /**
      * Reads global sharding settings from the confing.settings collection. The key parameter is

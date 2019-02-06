@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
@@ -36,15 +38,14 @@
 #include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
-#include "mongo/db/auth/internal_user_auth.h"
+#include "mongo/client/authenticate.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/list_collections_filter.h"
 #include "mongo/db/commands/rename_collection.h"
@@ -62,7 +63,6 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/s/grid.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -141,7 +141,8 @@ struct Cloner::Fun {
                 repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, to_collection));
 
         // Make sure database still exists after we resume from the temp release
-        Database* db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, _dbName);
+        auto databaseHolder = DatabaseHolder::get(opCtx);
+        auto db = databaseHolder->openDb(opCtx, _dbName);
 
         bool createdCollection = false;
         Collection* collection = NULL;
@@ -160,16 +161,18 @@ struct Cloner::Fun {
                 CollectionOptions collectionOptions;
                 uassertStatusOK(collectionOptions.parse(
                     from_options, CollectionOptions::ParseKind::parseForCommand));
-                Status s = Database::userCreateNS(
-                    opCtx,
-                    db,
-                    to_collection.toString(),
-                    collectionOptions,
-                    createDefaultIndexes,
-                    fixIndexSpec(to_collection.db().toString(), from_id_index));
-                verify(s.isOK());
+                auto indexSpec = fixIndexSpec(to_collection.db().toString(), from_id_index);
+                invariant(
+                    db->userCreateNS(
+                        opCtx, to_collection, collectionOptions, createDefaultIndexes, indexSpec),
+                    str::stream() << "collection creation failed during clone ["
+                                  << to_collection.ns()
+                                  << "]");
                 wunit.commit();
                 collection = db->getCollection(opCtx, to_collection);
+                invariant(collection,
+                          str::stream() << "Missing collection during clone [" << to_collection.ns()
+                                        << "]");
             });
         }
 
@@ -202,7 +205,7 @@ struct Cloner::Fun {
                 }
 
                 // TODO: SERVER-16598 abort if original db or collection is gone.
-                db = DatabaseHolder::getDatabaseHolder().get(opCtx, _dbName);
+                db = databaseHolder->getDb(opCtx, _dbName);
                 uassert(28593,
                         str::stream() << "Database " << _dbName << " dropped while cloning",
                         db != NULL);
@@ -270,7 +273,8 @@ struct Cloner::Fun {
                 }
             });
 
-            RARELY if (time(0) - saveLast > 60) {
+            static Rarely sampler;
+            if (sampler.tick() && (time(0) - saveLast > 60)) {
                 log() << numSeen << " objects cloned so far from collection " << from_collection;
                 saveLast = time(0);
             }
@@ -361,7 +365,8 @@ void Cloner::copyIndexes(OperationContext* opCtx,
 
     // We are under lock here again, so reload the database in case it may have disappeared
     // during the temp release
-    Database* db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, toDBName);
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->openDb(opCtx, toDBName);
 
     Collection* collection = db->getCollection(opCtx, to_collection);
     if (!collection) {
@@ -373,17 +378,21 @@ void Cloner::copyIndexes(OperationContext* opCtx,
             uassertStatusOK(
                 collectionOptions.parse(from_opts, CollectionOptions::ParseKind::parseForCommand));
             const bool createDefaultIndexes = true;
-            Status s = Database::userCreateNS(
-                opCtx,
-                db,
-                to_collection.toString(),
-                collectionOptions,
-                createDefaultIndexes,
-                fixIndexSpec(to_collection.db().toString(), getIdIndexSpec(from_indexes)));
-            invariant(s.isOK());
-            collection = db->getCollection(opCtx, to_collection);
-            invariant(collection);
+            invariant(db->userCreateNS(opCtx,
+                                       to_collection,
+                                       collectionOptions,
+                                       createDefaultIndexes,
+                                       fixIndexSpec(to_collection.db().toString(),
+                                                    getIdIndexSpec(from_indexes))),
+                      str::stream() << "Collection creation failed while copying indexes from "
+                                    << from_collection.ns()
+                                    << " to "
+                                    << to_collection.ns()
+                                    << " (Cloner)");
             wunit.commit();
+            collection = db->getCollection(opCtx, to_collection);
+            invariant(collection,
+                      str::stream() << "Missing collection " << to_collection.ns() << " (Cloner)");
         });
     }
 
@@ -393,17 +402,18 @@ void Cloner::copyIndexes(OperationContext* opCtx,
     // matches. It also wouldn't work on non-empty collections so we would need both
     // implementations anyway as long as that is supported.
     MultiIndexBlock indexer(opCtx, collection);
-    indexer.allowInterruption();
 
-    indexer.removeExistingIndexes(&indexesToBuild);
-    if (indexesToBuild.empty())
+    auto indexCatalog = collection->getIndexCatalog();
+    auto prunedIndexesToBuild = indexCatalog->removeExistingIndexes(opCtx, indexesToBuild);
+    if (prunedIndexesToBuild.empty()) {
         return;
+    }
 
-    auto indexInfoObjs = uassertStatusOK(indexer.init(indexesToBuild));
+    auto indexInfoObjs = uassertStatusOK(indexer.init(prunedIndexesToBuild));
     uassertStatusOK(indexer.insertAllDocumentsInCollection());
 
     WriteUnitOfWork wunit(opCtx);
-    indexer.commit();
+    uassertStatusOK(indexer.commit());
     if (opCtx->writesAreReplicated()) {
         for (auto&& infoObj : indexInfoObjs) {
             getGlobalServiceContext()->getOpObserver()->onCreateIndex(
@@ -470,7 +480,8 @@ bool Cloner::copyCollection(OperationContext* opCtx,
             !opCtx->writesAreReplicated() ||
                 repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss));
 
-    Database* db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbname);
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->openDb(opCtx, dbname);
 
     if (shouldCreateCollection) {
         bool result = writeConflictRetry(opCtx, "createCollection", ns, [&] {
@@ -480,8 +491,8 @@ bool Cloner::copyCollection(OperationContext* opCtx,
             CollectionOptions collectionOptions;
             uassertStatusOK(collectionOptions.parse(options, optionsParser));
             const bool createDefaultIndexes = true;
-            Status status = Database::userCreateNS(
-                opCtx, db, ns, collectionOptions, createDefaultIndexes, idIndexSpec);
+            Status status =
+                db->userCreateNS(opCtx, nss, collectionOptions, createDefaultIndexes, idIndexSpec);
             if (!status.isOK()) {
                 errmsg = status.toString();
                 // abort write unit of work
@@ -560,7 +571,8 @@ Status Cloner::createCollectionsForDb(
     const std::vector<CreateCollectionParams>& createCollectionParams,
     const std::string& dbName,
     const CloneOptions& opts) {
-    Database* db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbName);
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->openDb(opCtx, dbName);
     invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
 
     auto collCount = 0;
@@ -634,13 +646,9 @@ Status Cloner::createCollectionsForDb(
                 CollectionOptions collectionOptions;
                 uassertStatusOK(collectionOptions.parse(
                     options, CollectionOptions::ParseKind::parseForStorage));
-                Status createStatus =
-                    Database::userCreateNS(opCtx,
-                                           db,
-                                           nss.ns(),
-                                           collectionOptions,
-                                           createDefaultIndexes,
-                                           fixIndexSpec(nss.db().toString(), params.idIndexSpec));
+                auto indexSpec = fixIndexSpec(nss.db().toString(), params.idIndexSpec);
+                Status createStatus = db->userCreateNS(
+                    opCtx, nss, collectionOptions, createDefaultIndexes, indexSpec);
                 if (!createStatus.isOK()) {
                     return createStatus;
                 }
@@ -704,9 +712,11 @@ Status Cloner::copyDb(OperationContext* opCtx,
                 return Status(ErrorCodes::HostUnreachable, errmsg);
             }
 
-            if (isInternalAuthSet() && !con->authenticateInternalUser()) {
-                return Status(ErrorCodes::AuthenticationFailed,
-                              "Unable to authenticate as internal user");
+            if (auth::isInternalAuthSet()) {
+                auto authStatus = con->authenticateInternalUser();
+                if (!authStatus.isOK()) {
+                    return authStatus;
+                }
             }
 
             _conn = std::move(con);

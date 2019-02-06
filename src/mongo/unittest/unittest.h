@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 /*
  * A C++ unit testing framework.
@@ -164,23 +166,10 @@
  * normal `.ignore()` code.  This macro exists only to make using `ASSERT_THROWS` less inconvenient
  * on functions which both throw and return `Status` or `StatusWith`.
  */
-//#define UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(STATEMENT)
-#ifdef __GNUC__
-// The `(void) 0`s are to permit more readable formatting of these in-macro pragma statements.
-#define UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(STATEMENT)   \
-    do {                                                               \
-        _Pragma("GCC diagnostic push")(void) 0;                        \
-        _Pragma("GCC diagnostic ignored \"-Wunused\"")(void) 0;        \
-        _Pragma("GCC diagnostic ignored \"-Wunused-result\"")(void) 0; \
-        STATEMENT;                                                     \
-        _Pragma("GCC diagnostic pop")(void) 0;                         \
+#define UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(EXPRESSION) \
+    do {                                                              \
+        (void)(EXPRESSION);                                           \
     } while (false)
-#else
-#define UNIT_TEST_INTERNALS_IGNORE_UNUSED_RESULT_WARNINGS(STATEMENT) \
-    do {                                                             \
-        STATEMENT;                                                   \
-    } while (false)
-#endif
 
 /**
  * Behaves like ASSERT_THROWS, above, but also calls CHECK(caughtException) which may contain
@@ -263,7 +252,6 @@
 #define _TEST_TYPE_NAME(CASE_NAME, TEST_NAME) UnitTest__##CASE_NAME##__##TEST_NAME
 
 namespace mongo {
-
 namespace unittest {
 
 class Result;
@@ -275,6 +263,7 @@ void setupTestLogger();
  * different target from the global log domain.
  */
 mongo::logger::LogstreamBuilder log();
+mongo::logger::LogstreamBuilder warning();
 
 /**
  * Type representing the function composing a test.
@@ -316,6 +305,16 @@ public:
     virtual ~Test();
 
     void run();
+
+    /**
+     * Called on the test object before running the test.
+     */
+    virtual void setUp() {}
+
+    /**
+     * Called on the test object after running the test.
+     */
+    virtual void tearDown() {}
 
 protected:
     /**
@@ -373,16 +372,6 @@ protected:
      * Prints the captured log lines.
      */
     void printCapturedLogLines() const;
-
-    /**
-     * Called on the test object before running the test.
-     */
-    virtual void setUp();
-
-    /**
-     * Called on the test object after running the test.
-     */
-    virtual void tearDown();
 
 private:
     /**
@@ -474,6 +463,23 @@ struct SuiteInstance {
         new T(u);
     }
 };
+
+template <typename T>
+Test::RegistrationAgent<T>::RegistrationAgent(const std::string& suiteName,
+                                              const std::string& testName)
+    : _suiteName(suiteName), _testName(testName) {
+    Suite::getSuite(suiteName)->add<T>(testName);
+}
+
+template <typename T>
+std::string Test::RegistrationAgent<T>::getSuiteName() const {
+    return _suiteName;
+}
+
+template <typename T>
+std::string Test::RegistrationAgent<T>::getTestName() const {
+    return _testName;
+}
 
 /**
  * Exception thrown when a test assertion fails.
@@ -630,12 +636,5 @@ T assertGet(StatusWith<T>&& swt) {
  */
 std::vector<std::string> getAllSuiteNames();
 
-
-inline bool alwaysTrue() {
-    return true;
-}
-
 }  // namespace unittest
 }  // namespace mongo
-
-#include "mongo/unittest/unittest-inl.h"

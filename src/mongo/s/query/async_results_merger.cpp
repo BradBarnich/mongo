@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -90,9 +92,9 @@ AsyncResultsMerger::AsyncResultsMerger(OperationContext* opCtx,
       // since that is not supported we treat boost::none (unspecified) to mean 'kNormal'.
       _tailableMode(params.getTailableMode().value_or(TailableModeEnum::kNormal)),
       _params(std::move(params)),
-      _mergeQueue(MergingComparator(_remotes,
-                                    _params.getSort() ? *_params.getSort() : BSONObj(),
-                                    _params.getCompareWholeSortKey())) {
+      _mergeQueue(MergingComparator(
+          _remotes, _params.getSort().value_or(BSONObj()), _params.getCompareWholeSortKey())),
+      _promisedMinSortKeys(PromisedMinSortKeyComparator(_params.getSort().value_or(BSONObj()))) {
     if (params.getTxnNumber()) {
         invariant(params.getSessionId());
     }
@@ -108,6 +110,9 @@ AsyncResultsMerger::AsyncResultsMerger(OperationContext* opCtx,
         _addBatchToBuffer(WithLock::withoutLock(), remoteIndex, remote.getCursorResponse());
         ++remoteIndex;
     }
+    // If this is a change stream, then we expect to have already received PBRTs from every shard.
+    invariant(_promisedMinSortKeys.empty() || _promisedMinSortKeys.size() == _remotes.size());
+    _highWaterMark = _promisedMinSortKeys.empty() ? BSONObj() : _promisedMinSortKeys.begin()->first;
 }
 
 AsyncResultsMerger::~AsyncResultsMerger() {
@@ -173,11 +178,30 @@ void AsyncResultsMerger::reattachToOperationContext(OperationContext* opCtx) {
 
 void AsyncResultsMerger::addNewShardCursors(std::vector<RemoteCursor>&& newCursors) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
+    // Create a new entry in the '_remotes' list for each new shard, and add the first cursor batch
+    // to its buffer. This ensures the shard's initial high water mark is respected, if it exists.
     for (auto&& remote : newCursors) {
+        const auto newIndex = _remotes.size();
         _remotes.emplace_back(remote.getHostAndPort(),
                               remote.getCursorResponse().getNSS(),
                               remote.getCursorResponse().getCursorId());
+        _addBatchToBuffer(lk, newIndex, remote.getCursorResponse());
     }
+}
+
+BSONObj AsyncResultsMerger::getHighWaterMark() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    auto minPromisedSortKey = _getMinPromisedSortKey(lk);
+    if (!minPromisedSortKey.isEmpty() && !_ready(lk)) {
+        _highWaterMark = minPromisedSortKey;
+    }
+    return _highWaterMark;
+}
+
+BSONObj AsyncResultsMerger::_getMinPromisedSortKey(WithLock) {
+    // We cannot return the minimum promised sort key unless all shards have reported one.
+    return _promisedMinSortKeys.size() < _remotes.size() ? BSONObj()
+                                                         : _promisedMinSortKeys.begin()->first;
 }
 
 bool AsyncResultsMerger::_ready(WithLock lk) {
@@ -218,7 +242,7 @@ bool AsyncResultsMerger::_readySorted(WithLock lk) {
     return true;
 }
 
-bool AsyncResultsMerger::_readySortedTailable(WithLock) {
+bool AsyncResultsMerger::_readySortedTailable(WithLock lk) {
     if (_mergeQueue.empty()) {
         return false;
     }
@@ -227,19 +251,10 @@ bool AsyncResultsMerger::_readySortedTailable(WithLock) {
     auto smallestResult = _remotes[smallestRemote].docBuffer.front();
     auto keyWeWantToReturn =
         extractSortKey(*smallestResult.getResult(), _params.getCompareWholeSortKey());
-    for (const auto& remote : _remotes) {
-        if (!remote.promisedMinSortKey) {
-            // In order to merge sorted tailable cursors, we need this value to be populated.
-            return false;
-        }
-        if (compareSortKeys(keyWeWantToReturn, *remote.promisedMinSortKey, *_params.getSort()) >
-            0) {
-            // The key we want to return is not guaranteed to be smaller than future results from
-            // this remote, so we can't yet return it.
-            return false;
-        }
-    }
-    return true;
+    // We should always have a minPromisedSortKey from every shard in the sorted tailable case.
+    auto minPromisedSortKey = _getMinPromisedSortKey(lk);
+    invariant(!minPromisedSortKey.isEmpty());
+    return compareSortKeys(keyWeWantToReturn, minPromisedSortKey, *_params.getSort()) <= 0;
 }
 
 bool AsyncResultsMerger::_readyUnsorted(WithLock) {
@@ -297,6 +312,12 @@ ClusterQueryResult AsyncResultsMerger::_nextReadySorted(WithLock) {
     // next result.
     if (!_remotes[smallestRemote].docBuffer.empty()) {
         _mergeQueue.push(smallestRemote);
+    }
+
+    // For sorted tailable awaitData cursors, update the high water mark to the document's sort key.
+    if (_tailableMode == TailableModeEnum::kTailableAndAwaitData) {
+        _highWaterMark =
+            extractSortKey(*front.getResult(), _params.getCompareWholeSortKey()).getOwned();
     }
 
     return front;
@@ -483,47 +504,41 @@ StatusWith<CursorResponse> AsyncResultsMerger::_parseCursorResponse(
     return std::move(cursorResponse);
 }
 
-void AsyncResultsMerger::updateRemoteMetadata(RemoteCursorData* remote,
-                                              const CursorResponse& response) {
+void AsyncResultsMerger::_updateRemoteMetadata(WithLock,
+                                               size_t remoteIndex,
+                                               const CursorResponse& response) {
     // Update the cursorId; it is sent as '0' when the cursor has been exhausted on the shard.
-    remote->cursorId = response.getCursorId();
-    if (response.getLastOplogTimestamp() && !response.getLastOplogTimestamp()->isNull()) {
+    auto& remote = _remotes[remoteIndex];
+    remote.cursorId = response.getCursorId();
+    if (response.getPostBatchResumeToken()) {
         // We only expect to see this for change streams.
         invariant(_params.getSort());
         invariant(SimpleBSONObjComparator::kInstance.evaluate(*_params.getSort() ==
                                                               change_stream_constants::kSortSpec));
 
-        auto newLatestTimestamp = *response.getLastOplogTimestamp();
-        if (remote->promisedMinSortKey) {
-            auto existingLatestTimestamp = remote->promisedMinSortKey->firstElement().timestamp();
-            if (existingLatestTimestamp == newLatestTimestamp) {
-                // Nothing to update.
-                return;
-            }
-            // The most recent oplog timestamp should never be smaller than the timestamp field of
-            // the previous min sort key for this remote, if one exists.
-            invariant(existingLatestTimestamp < newLatestTimestamp);
+        // The postBatchResumeToken should never be empty.
+        invariant(!response.getPostBatchResumeToken()->isEmpty());
+
+        // The most recent minimum sort key should never be smaller than the previous promised
+        // minimum sort key for this remote, if one exists.
+        auto newMinSortKey = *response.getPostBatchResumeToken();
+        if (auto& oldMinSortKey = remote.promisedMinSortKey) {
+            invariant(compareSortKeys(newMinSortKey, *oldMinSortKey, *_params.getSort()) >= 0);
+            invariant(_promisedMinSortKeys.size() <= _remotes.size());
+            _promisedMinSortKeys.erase({*oldMinSortKey, remoteIndex});
         }
-
-        // Our new minimum promised sort key is the first key whose timestamp matches the most
-        // recent reported oplog timestamp.
-        auto newPromisedMin =
-            BSON("" << *response.getLastOplogTimestamp() << "" << MINKEY << "" << MINKEY);
-
-        // The promised min sort key should never be smaller than any results returned. If the
-        // last entry in the batch is also the most recent entry in the oplog, then its sort key
-        // of {lastOplogTimestamp, uuid, docID} will be greater than the artificial promised min
-        // sort key of {lastOplogTimestamp, MINKEY, MINKEY}.
-        auto maxSortKeyFromResponse =
-            (response.getBatch().empty()
-                 ? BSONObj()
-                 : extractSortKey(response.getBatch().back(), _params.getCompareWholeSortKey()));
-
-        remote->promisedMinSortKey =
-            (compareSortKeys(
-                 newPromisedMin, maxSortKeyFromResponse, change_stream_constants::kSortSpec) < 0
-                 ? maxSortKeyFromResponse.getOwned()
-                 : newPromisedMin.getOwned());
+        _promisedMinSortKeys.insert({newMinSortKey, remoteIndex});
+        remote.promisedMinSortKey = newMinSortKey;
+    } else {
+        // If we don't have a postBatchResumeToken, then we should never have an oplog timestamp.
+        // TODO SERVER-38539: remove this validation when $internalLatestOplogTimestamp is removed.
+        if (response.getLastOplogTimestamp()) {
+            severe() << "Host " << remote.shardHostAndPort
+                     << " returned a cursor which has an oplog timestamp but does not have a "
+                        "postBatchResumeToken, suggesting that one or more shards are running an "
+                        "older version of MongoDB. This configuration is not supported.";
+            fassertFailedNoTrace(51062);
+        }
     }
 }
 
@@ -567,7 +582,12 @@ void AsyncResultsMerger::_cleanUpFailedBatch(WithLock lk, Status status, size_t 
     remote.status = std::move(status);
     // Unreachable host errors are swallowed if the 'allowPartialResults' option is set. We
     // remove the unreachable host entirely from consideration by marking it as exhausted.
-    if (_params.getAllowPartialResults()) {
+    //
+    // The ExchangePassthrough error code is an internal-only error code used specifically to
+    // communicate that an error has occurred, but some other thread is responsible for returning
+    // the error to the user. In order to avoid polluting the user's error message, we ingore such
+    // errors with the expectation that all outstanding cursors will be closed promptly.
+    if (_params.getAllowPartialResults() || remote.status == ErrorCodes::ExchangePassthrough) {
         remote.status = Status::OK();
 
         // Clear the results buffer and cursor id.
@@ -587,7 +607,10 @@ void AsyncResultsMerger::_processBatchResults(WithLock lk,
     }
     auto cursorResponseStatus = _parseCursorResponse(response.data, remote);
     if (!cursorResponseStatus.isOK()) {
-        _cleanUpFailedBatch(lk, cursorResponseStatus.getStatus(), remoteIndex);
+        _cleanUpFailedBatch(lk,
+                            cursorResponseStatus.getStatus().withContext(
+                                "Error on remote shard " + remote.shardHostAndPort.toString()),
+                            remoteIndex);
         return;
     }
 
@@ -623,7 +646,7 @@ bool AsyncResultsMerger::_addBatchToBuffer(WithLock lk,
                                            size_t remoteIndex,
                                            const CursorResponse& response) {
     auto& remote = _remotes[remoteIndex];
-    updateRemoteMetadata(&remote, response);
+    _updateRemoteMetadata(lk, remoteIndex, response);
     for (const auto& obj : response.getBatch()) {
         // If there's a sort, we're expecting the remote node to have given us back a sort key.
         if (_params.getSort()) {
@@ -771,6 +794,12 @@ bool AsyncResultsMerger::MergingComparator::operator()(const size_t& lhs, const 
     return compareSortKeys(extractSortKey(*leftDoc.getResult(), _compareWholeSortKey),
                            extractSortKey(*rightDoc.getResult(), _compareWholeSortKey),
                            _sort) > 0;
+}
+
+bool AsyncResultsMerger::PromisedMinSortKeyComparator::operator()(
+    const MinSortKeyRemoteIdPair& lhs, const MinSortKeyRemoteIdPair& rhs) const {
+    auto sortKeyComp = compareSortKeys(lhs.first, rhs.first, _sort);
+    return sortKeyComp < 0 || (sortKeyComp == 0 && lhs.second < rhs.second);
 }
 
 }  // namespace mongo

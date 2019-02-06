@@ -1,25 +1,27 @@
 // @file curop.h
 
-/*
- *    Copyright (C) 2010 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -85,11 +87,6 @@ public:
         void incrementKeysDeleted(long long n);
 
         /**
-         * Increments nmoved by n.
-         */
-        void incrementNmoved(long long n);
-
-        /**
          * Increments ninserted by n.
          */
         void incrementNinserted(long long n);
@@ -104,7 +101,7 @@ public:
          * field2, ..., with corresponding values value1, value2, ..., we will output a string in
          * the format: "<field1>:<value1> <field2>:<value2> ...".
          */
-        std::string report();
+        std::string report() const;
 
         boost::optional<long long> keysExamined;
         boost::optional<long long> docsExamined;
@@ -116,8 +113,6 @@ public:
         boost::optional<long long> ninserted;
         boost::optional<long long> ndeleted;
 
-        // Updates resulted in a move (moves are expensive).
-        boost::optional<long long> nmoved;
         // Number of index keys inserted.
         boost::optional<long long> keysInserted;
         // Number of index keys removed.
@@ -183,6 +178,10 @@ public:
 
     BSONObj execStats;  // Owned here.
 
+    // The hash of the PlanCache key for the query being run. This may change depending on what
+    // indexes are present.
+    boost::optional<uint32_t> planCacheKey;
+    // The hash of the query's "stable" key. This represents the query's shape.
     boost::optional<uint32_t> queryHash;
 
     // Details of any error (whether from an exception or a command returning failure).
@@ -198,6 +197,9 @@ public:
 
     // Stores additive metrics.
     AdditiveMetrics additiveMetrics;
+
+    // Stores storage statistics.
+    std::shared_ptr<StorageStats> storageStats;
 };
 
 /**
@@ -238,6 +240,14 @@ public:
                                          Client* client,
                                          bool truncateOps,
                                          BSONObjBuilder* infoBuilder);
+
+    /**
+     * Serializes the fields of a GenericCursor which do not appear elsewhere in the currentOp
+     * output. If 'maxQuerySize' is given, truncates the cursor's originatingCommand but preserves
+     * the comment.
+     */
+    static BSONObj truncateAndSerializeGenericCursor(GenericCursor* cursor,
+                                                     boost::optional<size_t> maxQuerySize);
 
     /**
      * Constructs a nested CurOp at the top of the given "opCtx"'s CurOp stack.
@@ -509,17 +519,20 @@ public:
     void reportState(BSONObjBuilder* builder, bool truncateOps = false);
 
     /**
+     * Sets the message for this CurOp.
+     */
+    void setMessage_inlock(StringData message);
+
+    /**
      * Sets the message and the progress meter for this CurOp.
      *
      * While it is necessary to hold the lock while this method executes, the
      * "hit" and "finished" methods of ProgressMeter may be called safely from
      * the thread executing the operation without locking the Client.
      */
-    ProgressMeter& setMessage_inlock(const char* msg,
-                                     std::string name = "Progress",
-                                     unsigned long long progressMeterTotal = 0,
-                                     int secondsBetween = 3);
-
+    ProgressMeter& setProgress_inlock(StringData name,
+                                      unsigned long long progressMeterTotal = 0,
+                                      int secondsBetween = 3);
     /**
      * Gets the message for this CurOp.
      */

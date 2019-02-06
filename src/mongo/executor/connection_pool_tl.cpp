@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,7 +34,8 @@
 
 #include "mongo/executor/connection_pool_tl.h"
 
-#include "mongo/db/auth/internal_user_auth.h"
+#include "mongo/client/authenticate.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -42,7 +45,7 @@ namespace {
 const auto kMaxTimerDuration = Milliseconds::max();
 
 struct TimeoutHandler {
-    AtomicBool done;
+    AtomicWord<bool> done;
     Promise<void> promise;
 
     explicit TimeoutHandler(Promise<void> p) : promise(std::move(p)) {}
@@ -112,16 +115,16 @@ void TLTimer::cancelTimeout() {
     _timer->cancel();
 }
 
-void TLConnection::indicateSuccess() {
-    _status = Status::OK();
-}
-
-void TLConnection::indicateFailure(Status status) {
-    _status = std::move(status);
+Date_t TLTimer::now() {
+    return _reactor->now();
 }
 
 const HostAndPort& TLConnection::getHostAndPort() const {
     return _peer;
+}
+
+transport::ConnectSSLMode TLConnection::getSslMode() const {
+    return _sslMode;
 }
 
 bool TLConnection::isHealthy() {
@@ -132,20 +135,6 @@ AsyncDBClient* TLConnection::client() {
     return _client.get();
 }
 
-void TLConnection::indicateUsed() {
-    // It is illegal to attempt to use a connection after calling indicateFailure().
-    invariant(_status.isOK() || _status == ConnectionPool::kConnectionStateUnknown);
-    _lastUsed = _reactor->now();
-}
-
-Date_t TLConnection::getLastUsed() const {
-    return _lastUsed;
-}
-
-const Status& TLConnection::getStatus() const {
-    return _status;
-}
-
 void TLConnection::setTimeout(Milliseconds timeout, TimeoutCallback cb) {
     auto anchor = shared_from_this();
     _timer->setTimeout(timeout, [ cb = std::move(cb), anchor = std::move(anchor) ] { cb(); });
@@ -154,6 +143,67 @@ void TLConnection::setTimeout(Milliseconds timeout, TimeoutCallback cb) {
 void TLConnection::cancelTimeout() {
     _timer->cancelTimeout();
 }
+
+class TLConnectionSetupHook : public executor::NetworkConnectionHook {
+public:
+    explicit TLConnectionSetupHook(executor::NetworkConnectionHook* hookToWrap)
+        : _wrappedHook(hookToWrap) {}
+
+    BSONObj augmentIsMasterRequest(BSONObj cmdObj) override {
+        BSONObjBuilder bob(std::move(cmdObj));
+        bob.append("hangUpOnStepDown", false);
+        if (internalSecurity.user) {
+            bob.append("saslSupportedMechs", internalSecurity.user->getName().getUnambiguousName());
+        }
+
+        return bob.obj();
+    }
+
+    Status validateHost(const HostAndPort& remoteHost,
+                        const BSONObj& isMasterRequest,
+                        const RemoteCommandResponse& isMasterReply) override try {
+        const auto saslMechsElem = isMasterReply.data.getField("saslSupportedMechs");
+        if (saslMechsElem.type() == Array) {
+            auto array = saslMechsElem.Array();
+            for (const auto& elem : array) {
+                _saslMechsForInternalAuth.push_back(elem.checkAndGetStringData().toString());
+            }
+        }
+
+        if (!_wrappedHook) {
+            return Status::OK();
+        } else {
+            return _wrappedHook->validateHost(remoteHost, isMasterRequest, isMasterReply);
+        }
+    } catch (const DBException& e) {
+        return e.toStatus();
+    }
+
+    StatusWith<boost::optional<RemoteCommandRequest>> makeRequest(
+        const HostAndPort& remoteHost) final {
+        if (_wrappedHook) {
+            return _wrappedHook->makeRequest(remoteHost);
+        } else {
+            return boost::none;
+        }
+    }
+
+    Status handleReply(const HostAndPort& remoteHost, RemoteCommandResponse&& response) final {
+        if (_wrappedHook) {
+            return _wrappedHook->handleReply(remoteHost, std::move(response));
+        } else {
+            return Status::OK();
+        }
+    }
+
+    const std::vector<std::string>& saslMechsForInternalAuth() const {
+        return _saslMechsForInternalAuth;
+    }
+
+private:
+    std::vector<std::string> _saslMechsForInternalAuth;
+    executor::NetworkConnectionHook* const _wrappedHook = nullptr;
+};
 
 void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
     auto anchor = shared_from_this();
@@ -178,15 +228,22 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
         }
     });
 
-    AsyncDBClient::connect(_peer, transport::kGlobalSSLMode, _serviceContext, _reactor, timeout)
+    auto isMasterHook = std::make_shared<TLConnectionSetupHook>(_onConnectHook);
+
+    AsyncDBClient::connect(_peer, _sslMode, _serviceContext, _reactor, timeout)
         .onError([](StatusWith<AsyncDBClient::Handle> swc) -> StatusWith<AsyncDBClient::Handle> {
             return Status(ErrorCodes::HostUnreachable, swc.getStatus().reason());
         })
-        .then([this](AsyncDBClient::Handle client) {
+        .then([this, isMasterHook](AsyncDBClient::Handle client) {
             _client = std::move(client);
-            return _client->initWireVersion("NetworkInterfaceTL", _onConnectHook);
+            return _client->initWireVersion("NetworkInterfaceTL", isMasterHook.get());
         })
-        .then([this] { return _client->authenticate(getInternalUserAuthParams()); })
+        .then([this, isMasterHook] {
+            boost::optional<std::string> mechanism;
+            if (!isMasterHook->saslMechsForInternalAuth().empty())
+                mechanism = isMasterHook->saslMechsForInternalAuth().front();
+            return _client->authenticateInternal(std::move(mechanism));
+        })
         .then([this] {
             if (!_onConnectHook) {
                 return Future<void>::makeReady();
@@ -217,10 +274,6 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
     LOG(2) << "Finished connection setup.";
 }
 
-void TLConnection::resetToUnknown() {
-    _status = ConnectionPool::kConnectionStateUnknown;
-}
-
 void TLConnection::refresh(Milliseconds timeout, RefreshCallback cb) {
     auto anchor = shared_from_this();
 
@@ -234,10 +287,10 @@ void TLConnection::refresh(Milliseconds timeout, RefreshCallback cb) {
             return;
         }
 
-        _status = {ErrorCodes::HostUnreachable, "Timed out refreshing host"};
+        indicateFailure({ErrorCodes::HostUnreachable, "Timed out refreshing host"});
         _client->cancel();
 
-        handler->promise.setError(_status);
+        handler->promise.setError(getStatus());
     });
 
     _client
@@ -253,17 +306,18 @@ void TLConnection::refresh(Milliseconds timeout, RefreshCallback cb) {
 
             cancelTimeout();
 
-            _status = status;
             if (status.isOK()) {
+                indicateSuccess();
                 handler->promise.emplaceValue();
             } else {
+                indicateFailure(status);
                 handler->promise.setError(status);
             }
         });
 }
 
-size_t TLConnection::getGeneration() const {
-    return _generation;
+Date_t TLConnection::now() {
+    return _reactor->now();
 }
 
 void TLConnection::cancelAsync() {
@@ -272,11 +326,12 @@ void TLConnection::cancelAsync() {
 }
 
 std::shared_ptr<ConnectionPool::ConnectionInterface> TLTypeFactory::makeConnection(
-    const HostAndPort& hostAndPort, size_t generation) {
+    const HostAndPort& hostAndPort, transport::ConnectSSLMode sslMode, size_t generation) {
     auto conn = std::make_shared<TLConnection>(shared_from_this(),
                                                _reactor,
                                                getGlobalServiceContext(),
                                                hostAndPort,
+                                               sslMode,
                                                generation,
                                                _onConnectHook.get());
     fasten(conn.get());

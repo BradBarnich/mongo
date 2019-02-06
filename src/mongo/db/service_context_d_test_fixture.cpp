@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016-2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,17 +36,17 @@
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/db/catalog/catalog_control.h"
+#include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
+#include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/mock_periodic_runner_impl.h"
-
-#include "mongo/db/catalog/database_holder.h"
+#include "mongo/util/periodic_runner_factory.h"
 
 namespace mongo {
 
@@ -68,14 +70,18 @@ ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine, RepairAct
     auto logicalClock = std::make_unique<LogicalClock>(serviceContext);
     LogicalClock::set(serviceContext, std::move(logicalClock));
 
-    // Set up a fake no-op PeriodicRunner. No jobs will ever get run, which is
-    // desired behavior for unit tests unrelated to background jobs.
-    auto runner = std::make_unique<MockPeriodicRunnerImpl>();
-    serviceContext->setPeriodicRunner(std::move(runner));
+    // Set up the periodic runner to allow background job execution for tests that require it.
+    auto runner = makePeriodicRunner(getServiceContext());
+    runner->startup();
+    getServiceContext()->setPeriodicRunner(std::move(runner));
 
     storageGlobalParams.dbpath = _tempDir.path();
 
     initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
+
+    DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
+
+    IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
 
     // Set up UUID Catalog observer. This is necessary because the Collection destructor contains an
     // invariant to ensure the UUID corresponding to that Collection object is no longer associated
@@ -91,9 +97,14 @@ ServiceContextMongoDTest::~ServiceContextMongoDTest() {
     {
         auto opCtx = getClient()->makeOperationContext();
         Lock::GlobalLock glk(opCtx.get(), MODE_X);
-        DatabaseHolder::getDatabaseHolder().closeAll(opCtx.get(), "all databases dropped");
+        auto databaseHolder = DatabaseHolder::get(opCtx.get());
+        databaseHolder->closeAll(opCtx.get());
     }
-    shutdownGlobalStorageEngineCleanly(getGlobalServiceContext());
+
+    IndexBuildsCoordinator::get(getServiceContext())->shutdown();
+
+    shutdownGlobalStorageEngineCleanly(getServiceContext());
+
     std::swap(storageGlobalParams.engine, _stashedStorageParams.engine);
     std::swap(storageGlobalParams.engineSetByUser, _stashedStorageParams.engineSetByUser);
     std::swap(storageGlobalParams.repair, _stashedStorageParams.repair);

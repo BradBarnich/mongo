@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -258,7 +258,7 @@ __wt_compact_page_skip(
 	}
 
 	/* Reset the WT_REF state. */
-	ref->state = WT_REF_DISK;
+	WT_REF_SET_STATE(ref, WT_REF_DISK);
 
 	return (ret);
 }

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -44,7 +46,6 @@
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/db/write_concern_options.h"
 
 namespace mongo {
 
@@ -53,6 +54,7 @@ constexpr StringData AggregationRequest::kCursorName;
 constexpr StringData AggregationRequest::kBatchSizeName;
 constexpr StringData AggregationRequest::kFromMongosName;
 constexpr StringData AggregationRequest::kNeedsMergeName;
+constexpr StringData AggregationRequest::kMergeByPBRTName;
 constexpr StringData AggregationRequest::kPipelineName;
 constexpr StringData AggregationRequest::kCollationName;
 constexpr StringData AggregationRequest::kExplainName;
@@ -62,9 +64,6 @@ constexpr StringData AggregationRequest::kCommentName;
 constexpr StringData AggregationRequest::kExchangeName;
 
 constexpr long long AggregationRequest::kDefaultBatchSize;
-
-AggregationRequest::AggregationRequest(NamespaceString nss, std::vector<BSONObj> pipeline)
-    : _nss(std::move(nss)), _pipeline(std::move(pipeline)), _batchSize(kDefaultBatchSize) {}
 
 StatusWith<std::vector<BSONObj>> AggregationRequest::parsePipelineFromBSON(
     BSONElement pipelineElem) {
@@ -203,6 +202,14 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
 
             hasNeedsMergeElem = true;
             request.setNeedsMerge(elem.Bool());
+        } else if (kMergeByPBRTName == fieldName) {
+            if (elem.type() != BSONType::Bool) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream() << kMergeByPBRTName << " must be a boolean, not a "
+                                      << typeName(elem.type())};
+            }
+
+            request.setMergeByPBRT(elem.Bool());
         } else if (kAllowDiskUseName == fieldName) {
             if (storageGlobalParams.readOnly) {
                 return {ErrorCodes::IllegalOperation,
@@ -223,6 +230,16 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
             }
         } else if (bypassDocumentValidationCommandOption() == fieldName) {
             request.setBypassDocumentValidation(elem.trueValue());
+        } else if (WriteConcernOptions::kWriteConcernField == fieldName) {
+            if (elem.type() != BSONType::Object) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream() << fieldName << " must be an object, not a "
+                                      << typeName(elem.type())};
+            }
+
+            WriteConcernOptions writeConcern;
+            uassertStatusOK(writeConcern.parse(elem.embeddedObject()));
+            request.setWriteConcern(writeConcern);
         } else if (!isGenericArgument(fieldName)) {
             return {ErrorCodes::FailedToParse,
                     str::stream() << "unrecognized field '" << elem.fieldName() << "'"};
@@ -302,6 +319,7 @@ Document AggregationRequest::serializeToCommandObj() const {
         {kAllowDiskUseName, _allowDiskUse ? Value(true) : Value()},
         {kFromMongosName, _fromMongos ? Value(true) : Value()},
         {kNeedsMergeName, _needsMerge ? Value(true) : Value()},
+        {kMergeByPBRTName, _mergeByPBRT ? Value(true) : Value()},
         {bypassDocumentValidationCommandOption(),
          _bypassDocumentValidation ? Value(true) : Value()},
         // Only serialize a collation if one was specified.
@@ -322,7 +340,10 @@ Document AggregationRequest::serializeToCommandObj() const {
         // Only serialize maxTimeMs if specified.
         {QueryRequest::cmdOptionMaxTimeMS,
          _maxTimeMS == 0 ? Value() : Value(static_cast<int>(_maxTimeMS))},
-        {kExchangeName, _exchangeSpec ? Value(_exchangeSpec->toBSON()) : Value()}};
+        {kExchangeName, _exchangeSpec ? Value(_exchangeSpec->toBSON()) : Value()},
+        {WriteConcernOptions::kWriteConcernField,
+         _writeConcern ? Value(_writeConcern->toBSON()) : Value()},
+    };
 }
 
 }  // namespace mongo

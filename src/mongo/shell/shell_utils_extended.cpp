@@ -1,38 +1,44 @@
 // mongo/shell/shell_utils_extended.cpp
-/*
- *    Copyright 2010 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
-#include <boost/filesystem/convenience.hpp>
-#include <boost/filesystem/fstream.hpp>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
+#include <boost/filesystem.hpp>
 #include <fstream>
 
 #include "mongo/scripting/engine.h"
@@ -152,15 +158,33 @@ BSONObj hostname(const BSONObj&, void* data) {
 const int CANT_OPEN_FILE = 13300;
 
 BSONObj cat(const BSONObj& args, void* data) {
-    BSONElement e = singleArg(args);
+    BSONObjIterator it(args);
+
+    auto filePath = it.next();
+    uassert(51012,
+            "the first argument to cat() must be a string containing the path to the file",
+            filePath.type() == mongo::String);
+
+    std::ios::openmode mode = std::ios::in;
+
+    auto useBinary = it.next();
+    if (!useBinary.eoo()) {
+        uassert(51013,
+                "the second argument to cat(), must be a boolean indicating whether "
+                "or not to read the file in binary mode. If omitted, the default is 'false'.",
+                useBinary.type() == mongo::Bool);
+
+        if (useBinary.Bool())
+            mode |= std::ios::binary;
+    }
+
     stringstream ss;
-    ifstream f(e.valuestrsafe());
+    ifstream f(filePath.valuestrsafe(), mode);
     uassert(CANT_OPEN_FILE, "couldn't open file", f.is_open());
 
     std::streamsize sz = 0;
     while (1) {
         char ch = 0;
-        // slow...maybe change one day
         f.get(ch);
         if (ch == 0)
             break;
@@ -176,7 +200,7 @@ BSONObj md5sumFile(const BSONObj& args, void* data) {
     stringstream ss;
     FILE* f = fopen(e.valuestrsafe(), "rb");
     uassert(CANT_OPEN_FILE, "couldn't open file", f);
-    ON_BLOCK_EXIT(fclose, f);
+    ON_BLOCK_EXIT([&] { fclose(f); });
 
     md5digest d;
     md5_state_t st;
@@ -251,8 +275,10 @@ BSONObj copyFile(const BSONObj& args, void* data) {
 BSONObj writeFile(const BSONObj& args, void* data) {
     // Parse the arguments.
 
-    uassert(
-        40340, "writeFile requires 2 arguments: writeFile(filePath, content)", args.nFields() == 2);
+    uassert(40340,
+            "writeFile requires at least 2 arguments: writeFile(filePath, content, "
+            "[useBinaryMode])",
+            args.nFields() >= 2);
 
     BSONObjIterator it(args);
 
@@ -281,7 +307,20 @@ BSONObj writeFile(const BSONObj& args, void* data) {
             "the file name must be compatible with POSIX and Windows",
             boost::filesystem::portable_name(normalizedFilePath.filename().string()));
 
-    boost::filesystem::ofstream ofs{normalizedFilePath};
+    std::ios::openmode mode = std::ios::out;
+
+    auto useBinary = it.next();
+    if (!useBinary.eoo()) {
+        uassert(51014,
+                "the third argument to writeFile(), must be a boolean indicating whether "
+                "or not to read the file in binary mode. If omitted, the default is 'false'.",
+                useBinary.type() == mongo::Bool);
+
+        if (useBinary.Bool())
+            mode |= std::ios::binary;
+    }
+
+    boost::filesystem::ofstream ofs{normalizedFilePath, mode};
     uassert(40346,
             str::stream() << "failed to open file " << normalizedFilePath.string()
                           << " for writing",
@@ -306,6 +345,35 @@ BSONObj passwordPrompt(const BSONObj& a, void* data) {
     return BSON("" << askPassword());
 }
 
+BSONObj changeUmask(const BSONObj& a, void* data) {
+#ifdef _WIN32
+    uasserted(50977, "umask is not supported on windows");
+#else
+    uassert(50976,
+            "umask takes 1 argument, the octal mode of the umask",
+            a.nFields() == 1 && isNumericBSONType(a.firstElementType()));
+    auto val = a.firstElement().Number();
+    return BSON("" << umask(static_cast<mode_t>(val)));
+#endif
+}
+
+BSONObj getFileMode(const BSONObj& a, void* data) {
+    uassert(50975,
+            "getFileMode() takes one argument, the absolute path to a file",
+            a.nFields() == 1 && a.firstElementType() == String);
+    auto pathStr = a.firstElement().checkAndGetStringData();
+    boost::filesystem::path path(pathStr.rawData());
+    boost::system::error_code ec;
+    auto fileStatus = boost::filesystem::status(path, ec);
+    if (ec) {
+        uasserted(50974,
+                  str::stream() << "Unable to get status for file \"" << pathStr << "\": "
+                                << ec.message());
+    }
+
+    return BSON("" << fileStatus.permissions());
+}
+
 void installShellUtilsExtended(Scope& scope) {
     scope.injectNative("getHostName", getHostName);
     scope.injectNative("removeFile", removeFile);
@@ -320,6 +388,8 @@ void installShellUtilsExtended(Scope& scope) {
     scope.injectNative("md5sumFile", md5sumFile);
     scope.injectNative("mkdir", mkdir);
     scope.injectNative("passwordPrompt", passwordPrompt);
+    scope.injectNative("umask", changeUmask);
+    scope.injectNative("getFileMode", getFileMode);
 }
 }
 }

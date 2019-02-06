@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,13 +37,13 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/session_catalog_router.h"
 #include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/mock_ns_targeter.h"
-#include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -573,6 +575,45 @@ TEST_F(BatchWriteExecTest, NonRetryableErrorTxnNumber) {
     future.timed_get(kFutureTimeout);
 }
 
+TEST_F(BatchWriteExecTest, StaleEpochIsNotRetryable) {
+    // A StaleEpoch error is not retried.
+
+    BatchedCommandRequest request([&] {
+        write_ops::Insert insertOp(nss);
+        insertOp.setWriteCommandBase([] {
+            write_ops::WriteCommandBase writeCommandBase;
+            writeCommandBase.setOrdered(true);
+            return writeCommandBase;
+        }());
+        insertOp.setDocuments({BSON("x" << 1), BSON("x" << 2)});
+        return insertOp;
+    }());
+    request.setWriteConcern(BSONObj());
+
+    operationContext()->setLogicalSessionId(makeLogicalSessionIdForTest());
+    operationContext()->setTxnNumber(5);
+
+    BatchedCommandResponse nonRetryableErrResponse;
+    nonRetryableErrResponse.setStatus({ErrorCodes::StaleEpoch, "mock stale epoch error"});
+
+    auto future = launchAsync([&] {
+        BatchedCommandResponse response;
+        BatchWriteExecStats stats;
+        BatchWriteExec::executeBatch(operationContext(), nsTargeter, request, &response, &stats);
+        ASSERT(response.getOk());
+        ASSERT_EQ(0, response.getN());
+        ASSERT(response.isErrDetailsSet());
+        ASSERT_EQUALS(response.getErrDetailsAt(0)->toStatus().code(),
+                      nonRetryableErrResponse.toStatus().code());
+        ASSERT(response.getErrDetailsAt(0)->toStatus().reason().find(
+                   nonRetryableErrResponse.toStatus().reason()) != std::string::npos);
+        ASSERT_EQ(1, stats.numRounds);
+    });
+
+    expectInsertsReturnError({BSON("x" << 1), BSON("x" << 2)}, nonRetryableErrResponse);
+
+    future.timed_get(kFutureTimeout);
+}
 
 class BatchWriteExecTransactionTest : public BatchWriteExecTest {
 public:
@@ -587,16 +628,16 @@ public:
         repl::ReadConcernArgs::get(operationContext()) =
             repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern);
 
-        _scopedSession.emplace(operationContext());
-
         auto logicalClock = stdx::make_unique<LogicalClock>(getServiceContext());
         logicalClock->setClusterTimeFromTrustedSource(kInMemoryLogicalTime);
         LogicalClock::set(getServiceContext(), std::move(logicalClock));
 
+        _scopedSession.emplace(operationContext());
+
         auto txnRouter = TransactionRouter::get(operationContext());
-        txnRouter->checkOut();
-        txnRouter->beginOrContinueTxn(operationContext(), kTxnNumber, true);
-        txnRouter->setAtClusterTimeToLatestTime(operationContext());
+        txnRouter->beginOrContinueTxn(
+            operationContext(), kTxnNumber, TransactionRouter::TransactionActions::kStart);
+        txnRouter->setDefaultAtClusterTime(operationContext());
     }
 
     void tearDown() override {
@@ -607,7 +648,7 @@ public:
     }
 
 private:
-    boost::optional<ScopedRouterSession> _scopedSession;
+    boost::optional<RouterOperationContextSession> _scopedSession;
 };
 
 TEST_F(BatchWriteExecTransactionTest, ErrorInBatchThrows_CommandError) {

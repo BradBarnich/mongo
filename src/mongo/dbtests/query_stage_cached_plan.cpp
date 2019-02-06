@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -34,6 +36,7 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/cached_plan.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/jsobj.h"
@@ -43,7 +46,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_yield_policy.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner_params.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/stdx/memory.h"
@@ -66,6 +69,8 @@ std::unique_ptr<CanonicalQuery> canonicalQueryFromFilterObj(OperationContext* op
 
 class QueryStageCachedPlan : public unittest::Test {
 public:
+    QueryStageCachedPlan() : _client(&_opCtx) {}
+
     void setUp() {
         // If collection exists already, we need to drop it.
         dropCollection();
@@ -88,9 +93,14 @@ public:
         ASSERT_OK(dbtests::createIndex(&_opCtx, nss.ns(), obj));
     }
 
+    void dropIndex(BSONObj keyPattern) {
+        _client.dropIndex(nss.ns(), std::move(keyPattern));
+    }
+
     void dropCollection() {
         Lock::DBLock dbLock(&_opCtx, nss.db(), MODE_X);
-        Database* database = DatabaseHolder::getDatabaseHolder().get(&_opCtx, nss.db());
+        auto databaseHolder = DatabaseHolder::get(&_opCtx);
+        auto database = databaseHolder->getDb(&_opCtx, nss.db());
         if (!database) {
             return;
         }
@@ -122,7 +132,6 @@ public:
             state = cachedPlanStage->work(&id);
 
             ASSERT_NE(state, PlanStage::FAILURE);
-            ASSERT_NE(state, PlanStage::DEAD);
 
             if (state == PlanStage::ADVANCED) {
                 WorkingSetMember* member = ws.get(id);
@@ -160,6 +169,7 @@ protected:
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_opCtxPtr;
     WorkingSet _ws;
+    DBDirectClient _client{&_opCtx};
 };
 
 /**
@@ -415,6 +425,94 @@ TEST_F(QueryStageCachedPlan, EntriesAreNotDeactivatedWhenInactiveEntriesDisabled
         canonicalQueryFromFilterObj(opCtx(), nss, fromjson("{a: {$gte: 0}, b: {$gte:0}}"));
     forceReplanning(collection, highWorksCq.get());
     ASSERT_EQ(cache->get(*shapeCq).state, PlanCache::CacheEntryState::kPresentActive);
+}
+
+TEST_F(QueryStageCachedPlan, ThrowsOnYieldRecoveryWhenIndexIsDroppedBeforePlanSelection) {
+    // Create an index which we will drop later on.
+    BSONObj keyPattern = BSON("c" << 1);
+    addIndex(keyPattern);
+
+    boost::optional<AutoGetCollectionForReadCommand> readLock;
+    readLock.emplace(&_opCtx, nss);
+    Collection* collection = readLock->getCollection();
+    ASSERT(collection);
+
+    // Query can be answered by either index on "a" or index on "b".
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
+    ASSERT_OK(statusWithCQ.getStatus());
+    const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+
+    // We shouldn't have anything in the plan cache for this shape yet.
+    PlanCache* cache = collection->infoCache()->getPlanCache();
+    ASSERT(cache);
+
+    // Get planner params.
+    QueryPlannerParams plannerParams;
+    fillOutPlannerParams(&_opCtx, collection, cq.get(), &plannerParams);
+
+    const size_t decisionWorks = 10;
+    CachedPlanStage cachedPlanStage(&_opCtx,
+                                    collection,
+                                    &_ws,
+                                    cq.get(),
+                                    plannerParams,
+                                    decisionWorks,
+                                    new QueuedDataStage(&_opCtx, &_ws));
+
+    // Drop an index while the CachedPlanStage is in a saved state. Restoring should fail, since we
+    // may still need the dropped index for plan selection.
+    cachedPlanStage.saveState();
+    readLock.reset();
+    dropIndex(keyPattern);
+    readLock.emplace(&_opCtx, nss);
+    ASSERT_THROWS_CODE(cachedPlanStage.restoreState(), DBException, ErrorCodes::QueryPlanKilled);
+}
+
+TEST_F(QueryStageCachedPlan, DoesNotThrowOnYieldRecoveryWhenIndexIsDroppedAferPlanSelection) {
+    // Create an index which we will drop later on.
+    BSONObj keyPattern = BSON("c" << 1);
+    addIndex(keyPattern);
+
+    boost::optional<AutoGetCollectionForReadCommand> readLock;
+    readLock.emplace(&_opCtx, nss);
+    Collection* collection = readLock->getCollection();
+    ASSERT(collection);
+
+    // Query can be answered by either index on "a" or index on "b".
+    auto qr = stdx::make_unique<QueryRequest>(nss);
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
+    ASSERT_OK(statusWithCQ.getStatus());
+    const std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+
+    // We shouldn't have anything in the plan cache for this shape yet.
+    PlanCache* cache = collection->infoCache()->getPlanCache();
+    ASSERT(cache);
+
+    // Get planner params.
+    QueryPlannerParams plannerParams;
+    fillOutPlannerParams(&_opCtx, collection, cq.get(), &plannerParams);
+
+    const size_t decisionWorks = 10;
+    CachedPlanStage cachedPlanStage(&_opCtx,
+                                    collection,
+                                    &_ws,
+                                    cq.get(),
+                                    plannerParams,
+                                    decisionWorks,
+                                    new QueuedDataStage(&_opCtx, &_ws));
+
+    PlanYieldPolicy yieldPolicy(PlanExecutor::YIELD_MANUAL,
+                                _opCtx.getServiceContext()->getFastClockSource());
+    ASSERT_OK(cachedPlanStage.pickBestPlan(&yieldPolicy));
+
+    // Drop an index while the CachedPlanStage is in a saved state. We should be able to restore
+    // successfully.
+    cachedPlanStage.saveState();
+    readLock.reset();
+    dropIndex(keyPattern);
+    readLock.emplace(&_opCtx, nss);
+    cachedPlanStage.restoreState();
 }
 
 }  // namespace QueryStageCachedPlan

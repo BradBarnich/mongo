@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2008 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -115,6 +117,10 @@ void profile(OperationContext* opCtx, NetworkOp op) {
 
     const string dbName(nsToDatabase(CurOp::get(opCtx)->getNS()));
 
+    // True if we need to acquire an X lock on the database in order to create the system.profile
+    // collection.
+    bool acquireDbXLock = false;
+
     try {
         // Even if the operation we are profiling was interrupted, we still want to output the
         // profiler entry.  This lock guard will prevent lock acquisitions from throwing exceptions
@@ -125,10 +131,12 @@ void profile(OperationContext* opCtx, NetworkOp op) {
             noInterrupt.emplace(opCtx->lockState());
         }
 
-        bool acquireDbXLock = false;
         while (true) {
             std::unique_ptr<AutoGetDb> autoGetDb;
             if (acquireDbXLock) {
+                // We should not attempt to acquire an X lock while in "noInterrupt" scope.
+                noInterrupt.reset();
+
                 autoGetDb.reset(new AutoGetDb(opCtx, dbName, MODE_X));
                 if (autoGetDb->getDb()) {
                     createProfileCollection(opCtx, autoGetDb->getDb()).transitional_ignore();
@@ -168,8 +176,16 @@ void profile(OperationContext* opCtx, NetworkOp op) {
             }
         }
     } catch (const AssertionException& assertionEx) {
-        warning() << "Caught Assertion while trying to profile " << networkOpToString(op)
-                  << " against " << CurOp::get(opCtx)->getNS() << ": " << redact(assertionEx);
+        if (acquireDbXLock && assertionEx.isA<ErrorCategory::Interruption>()) {
+            warning()
+                << "Interrupted while attempting to create profile collection in database "
+                << dbName << " to profile operation " << networkOpToString(op) << " against "
+                << CurOp::get(opCtx)->getNS()
+                << ". Manually create profile collection to ensure future operations are logged.";
+        } else {
+            warning() << "Caught Assertion while trying to profile " << networkOpToString(op)
+                      << " against " << CurOp::get(opCtx)->getNS() << ": " << redact(assertionEx);
+        }
     }
 }
 

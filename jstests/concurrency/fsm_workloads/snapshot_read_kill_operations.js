@@ -4,7 +4,7 @@
  * Test a snapshot read spanning a find and getmore that runs concurrently with killSessions,
  * killOp, killCursors, and txnNumber change.
  *
- * @tags: [uses_transactions]
+ * @tags: [uses_transactions, state_functions_share_transaction]
  */
 load('jstests/concurrency/fsm_workload_helpers/snapshot_read_utils.js');
 var $config = (function() {
@@ -35,15 +35,23 @@ var $config = (function() {
             doSnapshotGetMore(collName,
                               this,
                               [
-                                ErrorCodes.NoSuchTransaction,
+                                ErrorCodes.CursorKilled,
                                 ErrorCodes.CursorNotFound,
                                 ErrorCodes.Interrupted,
-                                ErrorCodes.LockTimeout
+                                ErrorCodes.LockTimeout,
+                                ErrorCodes.NoSuchTransaction,
                               ],
                               [ErrorCodes.NoSuchTransaction, ErrorCodes.Interrupted]);
         },
 
         incrementTxnNumber: function incrementTxnNumber(db, collName) {
+            const abortErrorCodes = [
+                ErrorCodes.NoSuchTransaction,
+                ErrorCodes.TransactionCommitted,
+                ErrorCodes.TransactionTooOld,
+                ErrorCodes.Interrupted
+            ];
+            abortTransaction(this.sessionDb, this.txnNumber, abortErrorCodes);
             this.txnNumber++;
         },
 
@@ -73,7 +81,7 @@ var $config = (function() {
                 this.sessionDb.adminCommand(
                     {currentOp: 1, ns: {$regex: db.getName() + "\." + collName}, op: "getmore"}),
                 ErrorCodes.Interrupted);
-            if (res.inprog.length) {
+            if (res.hasOwnProperty("inprog") && res.inprog.length) {
                 const killOpCmd = {killOp: 1, op: res.inprog[0].opid};
                 const killRes = this.sessionDb.adminCommand(killOpCmd);
                 assert.commandWorkedOrFailedWithCode(killRes, ErrorCodes.Interrupted);

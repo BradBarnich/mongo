@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/optional/optional_io.hpp>
 #include <iostream>
 #include <string>
 
@@ -48,6 +51,12 @@
 
 namespace mongo {
 namespace {
+
+static std::string kSideWritesTableIdent("sideWrites");
+static std::string kConstraintViolationsTableIdent("constraintViolations");
+
+// Update version as breaking changes are introduced into the index build procedure.
+static const long kExpectedVersion = 1;
 
 class KVCollectionCatalogEntryTest : public ServiceContextTest {
 public:
@@ -87,7 +96,9 @@ public:
         return dbEntry->getCollectionCatalogEntry(_nss.ns());
     }
 
-    std::string createIndex(BSONObj keyPattern, std::string indexType = IndexNames::BTREE) {
+    std::string createIndex(BSONObj keyPattern,
+                            std::string indexType = IndexNames::BTREE,
+                            IndexBuildProtocol protocol = IndexBuildProtocol::kSinglePhase) {
         auto opCtx = newOperationContext();
         std::string indexName = "idx" + std::to_string(numIndexesCreated);
 
@@ -100,7 +111,7 @@ public:
             WriteUnitOfWork wuow(opCtx.get());
             const bool isSecondaryBackgroundIndexBuild = false;
             ASSERT_OK(getCollectionCatalogEntry()->prepareForIndexBuild(
-                opCtx.get(), &desc, isSecondaryBackgroundIndexBuild));
+                opCtx.get(), &desc, protocol, isSecondaryBackgroundIndexBuild));
             wuow.commit();
         }
 
@@ -332,6 +343,101 @@ TEST_F(KVCollectionCatalogEntryTest, NoOpWhenEntireIndexAlreadySetAsMultikey) {
         ASSERT(collEntry->isIndexMultikey(opCtx.get(), indexName, &multikeyPaths));
         ASSERT(multikeyPaths.empty());
     }
+}
+
+TEST_F(KVCollectionCatalogEntryTest, SinglePhaseIndexBuild) {
+    std::string indexName = createIndex(BSON("a" << 1));
+    CollectionCatalogEntry* collEntry = getCollectionCatalogEntry();
+
+    auto opCtx = newOperationContext();
+
+    ASSERT_EQ(kExpectedVersion, collEntry->getIndexBuildVersion(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexReady(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isTwoPhaseIndexBuild(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexBuildScanning(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexBuildDraining(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->getSideWritesIdent(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->getConstraintViolationsIdent(opCtx.get(), indexName));
+
+    collEntry->indexBuildSuccess(opCtx.get(), indexName);
+
+    ASSERT_EQ(kExpectedVersion, collEntry->getIndexBuildVersion(opCtx.get(), indexName));
+    ASSERT_TRUE(collEntry->isIndexReady(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isTwoPhaseIndexBuild(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexBuildScanning(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexBuildDraining(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->getSideWritesIdent(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->getConstraintViolationsIdent(opCtx.get(), indexName));
+}
+
+TEST_F(KVCollectionCatalogEntryTest, TwoPhaseIndexBuild) {
+    std::string indexName =
+        createIndex(BSON("a" << 1), IndexNames::BTREE, IndexBuildProtocol::kTwoPhase);
+    CollectionCatalogEntry* collEntry = getCollectionCatalogEntry();
+
+    auto opCtx = newOperationContext();
+
+    ASSERT_EQ(kExpectedVersion, collEntry->getIndexBuildVersion(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexReady(opCtx.get(), indexName));
+    ASSERT_TRUE(collEntry->isTwoPhaseIndexBuild(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexBuildScanning(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexBuildDraining(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->getSideWritesIdent(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->getConstraintViolationsIdent(opCtx.get(), indexName));
+
+    collEntry->setIndexBuildScanning(
+        opCtx.get(), indexName, kSideWritesTableIdent, kConstraintViolationsTableIdent);
+
+    ASSERT_EQ(kExpectedVersion, collEntry->getIndexBuildVersion(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexReady(opCtx.get(), indexName));
+    ASSERT_TRUE(collEntry->isTwoPhaseIndexBuild(opCtx.get(), indexName));
+    ASSERT_TRUE(collEntry->isIndexBuildScanning(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexBuildDraining(opCtx.get(), indexName));
+    ASSERT_EQ(kSideWritesTableIdent, collEntry->getSideWritesIdent(opCtx.get(), indexName));
+    ASSERT_EQ(kConstraintViolationsTableIdent,
+              collEntry->getConstraintViolationsIdent(opCtx.get(), indexName));
+
+    collEntry->setIndexBuildDraining(opCtx.get(), indexName);
+
+    ASSERT_EQ(kExpectedVersion, collEntry->getIndexBuildVersion(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexReady(opCtx.get(), indexName));
+    ASSERT_TRUE(collEntry->isTwoPhaseIndexBuild(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexBuildScanning(opCtx.get(), indexName));
+    ASSERT_TRUE(collEntry->isIndexBuildDraining(opCtx.get(), indexName));
+    ASSERT_EQ(kSideWritesTableIdent, collEntry->getSideWritesIdent(opCtx.get(), indexName));
+    ASSERT_EQ(kConstraintViolationsTableIdent,
+              collEntry->getConstraintViolationsIdent(opCtx.get(), indexName));
+
+    collEntry->indexBuildSuccess(opCtx.get(), indexName);
+
+    ASSERT_EQ(kExpectedVersion, collEntry->getIndexBuildVersion(opCtx.get(), indexName));
+    ASSERT(collEntry->isIndexReady(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexBuildScanning(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isIndexBuildDraining(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->isTwoPhaseIndexBuild(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->getSideWritesIdent(opCtx.get(), indexName));
+    ASSERT_FALSE(collEntry->getConstraintViolationsIdent(opCtx.get(), indexName));
+}
+
+DEATH_TEST_F(KVCollectionCatalogEntryTest,
+             SinglePhaseIllegalScanPhase,
+             "Invariant failure md.indexes[offset].runTwoPhaseBuild") {
+    std::string indexName = createIndex(BSON("a" << 1));
+    CollectionCatalogEntry* collEntry = getCollectionCatalogEntry();
+
+    auto opCtx = newOperationContext();
+    collEntry->setIndexBuildScanning(
+        opCtx.get(), indexName, kSideWritesTableIdent, kConstraintViolationsTableIdent);
+}
+
+DEATH_TEST_F(KVCollectionCatalogEntryTest,
+             SinglePhaseIllegalDrainPhase,
+             "Invariant failure md.indexes[offset].runTwoPhaseBuild") {
+    std::string indexName = createIndex(BSON("a" << 1));
+    CollectionCatalogEntry* collEntry = getCollectionCatalogEntry();
+
+    auto opCtx = newOperationContext();
+    collEntry->setIndexBuildDraining(opCtx.get(), indexName);
 }
 
 DEATH_TEST_F(KVCollectionCatalogEntryTest,

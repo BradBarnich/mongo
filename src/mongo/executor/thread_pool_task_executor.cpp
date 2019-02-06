@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -52,6 +54,9 @@
 namespace mongo {
 namespace executor {
 
+MONGO_FAIL_POINT_DEFINE(initialSyncFuzzerSynchronizationPoint1);
+MONGO_FAIL_POINT_DEFINE(initialSyncFuzzerSynchronizationPoint2);
+
 namespace {
 MONGO_FAIL_POINT_DEFINE(scheduleIntoPoolSpinsUntilThreadPoolShutsDown);
 }
@@ -62,14 +67,14 @@ class ThreadPoolTaskExecutor::CallbackState : public TaskExecutor::CallbackState
 public:
     static std::shared_ptr<CallbackState> make(CallbackFn&& cb,
                                                Date_t readyDate,
-                                               const transport::BatonHandle& baton) {
+                                               const BatonHandle& baton) {
         return std::make_shared<CallbackState>(std::move(cb), readyDate, baton);
     }
 
     /**
      * Do not call directly. Use make.
      */
-    CallbackState(CallbackFn&& cb, Date_t theReadyDate, const transport::BatonHandle& baton)
+    CallbackState(CallbackFn&& cb, Date_t theReadyDate, const BatonHandle& baton)
         : callback(std::move(cb)), readyDate(theReadyDate), baton(baton) {}
 
     virtual ~CallbackState() = default;
@@ -91,13 +96,13 @@ public:
     // _mutex.
 
     CallbackFn callback;
-    AtomicUInt32 canceled{0U};
+    AtomicWord<unsigned> canceled{0U};
     WorkQueue::iterator iter;
     Date_t readyDate;
     bool isNetworkOperation = false;
     AtomicWord<bool> isFinished{false};
     boost::optional<stdx::condition_variable> finishedCondition;
-    transport::BatonHandle baton;
+    BatonHandle baton;
 };
 
 class ThreadPoolTaskExecutor::EventState : public TaskExecutor::EventState {
@@ -272,11 +277,11 @@ void ThreadPoolTaskExecutor::signalEvent(const EventHandle& event) {
 }
 
 StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::onEvent(const EventHandle& event,
-                                                                         const CallbackFn& work) {
+                                                                         CallbackFn work) {
     if (!event.isValid()) {
         return {ErrorCodes::BadValue, "Passed invalid event handle to onEvent"};
     }
-    auto wq = makeSingletonWorkQueue(work, nullptr);
+    auto wq = makeSingletonWorkQueue(std::move(work), nullptr);
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     auto eventState = checked_cast<EventState*>(getEventFromHandle(event));
     auto cbHandle = enqueueCallbackState_inlock(&eventState->waiters, &wq);
@@ -321,9 +326,8 @@ void ThreadPoolTaskExecutor::waitForEvent(const EventHandle& event) {
     }
 }
 
-StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleWork(
-    const CallbackFn& work) {
-    auto wq = makeSingletonWorkQueue(work, nullptr);
+StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleWork(CallbackFn work) {
+    auto wq = makeSingletonWorkQueue(std::move(work), nullptr);
     WorkQueue temp;
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     auto cbHandle = enqueueCallbackState_inlock(&temp, &wq);
@@ -334,33 +338,35 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleWork(
     return cbHandle;
 }
 
-StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleWorkAt(
-    Date_t when, const CallbackFn& work) {
+StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleWorkAt(Date_t when,
+                                                                                CallbackFn work) {
     if (when <= now()) {
-        return scheduleWork(work);
+        return scheduleWork(std::move(work));
     }
-    auto wq = makeSingletonWorkQueue(work, nullptr, when);
+    auto wq = makeSingletonWorkQueue(std::move(work), nullptr, when);
     stdx::unique_lock<stdx::mutex> lk(_mutex);
     auto cbHandle = enqueueCallbackState_inlock(&_sleepersQueue, &wq);
     if (!cbHandle.isOK()) {
         return cbHandle;
     }
     lk.unlock();
-    _net->setAlarm(when,
-                   [this, cbHandle] {
-                       auto cbState =
-                           checked_cast<CallbackState*>(getCallbackFromHandle(cbHandle.getValue()));
-                       if (cbState->canceled.load()) {
-                           return;
-                       }
-                       stdx::unique_lock<stdx::mutex> lk(_mutex);
-                       if (cbState->canceled.load()) {
-                           return;
-                       }
-                       scheduleIntoPool_inlock(&_sleepersQueue, cbState->iter, std::move(lk));
-                   },
-                   nullptr)
-        .transitional_ignore();
+
+    auto status = _net->setAlarm(when, [this, cbHandle] {
+        auto cbState = checked_cast<CallbackState*>(getCallbackFromHandle(cbHandle.getValue()));
+        if (cbState->canceled.load()) {
+            return;
+        }
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
+        if (cbState->canceled.load()) {
+            return;
+        }
+        scheduleIntoPool_inlock(&_sleepersQueue, cbState->iter, std::move(lk));
+    });
+
+    if (!status.isOK()) {
+        cancel(cbHandle.getValue());
+        return status;
+    }
 
     return cbHandle;
 }
@@ -391,12 +397,39 @@ void remoteCommandFailedEarly(const TaskExecutor::CallbackArgs& cbData,
     cb(TaskExecutor::RemoteCommandCallbackArgs(
         cbData.executor, cbData.myHandle, request, {cbData.status}));
 }
+
+// The command names that the initial sync test fixture pauses on during the collection cloning
+// stage of initial sync.
+const auto initialSyncPauseCmds =
+    std::vector<std::string>{"listCollections", "listIndexes", "listDatabases"};
+
 }  // namespace
 
 StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::scheduleRemoteCommand(
     const RemoteCommandRequest& request,
     const RemoteCommandCallbackFn& cb,
-    const transport::BatonHandle& baton) {
+    const BatonHandle& baton) {
+
+    if (MONGO_FAIL_POINT(initialSyncFuzzerSynchronizationPoint1)) {
+        // We are only going to pause on these failpoints if the command issued is for the
+        // collection cloning part of initial sync.
+        const auto cmdName = request.cmdObj.firstElementFieldName();
+        if (std::find(initialSyncPauseCmds.begin(), initialSyncPauseCmds.end(), cmdName) !=
+            initialSyncPauseCmds.end()) {
+            // These failpoints are set and unset by the InitialSyncTest fixture to cause initial
+            // sync to pause so that the Initial Sync Fuzzer can run commands on the sync source.
+            log() << "Collection Cloner scheduled a remote command on the " << request.dbname
+                  << " db: " << request.cmdObj;
+            log() << "initialSyncFuzzerSynchronizationPoint1 fail point enabled.";
+            MONGO_FAIL_POINT_PAUSE_WHILE_SET(initialSyncFuzzerSynchronizationPoint1);
+
+            if (MONGO_FAIL_POINT(initialSyncFuzzerSynchronizationPoint2)) {
+                log() << "initialSyncFuzzerSynchronizationPoint2 fail point enabled.";
+                MONGO_FAIL_POINT_PAUSE_WHILE_SET(initialSyncFuzzerSynchronizationPoint2);
+            }
+        }
+    }
+
     RemoteCommandRequest scheduledRequest = request;
     if (request.timeout == RemoteCommandRequest::kNoTimeout) {
         scheduledRequest.expirationDate = RemoteCommandRequest::kNoExpirationDate;
@@ -506,7 +539,7 @@ StatusWith<TaskExecutor::CallbackHandle> ThreadPoolTaskExecutor::enqueueCallback
 }
 
 ThreadPoolTaskExecutor::WorkQueue ThreadPoolTaskExecutor::makeSingletonWorkQueue(
-    CallbackFn work, const transport::BatonHandle& baton, Date_t when) {
+    CallbackFn work, const BatonHandle& baton, Date_t when) {
     WorkQueue result;
     result.emplace_front(CallbackState::make(std::move(work), when, baton));
     result.front()->iter = result.begin();
@@ -561,7 +594,17 @@ void ThreadPoolTaskExecutor::scheduleIntoPool_inlock(WorkQueue* fromQueue,
 
     for (const auto& cbState : todo) {
         if (cbState->baton) {
-            cbState->baton->schedule([this, cbState] { runCallback(std::move(cbState)); });
+            cbState->baton->schedule([this, cbState](OperationContext* opCtx) {
+                if (opCtx) {
+                    runCallback(std::move(cbState));
+                    return;
+                }
+
+                cbState->canceled.store(1);
+                const auto status =
+                    _pool->schedule([this, cbState] { runCallback(std::move(cbState)); });
+                invariant(status.isOK() || status == ErrorCodes::ShutdownInProgress);
+            });
         } else {
             const auto status =
                 _pool->schedule([this, cbState] { runCallback(std::move(cbState)); });

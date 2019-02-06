@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -59,7 +61,9 @@ public:
 
     void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                 const NamespaceString& ns,
-                std::vector<BSONObj>&& objs) override {
+                std::vector<BSONObj>&& objs,
+                const WriteConcernOptions& wc,
+                boost::optional<OID>) override {
         MONGO_UNREACHABLE;
     }
 
@@ -67,8 +71,10 @@ public:
                 const NamespaceString& ns,
                 std::vector<BSONObj>&& queries,
                 std::vector<BSONObj>&& updates,
+                const WriteConcernOptions& wc,
                 bool upsert,
-                bool multi) final {
+                bool multi,
+                boost::optional<OID>) final {
         MONGO_UNREACHABLE;
     }
 
@@ -110,15 +116,15 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> makePipeline(
+    std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
         const std::vector<BSONObj>& rawPipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const MakePipelineOptions opts) override {
         MONGO_UNREACHABLE;
     }
 
-    Status attachCursorSourceToPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                        Pipeline* pipeline) override {
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) override {
         MONGO_UNREACHABLE;
     }
 
@@ -135,8 +141,13 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(
-        OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const override {
+    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFieldsForHostedCollection(
+        OperationContext*, const NamespaceString&, UUID) const override {
+        MONGO_UNREACHABLE;
+    }
+
+    std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
+        OperationContext*, const NamespaceString&) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -145,7 +156,8 @@ public:
         const NamespaceString& nss,
         UUID collectionUUID,
         const Document& documentKey,
-        boost::optional<BSONObj> readConcern) {
+        boost::optional<BSONObj> readConcern,
+        bool allowSpeculativeMajorityRead) {
         MONGO_UNREACHABLE;
     }
 
@@ -155,11 +167,15 @@ public:
     }
 
     BackupCursorState openBackupCursor(OperationContext* opCtx) final {
-        MONGO_UNREACHABLE;
+        return BackupCursorState{UUID::gen(), boost::none, {}};
     }
 
-    void closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) final {
-        MONGO_UNREACHABLE;
+    void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) final {}
+
+    BackupCursorExtendState extendBackupCursor(OperationContext* opCtx,
+                                               const UUID& backupId,
+                                               const Timestamp& extendTo) final {
+        return {{}};
     }
 
     std::vector<BSONObj> getMatchingPlanCacheEntryStats(OperationContext*,
@@ -172,6 +188,22 @@ public:
                                      const NamespaceString& nss,
                                      const std::set<FieldPath>& uniqueKeyPaths) const override {
         return true;
+    }
+
+    boost::optional<ChunkVersion> refreshAndGetCollectionVersion(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const NamespaceString& nss) const override {
+        return boost::none;
+    }
+
+    void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                      const NamespaceString&,
+                                      ChunkVersion) const override {
+        uasserted(51019, "Unexpected check of routing table");
+    }
+
+    std::unique_ptr<ResourceYielder> getResourceYielder() const override {
+        return nullptr;
     }
 };
 }  // namespace mongo

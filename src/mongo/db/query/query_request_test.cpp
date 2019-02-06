@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -400,7 +402,9 @@ TEST(QueryRequestTest, ParseFromCommandAllFlagsTrue) {
         "oplogReplay: true,"
         "noCursorTimeout: true,"
         "awaitData: true,"
-        "allowPartialResults: true}");
+        "allowPartialResults: true,"
+        "readOnce: true,"
+        "allowSpeculativeMajorityRead: true}");
     const NamespaceString nss("test.testns");
     bool isExplain = false;
     unique_ptr<QueryRequest> qr(
@@ -413,6 +417,17 @@ TEST(QueryRequestTest, ParseFromCommandAllFlagsTrue) {
     ASSERT(qr->isNoCursorTimeout());
     ASSERT(qr->isTailableAndAwaitData());
     ASSERT(qr->isAllowPartialResults());
+    ASSERT(qr->isReadOnce());
+    ASSERT(qr->allowSpeculativeMajorityRead());
+}
+
+TEST(QueryRequestTest, ParseFromCommandReadOnceDefaultsToFalse) {
+    BSONObj cmdObj = fromjson("{find: 'testns'}");
+    const NamespaceString nss("test.testns");
+    bool isExplain = false;
+    unique_ptr<QueryRequest> qr(
+        assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
+    ASSERT(!qr->isReadOnce());
 }
 
 TEST(QueryRequestTest, ParseFromCommandCommentWithValidMinMax) {
@@ -762,6 +777,16 @@ TEST(QueryRequestTest, ParseFromCommandCollationWrongType) {
     bool isExplain = false;
     auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
     ASSERT_NOT_OK(result.getStatus());
+}
+
+TEST(QueryRequestTest, ParseFromCommandReadOnceWrongType) {
+    BSONObj cmdObj = fromjson(
+        "{find: 'testns',"
+        "readOnce: 1}");
+    const NamespaceString nss("test.testns");
+    bool isExplain = false;
+    auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
+    ASSERT_EQ(ErrorCodes::FailedToParse, result.getStatus());
 }
 //
 // Parsing errors where a field has the right type but a bad value.
@@ -1291,6 +1316,20 @@ TEST(QueryRequestTest, ConvertToAggregationWithCollationSucceeds) {
     ASSERT_BSONOBJ_EQ(ar.getValue().getCollation(), BSON("f" << 1));
 }
 
+TEST(QueryRequestTest, ConvertToAggregationWithReadOnceFails) {
+    QueryRequest qr(testns);
+    qr.setReadOnce(true);
+    const auto aggCmd = qr.asAggregationCommand();
+    ASSERT_EQ(ErrorCodes::InvalidPipelineOperator, aggCmd.getStatus().code());
+}
+
+TEST(QueryRequestTest, ConvertToAggregationWithAllowSpeculativeMajorityReadFails) {
+    QueryRequest qr(testns);
+    qr.setAllowSpeculativeMajorityRead(true);
+    const auto aggCmd = qr.asAggregationCommand();
+    ASSERT_EQ(ErrorCodes::InvalidPipelineOperator, aggCmd.getStatus().code());
+}
+
 TEST(QueryRequestTest, ParseFromLegacyObjMetaOpComment) {
     BSONObj queryObj = fromjson(
         "{$query: {a: 1},"
@@ -1383,7 +1422,7 @@ TEST_F(QueryRequestTest, ParseFromUUID) {
     // Register a UUID/Collection pair in the UUIDCatalog.
     const CollectionUUID uuid = UUID::gen();
     const NamespaceString nss("test.testns");
-    Collection coll(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock coll(nss);
     UUIDCatalog& catalog = UUIDCatalog::get(opCtx.get());
     catalog.onCreateCollection(opCtx.get(), &coll, uuid);
     QueryRequest qr(NamespaceStringOrUUID("test", uuid));

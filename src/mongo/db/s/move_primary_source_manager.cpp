@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -37,6 +39,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/s/shard_metadata_util.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -70,12 +73,12 @@ NamespaceString MovePrimarySourceManager::getNss() const {
 Status MovePrimarySourceManager::clone(OperationContext* opCtx) {
     invariant(!opCtx->lockState()->isLocked());
     invariant(_state == kCreated);
-    auto scopedGuard = MakeGuard([&] { cleanupOnError(opCtx); });
+    auto scopedGuard = makeGuard([&] { cleanupOnError(opCtx); });
 
     log() << "Moving " << _dbname << " primary from: " << _fromShard << " to: " << _toShard;
 
     // Record start in changelog
-    uassertStatusOK(Grid::get(opCtx)->catalogClient()->logChangeChecked(
+    uassertStatusOK(ShardingLogging::get(opCtx)->logChangeChecked(
         opCtx,
         "movePrimary.start",
         _dbname.toString(),
@@ -83,13 +86,14 @@ Status MovePrimarySourceManager::clone(OperationContext* opCtx) {
         ShardingCatalogClient::kMajorityWriteConcern));
 
     {
-        // Register for notifications from the replication subsystem
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-
         // We use AutoGetOrCreateDb the first time just in case movePrimary was called before any
         // data was inserted into the database.
         AutoGetOrCreateDb autoDb(opCtx, getNss().toString(), MODE_X);
-        DatabaseShardingState::get(autoDb.getDb()).setMovePrimarySourceManager(opCtx, this);
+
+        auto& dss = DatabaseShardingState::get(autoDb.getDb());
+        auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, &dss);
+
+        dss.setMovePrimarySourceManager(opCtx, this, dssLock);
     }
 
     _state = kCloning;
@@ -122,14 +126,14 @@ Status MovePrimarySourceManager::clone(OperationContext* opCtx) {
     }
 
     _state = kCloneCaughtUp;
-    scopedGuard.Dismiss();
+    scopedGuard.dismiss();
     return Status::OK();
 }
 
 Status MovePrimarySourceManager::enterCriticalSection(OperationContext* opCtx) {
     invariant(!opCtx->lockState()->isLocked());
     invariant(_state == kCloneCaughtUp);
-    auto scopedGuard = MakeGuard([&] { cleanupOnError(opCtx); });
+    auto scopedGuard = makeGuard([&] { cleanupOnError(opCtx); });
 
     // Mark the shard as running a critical operation that requires recovery on crash.
     uassertStatusOK(ShardingStateRecovery::startMetadataOp(opCtx));
@@ -138,7 +142,6 @@ Status MovePrimarySourceManager::enterCriticalSection(OperationContext* opCtx) {
         // The critical section must be entered with the database X lock in order to ensure there
         // are no writes which could have entered and passed the database version check just before
         // we entered the critical section, but will potentially complete after we left it.
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetDb autoDb(opCtx, getNss().toString(), MODE_X);
 
         if (!autoDb.getDb()) {
@@ -147,8 +150,11 @@ Status MovePrimarySourceManager::enterCriticalSection(OperationContext* opCtx) {
                                     << " was dropped during the movePrimary operation.");
         }
 
+        auto& dss = DatabaseShardingState::get(autoDb.getDb());
+        auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, &dss);
+
         // IMPORTANT: After this line, the critical section is in place and needs to be signaled
-        DatabaseShardingState::get(autoDb.getDb()).enterCriticalSectionCatchUpPhase(opCtx);
+        dss.enterCriticalSectionCatchUpPhase(opCtx, dssLock);
     }
 
     _state = kCriticalSection;
@@ -174,21 +180,20 @@ Status MovePrimarySourceManager::enterCriticalSection(OperationContext* opCtx) {
 
     log() << "movePrimary successfully entered critical section";
 
-    scopedGuard.Dismiss();
+    scopedGuard.dismiss();
     return Status::OK();
 }
 
 Status MovePrimarySourceManager::commitOnConfig(OperationContext* opCtx) {
     invariant(!opCtx->lockState()->isLocked());
     invariant(_state == kCriticalSection);
-    auto scopedGuard = MakeGuard([&] { cleanupOnError(opCtx); });
+    auto scopedGuard = makeGuard([&] { cleanupOnError(opCtx); });
 
     ConfigsvrCommitMovePrimary commitMovePrimaryRequest;
     commitMovePrimaryRequest.set_configsvrCommitMovePrimary(getNss().ns());
     commitMovePrimaryRequest.setTo(_toShard.toString());
 
     {
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetDb autoDb(opCtx, getNss().toString(), MODE_X);
 
         if (!autoDb.getDb()) {
@@ -197,9 +202,12 @@ Status MovePrimarySourceManager::commitOnConfig(OperationContext* opCtx) {
                                     << " was dropped during the movePrimary operation.");
         }
 
+        auto& dss = DatabaseShardingState::get(autoDb.getDb());
+        auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, &dss);
+
         // Read operations must begin to wait on the critical section just before we send the
         // commit operation to the config server
-        DatabaseShardingState::get(autoDb.getDb()).enterCriticalSectionCommitPhase(opCtx);
+        dss.enterCriticalSectionCommitPhase(opCtx, dssLock);
     }
 
     auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
@@ -223,7 +231,7 @@ Status MovePrimarySourceManager::commitOnConfig(OperationContext* opCtx) {
                  "against the config server to obtain its latest optime"
               << causedBy(redact(commitStatus));
 
-        Status validateStatus = Grid::get(opCtx)->catalogClient()->logChangeChecked(
+        Status validateStatus = ShardingLogging::get(opCtx)->logChangeChecked(
             opCtx,
             "movePrimary.validating",
             getNss().ns(),
@@ -246,7 +254,7 @@ Status MovePrimarySourceManager::commitOnConfig(OperationContext* opCtx) {
         // this node can accept writes for this collection as a proxy for it being primary.
         if (!validateStatus.isOK()) {
             UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-            AutoGetDb autoDb(opCtx, getNss().toString(), MODE_X);
+            AutoGetDb autoDb(opCtx, getNss().toString(), MODE_IX);
 
             if (!autoDb.getDb()) {
                 uasserted(ErrorCodes::ConflictingOperationInProgress,
@@ -255,7 +263,10 @@ Status MovePrimarySourceManager::commitOnConfig(OperationContext* opCtx) {
             }
 
             if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, getNss())) {
-                DatabaseShardingState::get(autoDb.getDb()).setDbVersion(opCtx, boost::none);
+                auto& dss = DatabaseShardingState::get(autoDb.getDb());
+                auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, &dss);
+
+                dss.setDbVersion(opCtx, boost::none, dssLock);
                 uassertStatusOK(validateStatus.withContext(
                     str::stream() << "Unable to verify movePrimary commit for database: "
                                   << getNss().ns()
@@ -285,14 +296,14 @@ Status MovePrimarySourceManager::commitOnConfig(OperationContext* opCtx) {
 
     _cleanup(opCtx);
 
-    uassertStatusOK(Grid::get(opCtx)->catalogClient()->logChangeChecked(
+    uassertStatusOK(ShardingLogging::get(opCtx)->logChangeChecked(
         opCtx,
         "movePrimary.commit",
         _dbname.toString(),
         _buildMoveLogEntry(_dbname.toString(), _fromShard.toString(), _toShard.toString()),
         ShardingCatalogClient::kMajorityWriteConcern));
 
-    scopedGuard.Dismiss();
+    scopedGuard.dismiss();
 
     _state = kNeedCleanStaleData;
 
@@ -324,14 +335,14 @@ void MovePrimarySourceManager::cleanupOnError(OperationContext* opCtx) {
         return;
     }
 
-    try {
-        uassertStatusOK(Grid::get(opCtx)->catalogClient()->logChangeChecked(
-            opCtx,
-            "movePrimary.error",
-            _dbname.toString(),
-            _buildMoveLogEntry(_dbname.toString(), _fromShard.toString(), _toShard.toString()),
-            ShardingCatalogClient::kMajorityWriteConcern));
+    ShardingLogging::get(opCtx)->logChange(
+        opCtx,
+        "movePrimary.error",
+        _dbname.toString(),
+        _buildMoveLogEntry(_dbname.toString(), _fromShard.toString(), _toShard.toString()),
+        ShardingCatalogClient::kMajorityWriteConcern);
 
+    try {
         _cleanup(opCtx);
     } catch (const ExceptionForCat<ErrorCategory::NotMasterError>& ex) {
         BSONObjBuilder requestArgsBSON;
@@ -347,13 +358,16 @@ void MovePrimarySourceManager::_cleanup(OperationContext* opCtx) {
     {
         // Unregister from the database's sharding state if we're still registered.
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-        AutoGetDb autoDb(opCtx, getNss().toString(), MODE_X);
+        AutoGetDb autoDb(opCtx, getNss().toString(), MODE_IX);
 
         if (autoDb.getDb()) {
-            DatabaseShardingState::get(autoDb.getDb()).clearMovePrimarySourceManager(opCtx);
+            auto& dss = DatabaseShardingState::get(autoDb.getDb());
+            auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, &dss);
+
+            dss.clearMovePrimarySourceManager(opCtx, dssLock);
 
             // Leave the critical section if we're still registered.
-            DatabaseShardingState::get(autoDb.getDb()).exitCriticalSection(opCtx, boost::none);
+            dss.exitCriticalSection(opCtx, boost::none, dssLock);
         }
     }
 

@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -57,6 +59,7 @@
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/s/query/cluster_aggregation_planner.h"
 #include "mongo/unittest/death_test.h"
+#include "mongo/unittest/temp_dir.h"
 
 namespace mongo {
 namespace {
@@ -99,6 +102,8 @@ void assertPipelineOptimizesAndSerializesTo(std::string inputPipeJson,
     AggregationRequest request(kTestNss, rawPipeline);
     intrusive_ptr<ExpressionContextForTest> ctx =
         new ExpressionContextForTest(opCtx.get(), request);
+    TempDir tempDir("PipelineTest");
+    ctx->tempDir = tempDir.path();
 
     // For $graphLookup and $lookup, we have to populate the resolvedNamespaces so that the
     // operations will be able to have a resolved view definition.
@@ -125,6 +130,41 @@ TEST(PipelineOptimizationTest, MoveSkipBeforeProject) {
 TEST(PipelineOptimizationTest, LimitDoesNotMoveBeforeProject) {
     assertPipelineOptimizesTo("[{$project: {a : 1}}, {$limit : 5}]",
                               "[{$project: {_id: true, a : true}}, {$limit : 5}]");
+}
+
+TEST(PipelineOptimizationTest, SampleLegallyPushedBefore) {
+    string inputPipe =
+        "[{$replaceRoot: { newRoot: \"$a\" }}, "
+        "{$project: { b: 1 }}, "
+        "{$addFields: { c: 1 }}, "
+        "{$sample: { size: 4 }}]";
+
+    string outputPipe =
+        "[{$sample: {size: 4}}, "
+        "{$replaceRoot: {newRoot: \"$a\"}}, "
+        "{$project: {_id: true, b : true}}, "
+        "{$addFields: {c : {$const : 1}}}]";
+
+    assertPipelineOptimizesTo(inputPipe, outputPipe);
+}
+
+TEST(PipelineOptimizationTest, SampleNotIllegallyPushedBefore) {
+    string inputPipe =
+        "[{$project: { a : 1 }}, "
+        "{$match: { a: 1 }}, "
+        "{$sample: { size: 4 }}]";
+
+    string outputPipe =
+        "[{$match: {a: {$eq: 1}}}, "
+        "{$sample : {size: 4}}, "
+        "{$project: {_id: true, a : true}}]";
+
+    string serializedPipe =
+        "[{$match: {a: 1}}, "
+        "{$sample : {size: 4}}, "
+        "{$project: {_id: true, a : true}}]";
+
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MoveMatchBeforeAddFieldsIfInvolvedFieldsNotRelated) {
@@ -1534,6 +1574,7 @@ TEST(PipelineOptimizationTest, ChangeStreamLookupSwapsWithIndependentMatch) {
 
     intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest(kTestNss));
     expCtx->opCtx = opCtx.get();
+    expCtx->uuid = UUID::gen();
     setMockReplicationCoordinatorOnOpCtx(expCtx->opCtx);
 
     auto spec = BSON("$changeStream" << BSON("fullDocument"
@@ -1559,6 +1600,7 @@ TEST(PipelineOptimizationTest, ChangeStreamLookupDoesNotSwapWithMatchOnPostImage
 
     intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest(kTestNss));
     expCtx->opCtx = opCtx.get();
+    expCtx->uuid = UUID::gen();
     setMockReplicationCoordinatorOnOpCtx(expCtx->opCtx);
 
     auto spec = BSON("$changeStream" << BSON("fullDocument"
@@ -1750,6 +1792,8 @@ public:
         AggregationRequest request(kTestNss, rawPipeline);
         intrusive_ptr<ExpressionContextForTest> ctx =
             new ExpressionContextForTest(&_opCtx, request);
+        TempDir tempDir("PipelineTest");
+        ctx->tempDir = tempDir.path();
 
         // For $graphLookup and $lookup, we have to populate the resolvedNamespaces so that the
         // operations will be able to have a resolved view definition.
@@ -1847,6 +1891,111 @@ class UnwindWithOther : public Base {
 };
 }  // namespace moveFinalUnwindFromShardsToMerger
 
+namespace propagateDocLimitToShards {
+
+/**
+ * The $skip stage splits the pipeline into a shard pipeline and merge pipeline. Because the $limit
+ * stage in the merge pipeline creates an upper bound on how many documents are necessary from any
+ * of the shards, we can add a $limit to the shard pipeline to prevent it from sending more
+ * documents than necessary. See the comment for propagateDocLimitToShard in
+ * cluster_aggregation_planner.cpp and the explanation in SERVER-36881.
+ */
+class MatchWithSkipAndLimit : public Base {
+    string inputPipeJson() {
+        return "[{$match: {x: 4}}, {$skip: 10}, {$limit: 5}]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {x: {$eq: 4}}}, {$limit: 15}]";
+    }
+    string mergePipeJson() {
+        return "[{$skip: 10}, {$limit: 5}]";
+    }
+};
+
+/**
+ * When computing an upper bound on how many documents we need from each shard, make sure to count
+ * all $skip stages in any pipeline that has more than one.
+ */
+class MatchWithMultipleSkipsAndLimit : public Base {
+    string inputPipeJson() {
+        return "[{$match: {x: 4}}, {$skip: 7}, {$skip: 3}, {$limit: 5}]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {x: {$eq: 4}}}, {$limit: 15}]";
+    }
+    string mergePipeJson() {
+        return "[{$skip: 10}, {$limit: 5}]";
+    }
+};
+
+/**
+ * A $limit stage splits the pipeline with the $limit in place on both the shard and merge
+ * pipelines. Make sure that the propagateDocLimitToShards() optimization does not add another
+ * $limit to the shard pipeline.
+ */
+class MatchWithLimitAndSkip : public Base {
+    string inputPipeJson() {
+        return "[{$match: {x: 4}}, {$limit: 10}, {$skip: 5}]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {x: {$eq: 4}}}, {$limit: 10}]";
+    }
+    string mergePipeJson() {
+        return "[{$limit: 10}, {$skip: 5}]";
+    }
+};
+
+
+/**
+ * The addition of an $addFields stage between the $skip and $limit stages does not prevent us from
+ * propagating the limit to the shards.
+ */
+class MatchWithSkipAddFieldsAndLimit : public Base {
+    string inputPipeJson() {
+        return "[{$match: {x: 4}}, {$skip: 10}, {$addFields: {y: 1}}, {$limit: 5}]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {x: {$eq: 4}}}, {$limit: 15}]";
+    }
+    string mergePipeJson() {
+        return "[{$skip: 10}, {$addFields: {y: {$const: 1}}}, {$limit: 5}]";
+    }
+};
+
+/**
+ * The addition of a $group stage between the $skip and $limit stages _does_ prevent us from
+ * propagating the limit to the shards. The merger will need to see all the documents from each
+ * shard before it can aply the $limit.
+ */
+class MatchWithSkipGroupAndLimit : public Base {
+    string inputPipeJson() {
+        return "[{$match: {x: 4}}, {$skip: 10}, {$group: {_id: '$y'}}, {$limit: 5}]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {x: {$eq: 4}}}, {$project: {_id: false, y: true}}]";
+    }
+    string mergePipeJson() {
+        return "[{$skip: 10}, {$group: {_id: '$y'}}, {$limit: 5}]";
+    }
+};
+
+/**
+ * The addition of a $match stage between the $skip and $limit stages also prevents us from
+ * propagating the limit to the shards. We don't know in advance how many documents will pass the
+ * filter in the second $match, so we also don't know how many documents we'll need from the shards.
+ */
+class MatchWithSkipSecondMatchAndLimit : public Base {
+    string inputPipeJson() {
+        return "[{$match: {x: 4}}, {$skip: 10}, {$match: {y: {$gt: 10}}}, {$limit: 5}]";
+    }
+    string shardPipeJson() {
+        return "[{$match: {x: {$eq: 4}}}]";
+    }
+    string mergePipeJson() {
+        return "[{$skip: 10}, {$match: {y: {$gt: 10}}}, {$limit: 5}]";
+    }
+};
+}  // namespace propagateDocLimitToShards
 
 namespace limitFieldsSentFromShardsToMerger {
 // These tests use $limit to split the pipelines between shards and merger as it is
@@ -2903,6 +3052,12 @@ public:
         add<Optimizations::Sharded::moveFinalUnwindFromShardsToMerger::TwoUnwind>();
         add<Optimizations::Sharded::moveFinalUnwindFromShardsToMerger::UnwindNotFinal>();
         add<Optimizations::Sharded::moveFinalUnwindFromShardsToMerger::UnwindWithOther>();
+        add<Optimizations::Sharded::propagateDocLimitToShards::MatchWithSkipAndLimit>();
+        add<Optimizations::Sharded::propagateDocLimitToShards::MatchWithMultipleSkipsAndLimit>();
+        add<Optimizations::Sharded::propagateDocLimitToShards::MatchWithLimitAndSkip>();
+        add<Optimizations::Sharded::propagateDocLimitToShards::MatchWithSkipAddFieldsAndLimit>();
+        add<Optimizations::Sharded::propagateDocLimitToShards::MatchWithSkipGroupAndLimit>();
+        add<Optimizations::Sharded::propagateDocLimitToShards::MatchWithSkipSecondMatchAndLimit>();
         add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::NeedWholeDoc>();
         add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::JustNeedsId>();
         add<Optimizations::Sharded::limitFieldsSentFromShardsToMerger::JustNeedsNonId>();

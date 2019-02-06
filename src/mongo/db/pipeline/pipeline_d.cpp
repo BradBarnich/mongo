@@ -1,29 +1,31 @@
+
 /**
- * Copyright (c) 2012-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
@@ -40,9 +42,12 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/multi_iterator.h"
+#include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/shard_filter.h"
+#include "mongo/db/exec/trial_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
@@ -92,50 +97,72 @@ using std::unique_ptr;
 using write_ops::Insert;
 
 namespace {
-
 /**
  * Returns a PlanExecutor which uses a random cursor to sample documents if successful. Returns {}
  * if the storage engine doesn't support random cursors, or if 'sampleSize' is a large enough
  * percentage of the collection.
  */
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorExecutor(
-    Collection* collection, OperationContext* opCtx, long long sampleSize, long long numRecords) {
-    double kMaxSampleRatioForRandCursor = 0.05;
+    Collection* coll, OperationContext* opCtx, long long sampleSize, long long numRecords) {
+    // Verify that we are already under a collection lock. We avoid taking locks ourselves in this
+    // function because double-locking forces any PlanExecutor we create to adopt a NO_YIELD policy.
+    invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns().ns(), MODE_IS));
+
+    static const double kMaxSampleRatioForRandCursor = 0.05;
     if (sampleSize > numRecords * kMaxSampleRatioForRandCursor || numRecords <= 100) {
         return {nullptr};
     }
 
     // Attempt to get a random cursor from the RecordStore.
-    auto rsRandCursor = collection->getRecordStore()->getRandomCursor(opCtx);
+    auto rsRandCursor = coll->getRecordStore()->getRandomCursor(opCtx);
     if (!rsRandCursor) {
         // The storage engine has no random cursor support.
         return {nullptr};
     }
 
-    auto ws = stdx::make_unique<WorkingSet>();
-    auto stage = stdx::make_unique<MultiIteratorStage>(opCtx, ws.get(), collection);
-    stage->addIterator(std::move(rsRandCursor));
+    // Build a MultiIteratorStage and pass it the random-sampling RecordCursor.
+    auto ws = std::make_unique<WorkingSet>();
+    std::unique_ptr<PlanStage> root = std::make_unique<MultiIteratorStage>(opCtx, ws.get(), coll);
+    static_cast<MultiIteratorStage*>(root.get())->addIterator(std::move(rsRandCursor));
 
-    {
-        AutoGetCollectionForRead autoColl(opCtx, collection->ns());
+    // Determine whether this collection is sharded. If so, retrieve its sharding metadata.
+    boost::optional<ScopedCollectionMetadata> shardMetadata =
+        (ShardingState::get(opCtx)->needCollectionMetadata(opCtx, coll->ns().ns())
+             ? CollectionShardingState::get(opCtx, coll->ns())->getMetadataForOperation(opCtx)
+             : boost::optional<ScopedCollectionMetadata>{});
 
-        // If we're in a sharded environment, we need to filter out documents we don't own.
-        if (ShardingState::get(opCtx)->needCollectionMetadata(opCtx, collection->ns().ns())) {
-            auto shardFilterStage = stdx::make_unique<ShardFilterStage>(
-                opCtx,
-                CollectionShardingState::get(opCtx, collection->ns())->getMetadata(opCtx),
-                ws.get(),
-                stage.release());
-            return PlanExecutor::make(opCtx,
-                                      std::move(ws),
-                                      std::move(shardFilterStage),
-                                      collection,
-                                      PlanExecutor::YIELD_AUTO);
-        }
+    // Because 'numRecords' includes orphan documents, our initial decision to optimize the $sample
+    // cursor may have been mistaken. For sharded collections, build a TRIAL plan that will switch
+    // to a collection scan if the ratio of orphaned to owned documents encountered over the first
+    // 100 works() is such that we would have chosen not to optimize.
+    if (shardMetadata && (*shardMetadata)->isSharded()) {
+        // The ratio of owned to orphaned documents must be at least equal to the ratio between the
+        // requested sampleSize and the maximum permitted sampleSize for the original constraints to
+        // be satisfied. For instance, if there are 200 documents and the sampleSize is 5, then at
+        // least (5 / (200*0.05)) = (5/10) = 50% of those documents must be owned. If less than 5%
+        // of the documents in the collection are owned, we default to the backup plan.
+        static const size_t kMaxPresampleSize = 100;
+        const auto minWorkAdvancedRatio = std::max(
+            sampleSize / (numRecords * kMaxSampleRatioForRandCursor), kMaxSampleRatioForRandCursor);
+        // The trial plan is SHARDING_FILTER-MULTI_ITERATOR.
+        auto randomCursorPlan =
+            std::make_unique<ShardFilterStage>(opCtx, *shardMetadata, ws.get(), root.release());
+        // The backup plan is SHARDING_FILTER-COLLSCAN.
+        std::unique_ptr<PlanStage> collScanPlan = std::make_unique<CollectionScan>(
+            opCtx, coll, CollectionScanParams{}, ws.get(), nullptr);
+        collScanPlan = std::make_unique<ShardFilterStage>(
+            opCtx, *shardMetadata, ws.get(), collScanPlan.release());
+        // Place a TRIAL stage at the root of the plan tree, and pass it the trial and backup plans.
+        root = std::make_unique<TrialStage>(opCtx,
+                                            ws.get(),
+                                            std::move(randomCursorPlan),
+                                            std::move(collScanPlan),
+                                            kMaxPresampleSize,
+                                            minWorkAdvancedRatio);
     }
 
     return PlanExecutor::make(
-        opCtx, std::move(ws), std::move(stage), collection, PlanExecutor::YIELD_AUTO);
+        opCtx, std::move(ws), std::move(root), coll, PlanExecutor::YIELD_AUTO);
 }
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExecutor(
@@ -228,7 +255,7 @@ BSONObj removeSortKeyMetaProjection(BSONObj projectionObj) {
 StringData extractGeoNearFieldFromIndexes(OperationContext* opCtx, Collection* collection) {
     invariant(collection);
 
-    std::vector<IndexDescriptor*> idxs;
+    std::vector<const IndexDescriptor*> idxs;
     collection->getIndexCatalog()->findIndexByType(opCtx, IndexNames::GEO_2D, idxs);
     uassert(ErrorCodes::IndexNotFound,
             str::stream() << "There is more than one 2d index on " << collection->ns().ns()
@@ -289,16 +316,32 @@ void PipelineD::prepareCursorSource(Collection* collection,
             auto exec = uassertStatusOK(
                 createRandomCursorExecutor(collection, expCtx->opCtx, sampleSize, numRecords));
             if (exec) {
-                // Replace $sample stage with $sampleFromRandomCursor stage.
-                sources.pop_front();
-                std::string idString = collection->ns().isOplog() ? "ts" : "_id";
-                sources.emplace_front(DocumentSourceSampleFromRandomCursor::create(
-                    expCtx, sampleSize, idString, numRecords));
+                // For sharded collections, the root of the plan tree is a TrialStage that may have
+                // chosen either a random-sampling cursor trial plan or a COLLSCAN backup plan. We
+                // can only optimize the $sample aggregation stage if the trial plan was chosen.
+                auto* trialStage = (exec->getRootStage()->stageType() == StageType::STAGE_TRIAL
+                                        ? static_cast<TrialStage*>(exec->getRootStage())
+                                        : nullptr);
+                if (!trialStage || !trialStage->pickedBackupPlan()) {
+                    // Replace $sample stage with $sampleFromRandomCursor stage.
+                    pipeline->popFront();
+                    std::string idString = collection->ns().isOplog() ? "ts" : "_id";
+                    pipeline->addInitialSource(DocumentSourceSampleFromRandomCursor::create(
+                        expCtx, sampleSize, idString, numRecords));
+                }
 
-                addCursorSource(
-                    pipeline,
-                    DocumentSourceCursor::create(collection, std::move(exec), expCtx),
-                    pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata));
+                // The order in which we evaluate these arguments is significant. We'd like to be
+                // sure that the DocumentSourceCursor is created _last_, because if we run into a
+                // case where a DocumentSourceCursor has been created (yet hasn't been put into a
+                // Pipeline) and an exception is thrown, an invariant will trigger in the
+                // DocumentSourceCursor. This is a design flaw in DocumentSourceCursor.
+
+                // TODO SERVER-37453 this should no longer be necessary when we no don't need locks
+                // to destroy a PlanExecutor.
+                auto deps = pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata);
+                addCursorSource(pipeline,
+                                DocumentSourceCursor::create(collection, std::move(exec), expCtx),
+                                std::move(deps));
                 return;
             }
         }
@@ -539,7 +582,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
         plannerOpts |= QueryPlannerParams::IS_COUNT;
     }
 
-    if (expCtx->needsMerge && expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData) {
+    if (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage()) {
+        invariant(expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData);
         plannerOpts |= QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
     }
 
@@ -730,6 +774,10 @@ void PipelineD::addCursorSource(Pipeline* pipeline,
                                 const BSONObj& queryObj,
                                 const BSONObj& sortObj,
                                 const BSONObj& projectionObj) {
+    // Add the cursor to the pipeline first so that it's correctly disposed of as part of the
+    // pipeline if an exception is thrown during this method.
+    pipeline->addInitialSource(cursor);
+
     cursor->setQuery(queryObj);
     cursor->setSort(sortObj);
     if (deps.hasNoRequirements()) {
@@ -748,7 +796,6 @@ void PipelineD::addCursorSource(Pipeline* pipeline,
 
         cursor->setProjection(deps.toProjection(), deps.toParsedDeps());
     }
-    pipeline->addInitialSource(std::move(cursor));
 }
 
 Timestamp PipelineD::getLatestOplogTimestamp(const Pipeline* pipeline) {

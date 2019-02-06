@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -74,18 +76,16 @@ void onShardVersionMismatch(OperationContext* opCtx,
 
     const auto currentShardVersion = [&] {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        const auto currentMetadata = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
-        if (currentMetadata->isSharded()) {
-            return currentMetadata->getShardVersion();
-        }
-
-        return ChunkVersion::UNSHARDED();
+        return CollectionShardingState::get(opCtx, nss)->getCurrentShardVersionIfKnown();
     }();
 
-    if (currentShardVersion.epoch() == shardVersionReceived.epoch() &&
-        currentShardVersion.majorVersion() >= shardVersionReceived.majorVersion()) {
-        // Don't need to remotely reload if we're in the same epoch and the requested version is
-        // smaller than the one we know about. This means that the remote side is behind.
+    if (currentShardVersion) {
+        if (currentShardVersion->epoch() == shardVersionReceived.epoch() &&
+            currentShardVersion->majorVersion() >= shardVersionReceived.majorVersion()) {
+            // Don't need to remotely reload if we're in the same epoch and the requested version is
+            // smaller than the one we know about. This means that the remote side is behind.
+            return;
+        }
     }
 
     if (MONGO_FAIL_POINT(skipShardFilteringMetadataRefresh)) {
@@ -143,58 +143,69 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
     invariant(!opCtx->lockState()->isLocked());
     invariant(!opCtx->getClient()->isInDirectClient());
 
-    auto const shardingState = ShardingState::get(opCtx);
+    auto* const shardingState = ShardingState::get(opCtx);
     invariant(shardingState->canAcceptShardedCommands());
 
-    const auto routingInfo =
+    auto routingInfo =
         uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(
             opCtx, nss, forceRefreshFromThisThread));
-    const auto cm = routingInfo.cm();
+    auto cm = routingInfo.cm();
 
     if (!cm) {
         // No chunk manager, so unsharded.
 
         // Exclusive collection lock needed since we're now changing the metadata
         AutoGetCollection autoColl(opCtx, nss, MODE_IX, MODE_X);
-
-        auto* const css = CollectionShardingRuntime::get(opCtx, nss);
-        css->setFilteringMetadata(opCtx, CollectionMetadata());
+        CollectionShardingRuntime::get(opCtx, nss)
+            ->setFilteringMetadata(opCtx, CollectionMetadata());
 
         return ChunkVersion::UNSHARDED();
     }
 
+    // Optimistic check with only IS lock in order to avoid threads piling up on the collection X
+    // lock below
     {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        auto metadata = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
+        auto optMetadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadataIfKnown();
 
         // We already have newer version
-        if (metadata->isSharded() &&
-            metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
-            metadata->getCollVersion() >= cm->getVersion()) {
-            LOG(1) << "Skipping refresh of metadata for " << nss << " "
-                   << metadata->getCollVersion() << " with an older " << cm->getVersion();
-            return metadata->getShardVersion();
+        if (optMetadata) {
+            const auto& metadata = *optMetadata;
+            if (metadata->isSharded() &&
+                metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
+                metadata->getCollVersion() >= cm->getVersion()) {
+                LOG(1) << "Skipping refresh of metadata for " << nss << " "
+                       << metadata->getCollVersion() << " with an older " << cm->getVersion();
+                return metadata->getShardVersion();
+            }
         }
     }
 
     // Exclusive collection lock needed since we're now changing the metadata
     AutoGetCollection autoColl(opCtx, nss, MODE_IX, MODE_X);
-
     auto* const css = CollectionShardingRuntime::get(opCtx, nss);
 
-    auto metadata = css->getMetadata(opCtx);
+    {
+        auto optMetadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadataIfKnown();
 
-    // We already have newer version
-    if (metadata->isSharded() && metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
-        metadata->getCollVersion() >= cm->getVersion()) {
-        LOG(1) << "Skipping refresh of metadata for " << nss << " " << metadata->getCollVersion()
-               << " with an older " << cm->getVersion();
-        return metadata->getShardVersion();
+        // We already have newer version
+        if (optMetadata) {
+            const auto& metadata = *optMetadata;
+            if (metadata->isSharded() &&
+                metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
+                metadata->getCollVersion() >= cm->getVersion()) {
+                LOG(1) << "Skipping refresh of metadata for " << nss << " "
+                       << metadata->getCollVersion() << " with an older " << cm->getVersion();
+                return metadata->getShardVersion();
+            }
+        }
     }
 
-    css->setFilteringMetadata(opCtx, CollectionMetadata(cm, shardingState->shardId()));
+    CollectionMetadata metadata(std::move(cm), shardingState->shardId());
+    const auto newShardVersion = metadata.getShardVersion();
 
-    return css->getMetadata(opCtx)->getShardVersion();
+    css->setFilteringMetadata(opCtx, std::move(metadata));
+    return newShardVersion;
 }
 
 Status onDbVersionMismatchNoExcept(
@@ -226,18 +237,22 @@ void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
     // First, check under a shared lock if another thread already updated the cached version.
     // This is a best-effort optimization to make as few threads as possible to convoy on the
     // exclusive lock below.
+    auto databaseHolder = DatabaseHolder::get(opCtx);
     {
         // Take the DBLock directly rather than using AutoGetDb, to prevent a recursive call
         // into checkDbVersion().
         Lock::DBLock dbLock(opCtx, dbName, MODE_IS);
-        const auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, dbName);
+        auto db = databaseHolder->getDb(opCtx, dbName);
         if (!db) {
             log() << "Database " << dbName
                   << " has been dropped; not caching the refreshed databaseVersion";
             return;
         }
 
-        const auto cachedDbVersion = DatabaseShardingState::get(db).getDbVersion(opCtx);
+        auto& dss = DatabaseShardingState::get(db);
+        auto dssLock = DatabaseShardingState::DSSLock::lock(opCtx, &dss);
+
+        const auto cachedDbVersion = dss.getDbVersion(opCtx, dssLock);
         if (cachedDbVersion && cachedDbVersion->getUuid() == refreshedDbVersion.getUuid() &&
             cachedDbVersion->getLastMod() >= refreshedDbVersion.getLastMod()) {
             LOG(2) << "Skipping setting cached databaseVersion for " << dbName
@@ -250,14 +265,17 @@ void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
 
     // The cached version is older than the refreshed version; update the cached version.
     Lock::DBLock dbLock(opCtx, dbName, MODE_X);
-    const auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, dbName);
+    auto db = databaseHolder->getDb(opCtx, dbName);
     if (!db) {
         log() << "Database " << dbName
               << " has been dropped; not caching the refreshed databaseVersion";
         return;
     }
 
-    DatabaseShardingState::get(db).setDbVersion(opCtx, std::move(refreshedDbVersion));
+    auto& dss = DatabaseShardingState::get(db);
+    auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, &dss);
+
+    dss.setDbVersion(opCtx, std::move(refreshedDbVersion), dssLock);
 }
 
 }  // namespace mongo

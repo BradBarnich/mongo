@@ -1,29 +1,31 @@
-/*
- *    Copyright 2010 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
@@ -87,10 +89,12 @@ using namespace mongo;
 string historyFile;
 bool gotInterrupted = false;
 bool inMultiLine = false;
-static AtomicBool atPrompt(false);  // can eval before getting to prompt
+static AtomicWord<bool> atPrompt(false);  // can eval before getting to prompt
 
 namespace {
-const auto kDefaultMongoURL = "mongodb://127.0.0.1:27017"_sd;
+const std::string kDefaultMongoHost = "127.0.0.1"s;
+const std::string kDefaultMongoPort = "27017"s;
+const std::string kDefaultMongoURL = "mongodb://"s + kDefaultMongoHost + ":"s + kDefaultMongoPort;
 
 // Initialize the featureCompatibilityVersion server parameter since the mongo shell does not have a
 // featureCompatibilityVersion document from which to initialize the parameter. The parameter is set
@@ -198,7 +202,7 @@ void shellHistoryAdd(const char* line) {
 }
 
 void killOps() {
-    if (mongo::shell_utils::_nokillop)
+    if (shellGlobalParams.nokillop)
         return;
 
     if (atPrompt.load())
@@ -237,7 +241,7 @@ void setupSignals() {
 string getURIFromArgs(const std::string& arg, const std::string& host, const std::string& port) {
     if (host.empty() && arg.empty() && port.empty()) {
         // Nothing provided, just play the default.
-        return kDefaultMongoURL.toString();
+        return kDefaultMongoURL;
     }
 
     if ((str::startsWith(arg, "mongodb://") || str::startsWith(arg, "mongodb+srv://")) &&
@@ -245,7 +249,7 @@ string getURIFromArgs(const std::string& arg, const std::string& host, const std
         // mongo mongodb://blah
         return arg;
     }
-    if ((str::startsWith(host, "mongodb://") || str::startsWith(arg, "mongodb+srv://")) &&
+    if ((str::startsWith(host, "mongodb://") || str::startsWith(host, "mongodb+srv://")) &&
         arg.empty() && port.empty()) {
         // mongo --host mongodb://blah
         return host;
@@ -724,16 +728,17 @@ static void edit(const string& whatToEdit) {
 }
 
 namespace {
-bool mechanismRequiresPassword() {
-    using std::begin;
-    using std::end;
-    const std::string passwordlessMechanisms[] = {"GSSAPI", "MONGODB-X509"};
-    auto isInShellParameters = [](const auto& mech) {
-        return mech == shellGlobalParams.authenticationMechanism;
-    };
-
-    return std::none_of(
-        begin(passwordlessMechanisms), end(passwordlessMechanisms), isInShellParameters);
+bool mechanismRequiresPassword(const MongoURI& uri) {
+    if (const auto authMechanisms = uri.getOption("authMechanism")) {
+        constexpr std::array<StringData, 2> passwordlessMechanisms{"GSSAPI"_sd, "MONGODB-X509"_sd};
+        const std::string& authMechanism = authMechanisms.get();
+        for (const auto& mechanism : passwordlessMechanisms) {
+            if (mechanism.toString() == authMechanism) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 }  // namespace
 
@@ -768,6 +773,8 @@ int _main(int argc, char* argv[], char** envp) {
     // hide password from ps output
     redactPasswordOptions(argc, argv);
 
+    ErrorExtraInfo::invariantHaveAllParsers();
+
     if (!mongo::serverGlobalParams.quiet.load())
         cout << mongoShellVersion(VersionInfoInterface::instance()) << endl;
 
@@ -778,126 +785,71 @@ int _main(int argc, char* argv[], char** envp) {
         ->attachAppender(std::make_unique<logger::ConsoleAppender<logger::MessageEventEphemeral>>(
             std::make_unique<logger::MessageEventUnadornedEncoder>()));
 
+    // Get the URL passed to the shell
     std::string& cmdlineURI = shellGlobalParams.url;
+
+    // Parse the output of getURIFromArgs which will determine if --host passed in a URI
     MongoURI parsedURI;
-    if (!cmdlineURI.empty()) {
-        parsedURI = uassertStatusOK(MongoURI::parse(stdx::as_const(cmdlineURI)));
+    parsedURI = uassertStatusOK(MongoURI::parse(getURIFromArgs(
+        cmdlineURI, escape(shellGlobalParams.dbhost), escape(shellGlobalParams.port))));
+
+    // TODO: add in all of the relevant shellGlobalParams to parsedURI
+    parsedURI.setOptionIfNecessary("compressors"s, shellGlobalParams.networkMessageCompressors);
+    parsedURI.setOptionIfNecessary("authMechanism"s, shellGlobalParams.authenticationMechanism);
+    parsedURI.setOptionIfNecessary("authSource"s, shellGlobalParams.authenticationDatabase);
+    parsedURI.setOptionIfNecessary("gssapiServiceName"s, shellGlobalParams.gssapiServiceName);
+    parsedURI.setOptionIfNecessary("gssapiHostName"s, shellGlobalParams.gssapiHostName);
+
+    if (const auto authMechanisms = parsedURI.getOption("authMechanism")) {
+        stringstream ss;
+        ss << "DB.prototype._defaultAuthenticationMechanism = \"" << escape(authMechanisms.get())
+           << "\";" << endl;
+        mongo::shell_utils::_dbConnect += ss.str();
     }
 
-    // We create an altered URI from the one passed so that we can pass that to replica set
-    // monitors.  This is to avoid making potentially breaking changes to the replica set monitor
-    // code.
-    std::string processedURI = cmdlineURI;
-    auto pos = cmdlineURI.find('@');
-    auto protocolLength = processedURI.find("://");
-    if (pos != std::string::npos && protocolLength != std::string::npos) {
-        processedURI =
-            processedURI.substr(0, protocolLength) + "://" + processedURI.substr(pos + 1);
+    if (const auto gssapiServiveName = parsedURI.getOption("gssapiServiceName")) {
+        stringstream ss;
+        ss << "DB.prototype._defaultGssapiServiceName = \"" << escape(gssapiServiveName.get())
+           << "\";" << endl;
+        mongo::shell_utils::_dbConnect += ss.str();
     }
 
     if (!shellGlobalParams.nodb) {  // connect to db
+        bool usingPassword = !shellGlobalParams.password.empty();
+
+        if (mechanismRequiresPassword(parsedURI) &&
+            (parsedURI.getUser().size() || shellGlobalParams.username.size())) {
+            usingPassword = true;
+        }
+
+        if (usingPassword && parsedURI.getPassword().empty()) {
+            if (!shellGlobalParams.password.empty()) {
+                parsedURI.setPassword(stdx::as_const(shellGlobalParams.password));
+            } else {
+                parsedURI.setPassword(mongo::askPassword());
+            }
+        }
+
+        if (parsedURI.getUser().empty() && !shellGlobalParams.username.empty()) {
+            parsedURI.setUser(stdx::as_const(shellGlobalParams.username));
+        }
+
         stringstream ss;
-        if (mongo::serverGlobalParams.quiet.load())
-            ss << "__quiet = true;";
-        ss << "db = connect( \""
-           << getURIFromArgs(processedURI, shellGlobalParams.dbhost, shellGlobalParams.port)
-           << "\");";
+        if (mongo::serverGlobalParams.quiet.load()) {
+            ss << "__quiet = true;" << endl;
+        }
+
+        ss << "db = connect( \"" << parsedURI.canonicalizeURIAsString() << "\");" << endl;
 
         if (shellGlobalParams.shouldRetryWrites || parsedURI.getRetryWrites()) {
             // If the --retryWrites cmdline argument or retryWrites URI param was specified, then
             // replace the global `db` object with a DB object started in a session. The resulting
             // Mongo connection checks its _retryWrites property.
-            ss << "db = db.getMongo().startSession().getDatabase(db.getName());";
+            ss << "db = db.getMongo().startSession().getDatabase(db.getName());" << endl;
         }
 
-        mongo::shell_utils::_dbConnect = ss.str();
-
-        if (cmdlineURI.size()) {
-            const auto mechanismKey = parsedURI.getOptions().find("authMechanism");
-            if (mechanismKey != end(parsedURI.getOptions()) &&
-                shellGlobalParams.authenticationMechanism.empty()) {
-                shellGlobalParams.authenticationMechanism = mechanismKey->second;
-            }
-
-            if (mechanismRequiresPassword() &&
-                (parsedURI.getUser().size() || shellGlobalParams.username.size())) {
-                shellGlobalParams.usingPassword = true;
-            }
-            if (shellGlobalParams.usingPassword && shellGlobalParams.password.empty()) {
-                shellGlobalParams.password =
-                    parsedURI.getPassword().size() ? parsedURI.getPassword() : mongo::askPassword();
-            }
-            if (parsedURI.getUser().size() && shellGlobalParams.username.empty()) {
-                shellGlobalParams.username = parsedURI.getUser();
-            }
-            auto authParam = parsedURI.getOptions().find(kAuthParam);
-            if (authParam != end(parsedURI.getOptions()) &&
-                shellGlobalParams.authenticationDatabase.empty()) {
-                shellGlobalParams.authenticationDatabase = authParam->second;
-            }
-        } else if (shellGlobalParams.usingPassword && shellGlobalParams.password.empty()) {
-            shellGlobalParams.password = mongo::askPassword();
-        }
+        mongo::shell_utils::_dbConnect += ss.str();
     }
-
-    // We now substitute the altered URI to permit the replica set monitors to see it without
-    // usernames.  This is to avoid making potentially breaking changes to the replica set monitor
-    // code.
-    cmdlineURI = processedURI;
-
-
-    // Construct the authentication-related code to execute on shell startup.
-    //
-    // This constructs and immediately executes an anonymous function, to avoid
-    // the shell's default behavior of printing statement results to the console.
-    //
-    // It constructs a statement of the following form:
-    //
-    // (function() {
-    //    // Set default authentication mechanism and, maybe, authenticate.
-    //  }())
-    stringstream authStringStream;
-    authStringStream << "(function() { " << endl;
-    if (!shellGlobalParams.authenticationMechanism.empty()) {
-        authStringStream << "DB.prototype._defaultAuthenticationMechanism = \""
-                         << escape(shellGlobalParams.authenticationMechanism) << "\";" << endl;
-    }
-
-    if (!shellGlobalParams.gssapiServiceName.empty()) {
-        authStringStream << "DB.prototype._defaultGssapiServiceName = \""
-                         << escape(shellGlobalParams.gssapiServiceName) << "\";" << endl;
-    }
-
-    if (!shellGlobalParams.nodb && (!shellGlobalParams.username.empty() ||
-                                    shellGlobalParams.authenticationMechanism == "MONGODB-X509")) {
-        authStringStream << "var username = \"" << escape(shellGlobalParams.username) << "\";"
-                         << endl;
-        if (shellGlobalParams.usingPassword) {
-            authStringStream << "var password = \"" << escape(shellGlobalParams.password) << "\";"
-                             << endl;
-        }
-        if (shellGlobalParams.authenticationDatabase.empty()) {
-            authStringStream << "var authDb = db;" << endl;
-        } else {
-            authStringStream << "var authDb = db.getSiblingDB(\""
-                             << escape(shellGlobalParams.authenticationDatabase) << "\");" << endl;
-        }
-
-        authStringStream << "authDb._authOrThrow({ ";
-        if (!shellGlobalParams.username.empty()) {
-            authStringStream << saslCommandUserFieldName << ": username ";
-        }
-        if (shellGlobalParams.usingPassword) {
-            authStringStream << ", " << saslCommandPasswordFieldName << ": password ";
-        }
-        if (!shellGlobalParams.gssapiHostName.empty()) {
-            authStringStream << ", " << saslCommandServiceHostnameFieldName << ": \""
-                             << escape(shellGlobalParams.gssapiHostName) << '"' << endl;
-        }
-        authStringStream << "});" << endl;
-    }
-    authStringStream << "}())";
-    mongo::shell_utils::_dbAuth = authStringStream.str();
 
     mongo::ScriptEngine::setConnectCallback(mongo::shell_utils::onConnect);
     mongo::ScriptEngine::setup();
@@ -907,7 +859,7 @@ int _main(int argc, char* argv[], char** envp) {
     mongo::getGlobalScriptEngine()->enableJavaScriptProtection(
         shellGlobalParams.javascriptProtection);
 
-    auto poolGuard = MakeGuard([] { ScriptEngine::dropScopeCache(); });
+    auto poolGuard = makeGuard([] { ScriptEngine::dropScopeCache(); });
 
     unique_ptr<mongo::Scope> scope(mongo::getGlobalScriptEngine()->newScope());
     shellMainScope = scope.get();

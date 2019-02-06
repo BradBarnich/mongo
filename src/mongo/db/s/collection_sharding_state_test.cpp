@@ -1,28 +1,31 @@
-/*    Copyright (C) 2016 MongoDB Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -30,6 +33,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/s/shard_server_test_fixture.h"
 
@@ -55,12 +59,25 @@ CollectionMetadata makeAMetadata(BSONObj const& keyPattern) {
     return CollectionMetadata(std::move(cm), ShardId("this"));
 }
 
-using DeleteStateTest = ShardServerTestFixture;
+class DeleteStateTest : public ShardServerTestFixture {
+protected:
+    void setCollectionFilteringMetadata(CollectionMetadata metadata) {
+        AutoGetCollection autoColl(operationContext(), kTestNss, MODE_X);
+        auto* const css = CollectionShardingRuntime::get(operationContext(), kTestNss);
+        css->setFilteringMetadata(operationContext(), std::move(metadata));
+
+        auto& oss = OperationShardingState::get(operationContext());
+        const auto version = metadata.getShardVersion();
+        BSONObjBuilder builder;
+        version.appendToCommand(&builder);
+        oss.initializeClientRoutingVersions(kTestNss, builder.obj());
+    }
+};
 
 TEST_F(DeleteStateTest, MakeDeleteStateUnsharded) {
+    setCollectionFilteringMetadata(CollectionMetadata());
+
     AutoGetCollection autoColl(operationContext(), kTestNss, MODE_IX);
-    auto* const css = CollectionShardingRuntime::get(operationContext(), kTestNss);
-    css->setFilteringMetadata(operationContext(), CollectionMetadata());
 
     auto doc = BSON("key3"
                     << "abc"
@@ -79,11 +96,10 @@ TEST_F(DeleteStateTest, MakeDeleteStateUnsharded) {
 }
 
 TEST_F(DeleteStateTest, MakeDeleteStateShardedWithoutIdInShardKey) {
-    AutoGetCollection autoColl(operationContext(), kTestNss, MODE_IX);
-    auto* const css = CollectionShardingRuntime::get(operationContext(), kTestNss);
-
     // Push a CollectionMetadata with a shard key not including "_id"...
-    css->setFilteringMetadata(operationContext(), makeAMetadata(BSON("key" << 1 << "key3" << 1)));
+    setCollectionFilteringMetadata(makeAMetadata(BSON("key" << 1 << "key3" << 1)));
+
+    AutoGetCollection autoColl(operationContext(), kTestNss, MODE_IX);
 
     // The order of fields in `doc` deliberately does not match the shard key
     auto doc = BSON("key3"
@@ -105,12 +121,10 @@ TEST_F(DeleteStateTest, MakeDeleteStateShardedWithoutIdInShardKey) {
 }
 
 TEST_F(DeleteStateTest, MakeDeleteStateShardedWithIdInShardKey) {
-    AutoGetCollection autoColl(operationContext(), kTestNss, MODE_IX);
-    auto* const css = CollectionShardingRuntime::get(operationContext(), kTestNss);
-
     // Push a CollectionMetadata with a shard key that does have "_id" in the middle...
-    css->setFilteringMetadata(operationContext(),
-                              makeAMetadata(BSON("key" << 1 << "_id" << 1 << "key2" << 1)));
+    setCollectionFilteringMetadata(makeAMetadata(BSON("key" << 1 << "_id" << 1 << "key2" << 1)));
+
+    AutoGetCollection autoColl(operationContext(), kTestNss, MODE_IX);
 
     // The order of fields in `doc` deliberately does not match the shard key
     auto doc = BSON("key2" << true << "key3"
@@ -130,13 +144,11 @@ TEST_F(DeleteStateTest, MakeDeleteStateShardedWithIdInShardKey) {
 }
 
 TEST_F(DeleteStateTest, MakeDeleteStateShardedWithIdHashInShardKey) {
-    AutoGetCollection autoColl(operationContext(), kTestNss, MODE_IX);
-    auto* const css = CollectionShardingRuntime::get(operationContext(), kTestNss);
-
     // Push a CollectionMetadata with a shard key "_id", hashed.
-    auto aMetadata = makeAMetadata(BSON("_id"
-                                        << "hashed"));
-    css->setFilteringMetadata(operationContext(), std::move(aMetadata));
+    setCollectionFilteringMetadata(makeAMetadata(BSON("_id"
+                                                      << "hashed")));
+
+    AutoGetCollection autoColl(operationContext(), kTestNss, MODE_IX);
 
     auto doc = BSON("key2" << true << "_id"
                            << "hello"

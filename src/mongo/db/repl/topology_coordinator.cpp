@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,6 +41,7 @@
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/audit.h"
+#include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/client.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/operation_context.h"
@@ -48,7 +51,6 @@
 #include "mongo/db/repl/member_data.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
-#include "mongo/db/repl/repl_set_html_summary.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/server_parameters.h"
@@ -250,8 +252,10 @@ HostAndPort TopologyCoordinator::chooseNewSyncSource(Date_t now,
     int needMorePings = (_memberData.size() - 1) * 2 - _getTotalPings();
 
     if (needMorePings > 0) {
-        OCCASIONALLY log() << "waiting for " << needMorePings
-                           << " pings from other members before syncing";
+        static Occasionally sampler;
+        if (sampler.tick()) {
+            log() << "waiting for " << needMorePings << " pings from other members before syncing";
+        }
         _syncSource = HostAndPort();
         return _syncSource;
     }
@@ -825,8 +829,16 @@ bool TopologyCoordinator::haveNumNodesReachedOpTime(const OpTime& targetOpTime,
     }
 
     for (auto&& memberData : _memberData) {
+        const auto isArbiter = _rsConfig.getMemberAt(memberData.getMemberId()).isArbiter();
+
+        // We do not count arbiters towards the write concern.
+        if (isArbiter) {
+            continue;
+        }
+
         const OpTime& memberOpTime =
             durablyWritten ? memberData.getLastDurableOpTime() : memberData.getLastAppliedOpTime();
+
         if (memberOpTime >= targetOpTime) {
             --numNodes;
         }
@@ -955,7 +967,17 @@ void TopologyCoordinator::setMyLastAppliedOpTime(OpTime opTime,
                                                  Date_t now,
                                                  bool isRollbackAllowed) {
     auto& myMemberData = _selfMemberData();
-    invariant(isRollbackAllowed || opTime >= myMemberData.getLastAppliedOpTime());
+    auto myLastAppliedOpTime = myMemberData.getLastAppliedOpTime();
+
+    if (!(isRollbackAllowed || opTime == myLastAppliedOpTime)) {
+        invariant(opTime > myLastAppliedOpTime);
+        // In pv1, oplog entries are ordered by non-decreasing term and strictly increasing
+        // timestamp. So, in pv1, its not possible for us to get opTime with higher term and
+        // timestamp lesser than or equal to our current lastAppliedOptime.
+        invariant(opTime.getTerm() == OpTime::kUninitializedTerm ||
+                  myLastAppliedOpTime.getTerm() == OpTime::kUninitializedTerm ||
+                  opTime.getTimestamp() > myLastAppliedOpTime.getTimestamp());
+    }
     myMemberData.setLastAppliedOpTime(opTime, now);
 }
 
@@ -1688,7 +1710,10 @@ void TopologyCoordinator::fillIsMasterForReplSet(IsMasterResponse* response) {
     }
 
     response->setReplSetVersion(_rsConfig.getConfigVersion());
-    response->setIsMaster(myState.primary());
+    // "ismaster" is false if we are not primary. If we're stepping down, we're waiting for the
+    // Replication State Transition Lock before we can change to secondary, but we should report
+    // "ismaster" false to indicate that we can't accept new writes.
+    response->setIsMaster(myState.primary() && _leaderMode != LeaderMode::kSteppingDown);
     response->setIsSecondary(myState.secondary());
 
     const MemberConfig* curPrimary = _currentPrimaryMember();
@@ -2339,7 +2364,7 @@ void TopologyCoordinator::_stepDownSelfAndReplaceWith(int newPrimary) {
 }
 
 bool TopologyCoordinator::updateLastCommittedOpTime() {
-    // If we're not primary or we're stepping down due to learning of a new term then  we must not
+    // If we're not primary or we're stepping down due to learning of a new term then we must not
     // advance the commit point.  If we are stepping down due to a user request, however, then it
     // is safe to advance the commit point, and in fact we must since the stepdown request may be
     // waiting for the commit point to advance enough to be able to safely complete the step down.
@@ -2613,17 +2638,6 @@ rpc::OplogQueryMetadata TopologyCoordinator::prepareOplogQueryMetadata(int rbid)
                                    _rsConfig.findMemberIndexByHostAndPort(getSyncSourceAddress()));
 }
 
-void TopologyCoordinator::summarizeAsHtml(ReplSetHtmlSummary* output) {
-    // TODO(dannenberg) consider putting both optimes into the htmlsummary.
-    output->setSelfOptime(getMyLastAppliedOpTime());
-    output->setConfig(_rsConfig);
-    output->setHBData(_memberData);
-    output->setSelfIndex(_selfIndex);
-    output->setPrimaryIndex(_currentPrimaryIndex);
-    output->setSelfState(getMemberState());
-    output->setSelfHeartbeatMessage(_hbmsg);
-}
-
 void TopologyCoordinator::processReplSetRequestVotes(const ReplSetRequestVotesArgs& args,
                                                      ReplSetRequestVotesResponse* response) {
     response->setTerm(_term);
@@ -2776,6 +2790,66 @@ TopologyCoordinator::latestKnownOpTimeSinceHeartbeatRestartPerMember() const {
         opTimesPerMember[memberId] = member.getHeartbeatAppliedOpTime();
     }
     return opTimesPerMember;
+}
+
+bool TopologyCoordinator::checkIfCommitQuorumCanBeSatisfied(
+    const CommitQuorumOptions& commitQuorum, const std::vector<MemberConfig>& members) const {
+    if (!commitQuorum.mode.empty() && commitQuorum.mode != CommitQuorumOptions::kMajority) {
+        StatusWith<ReplSetTagPattern> tagPatternStatus =
+            _rsConfig.findCustomWriteMode(commitQuorum.mode);
+        if (!tagPatternStatus.isOK()) {
+            return false;
+        }
+
+        ReplSetTagMatch matcher(tagPatternStatus.getValue());
+        for (auto&& member : members) {
+            for (MemberConfig::TagIterator it = member.tagsBegin(); it != member.tagsEnd(); ++it) {
+                if (matcher.update(*it)) {
+                    return true;
+                }
+            }
+        }
+
+        // Even if all the nodes in the set had a given write it still would not satisfy this
+        // commit quorum.
+        return false;
+    } else {
+        int nodesRemaining = 0;
+        if (!commitQuorum.mode.empty()) {
+            invariant(commitQuorum.mode == CommitQuorumOptions::kMajority);
+            nodesRemaining = _rsConfig.getWriteMajority();
+        } else {
+            nodesRemaining = commitQuorum.numNodes;
+        }
+
+        for (auto&& member : members) {
+            if (!member.isArbiter()) {  // Only count data-bearing nodes
+                --nodesRemaining;
+                if (nodesRemaining <= 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+}
+
+bool TopologyCoordinator::checkIfCommitQuorumIsSatisfied(
+    const CommitQuorumOptions& commitQuorum,
+    const std::vector<HostAndPort>& commitReadyMembers) const {
+    std::vector<MemberConfig> commitReadyMemberConfigs;
+    for (auto& commitReadyMember : commitReadyMembers) {
+        const MemberConfig* memberConfig = _rsConfig.findMemberByHostAndPort(commitReadyMember);
+
+        invariant(memberConfig);
+        commitReadyMemberConfigs.push_back(*memberConfig);
+    }
+
+    // Calling this with commit ready members only is the same as checking if the commit quorum is
+    // satisfied. Because the 'commitQuorum' is based on the participation of all the replica set
+    // members, and if the 'commitQuorum' can be satisfied with all the commit ready members, then
+    // the commit quorum is satisfied in this replica set configuration.
+    return checkIfCommitQuorumCanBeSatisfied(commitQuorum, commitReadyMemberConfigs);
 }
 
 }  // namespace repl

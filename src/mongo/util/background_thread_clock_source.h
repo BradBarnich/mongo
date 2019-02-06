@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -56,7 +58,7 @@ public:
     ~BackgroundThreadClockSource() override;
     Milliseconds getPrecision() override;
     Date_t now() override;
-    Status setAlarm(Date_t when, stdx::function<void()> action) override;
+    Status setAlarm(Date_t when, unique_function<void()> action) override;
 
     /**
      * Doesn't count as a call to now() for determining whether this ClockSource is idle.
@@ -73,8 +75,8 @@ private:
     int64_t _updateCurrent_inlock();
 
     const std::unique_ptr<ClockSource> _clockSource;
-    AtomicInt64 _current{0};           // 0 if _timer is paused due to idleness.
-    AtomicBool _timerWillPause{true};  // If true when _timer wakes up, it will pause.
+    AtomicWord<long long> _current{0};       // 0 if _timer is paused due to idleness.
+    AtomicWord<bool> _timerWillPause{true};  // If true when _timer wakes up, it will pause.
 
     const Milliseconds _granularity;
 

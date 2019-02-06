@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,7 +41,6 @@ namespace mongo {
 namespace {
 
 constexpr auto listCollectionsCursorCol = "$cmd.listCollections"_sd;
-constexpr auto listIndexesCursorNSPrefix = "$cmd.listIndexes."_sd;
 constexpr auto collectionlessAggregateCursorCol = "$cmd.aggregate"_sd;
 constexpr auto dropPendingNSPrefix = "system.drop."_sd;
 
@@ -56,8 +57,15 @@ const NamespaceString NamespaceString::kServerConfigurationNamespace(NamespaceSt
                                                                      "system.version");
 const NamespaceString NamespaceString::kLogicalSessionsNamespace(NamespaceString::kConfigDb,
                                                                  "system.sessions");
+
+// Persisted state for a shard participating in a transaction or retryable write.
 const NamespaceString NamespaceString::kSessionTransactionsTableNamespace(
     NamespaceString::kConfigDb, "transactions");
+
+// Persisted state for a shard coordinating a cross-shard transaction.
+const NamespaceString NamespaceString::kTransactionCoordinatorsNamespace(
+    NamespaceString::kConfigDb, "transaction_coordinators");
+
 const NamespaceString NamespaceString::kShardConfigCollectionsNamespace(NamespaceString::kConfigDb,
                                                                         "cache.collections");
 const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceString::kConfigDb,
@@ -65,14 +73,11 @@ const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceS
 const NamespaceString NamespaceString::kSystemKeysNamespace(NamespaceString::kAdminDb,
                                                             "system.keys");
 const NamespaceString NamespaceString::kRsOplogNamespace(NamespaceString::kLocalDb, "oplog.rs");
+const NamespaceString NamespaceString::kSystemReplSetNamespace(NamespaceString::kLocalDb,
+                                                               "system.replset");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
-}
-
-bool NamespaceString::isListIndexesCursorNS() const {
-    return coll().size() > listIndexesCursorNSPrefix.size() &&
-        coll().startsWith(listIndexesCursorNSPrefix);
 }
 
 bool NamespaceString::isCollectionlessAggregateNS() const {
@@ -117,13 +122,6 @@ NamespaceString NamespaceString::makeListCollectionsNSS(StringData dbName) {
     return nss;
 }
 
-NamespaceString NamespaceString::makeListIndexesNSS(StringData dbName, StringData collectionName) {
-    NamespaceString nss(dbName, str::stream() << listIndexesCursorNSPrefix << collectionName);
-    dassert(nss.isValid());
-    dassert(nss.isListIndexesCursorNS());
-    return nss;
-}
-
 NamespaceString NamespaceString::makeCollectionlessAggregateNSS(StringData dbname) {
     NamespaceString nss(dbname, collectionlessAggregateCursorCol);
     dassert(nss.isValid());
@@ -131,25 +129,9 @@ NamespaceString NamespaceString::makeCollectionlessAggregateNSS(StringData dbnam
     return nss;
 }
 
-NamespaceString NamespaceString::getTargetNSForListIndexes() const {
-    dassert(isListIndexesCursorNS());
-    return NamespaceString(db(), coll().substr(listIndexesCursorNSPrefix.size()));
-}
-
 std::string NamespaceString::getSisterNS(StringData local) const {
     verify(local.size() && local[0] != '.');
     return db().toString() + "." + local.toString();
-}
-
-boost::optional<NamespaceString> NamespaceString::getTargetNSForGloballyManagedNamespace() const {
-    // Globally managed namespaces are of the form '$cmd.commandName.<targetNs>' or simply
-    // '$cmd.commandName'.
-    dassert(isGloballyManagedNamespace());
-    const size_t indexOfNextDot = coll().find('.', 5);
-    if (indexOfNextDot == std::string::npos) {
-        return boost::none;
-    }
-    return NamespaceString{db(), coll().substr(indexOfNextDot + 1)};
 }
 
 bool NamespaceString::isDropPendingNamespace() const {
@@ -231,6 +213,12 @@ Status NamespaceString::checkLengthForRename(
     return Status::OK();
 }
 
+NamespaceString NamespaceString::makeIndexNamespace(StringData indexName) const {
+    StringBuilder ss;
+    ss << coll() << ".$" << indexName;
+    return NamespaceString(db(), ss.stringData());
+}
+
 bool NamespaceString::isReplicated() const {
     if (isLocal()) {
         return false;
@@ -263,6 +251,14 @@ std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss) {
 
 std::ostream& operator<<(std::ostream& stream, const NamespaceStringOrUUID& nsOrUUID) {
     return stream << nsOrUUID.toString();
+}
+
+StringBuilder& operator<<(StringBuilder& builder, const NamespaceString& nss) {
+    return builder << nss.toString();
+}
+
+StringBuilder& operator<<(StringBuilder& builder, const NamespaceStringOrUUID& nsOrUUID) {
+    return builder << nsOrUUID.toString();
 }
 
 }  // namespace mongo

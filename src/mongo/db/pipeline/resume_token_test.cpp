@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -49,7 +51,7 @@ TEST(ResumeToken, EncodesFullTokenFromData) {
     UUID testUuid = UUID::gen();
     Document documentKey{{"_id"_sd, "stuff"_sd}, {"otherkey"_sd, Document{{"otherstuff"_sd, 2}}}};
 
-    ResumeTokenData resumeTokenDataIn(ts, 0, 0, Value(documentKey), testUuid);
+    ResumeTokenData resumeTokenDataIn(ts, 0, 0, testUuid, Value(documentKey));
     ResumeToken token(resumeTokenDataIn);
     ResumeTokenData tokenData = token.getData();
     ASSERT_EQ(resumeTokenDataIn, tokenData);
@@ -70,7 +72,7 @@ TEST(ResumeToken, ShouldRoundTripThroughHexEncoding) {
     UUID testUuid = UUID::gen();
     Document documentKey{{"_id"_sd, "stuff"_sd}, {"otherkey"_sd, Document{{"otherstuff"_sd, 2}}}};
 
-    ResumeTokenData resumeTokenDataIn(ts, 0, 0, Value(documentKey), testUuid);
+    ResumeTokenData resumeTokenDataIn(ts, 0, 0, testUuid, Value(documentKey));
 
     // Test serialization/parsing through Document.
     auto rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument());
@@ -104,9 +106,9 @@ TEST(ResumeToken, TestMissingTypebitsOptimization) {
     Timestamp ts(1000, 1);
     UUID testUuid = UUID::gen();
 
-    ResumeTokenData hasTypeBitsData(ts, 0, 0, Value(Document{{"_id", 1.0}}), testUuid);
+    ResumeTokenData hasTypeBitsData(ts, 0, 0, testUuid, Value(Document{{"_id", 1.0}}));
     ResumeTokenData noTypeBitsData(
-        ResumeTokenData(ts, 0, 0, Value(Document{{"_id", 1}}), testUuid));
+        ResumeTokenData(ts, 0, 0, testUuid, Value(Document{{"_id", 1}})));
     ResumeToken hasTypeBitsToken(hasTypeBitsData);
     ResumeToken noTypeBitsToken(noTypeBitsData);
     ASSERT_EQ(noTypeBitsToken, hasTypeBitsToken);
@@ -225,7 +227,34 @@ TEST(ResumeToken, WrongVersionToken) {
     // With version 2 it should fail - the maximum supported version is 1.
     resumeTokenDataIn.version = 2;
     rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    ASSERT_THROWS(rtToken.getData(), AssertionException);
 
+    // For version 0, the 'tokenType' field is not encoded. We expect it to default from the value
+    // 'kHighWaterMarkToken' back to 'kEventToken' after serialization.
+    resumeTokenDataIn = {};
+    resumeTokenDataIn.version = 0;
+    resumeTokenDataIn.tokenType = ResumeTokenData::kHighWaterMarkToken;
+
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    tokenData = rtToken.getData();
+    ASSERT_NE(resumeTokenDataIn, tokenData);
+    tokenData.tokenType = ResumeTokenData::kHighWaterMarkToken;
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    // Version 1 should include the 'tokenType' field through serialization.
+    resumeTokenDataIn.version = 1;
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    tokenData = rtToken.getData();
+    ASSERT_EQ(resumeTokenDataIn, tokenData);
+
+    // A non-TokenType value in the 'tokenType' field should fail to decode.
+    resumeTokenDataIn.tokenType = static_cast<ResumeTokenData::TokenType>(5);
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
+    ASSERT_THROWS(rtToken.getData(), AssertionException);
+
+    // With version 2 it should fail - the maximum supported version is 1.
+    resumeTokenDataIn.version = 2;
+    rtToken = ResumeToken::parse(ResumeToken(resumeTokenDataIn).toDocument().toBson());
     ASSERT_THROWS(rtToken.getData(), AssertionException);
 }
 
@@ -271,67 +300,67 @@ TEST(ResumeToken, StringEncodingSortsCorrectly) {
     };
 
     // Test using only Timestamps.
-    assertLt({ts2_2, 0, 0, Value(), boost::none}, {ts10_4, 0, 0, Value(), boost::none});
-    assertLt({ts2_2, 0, 0, Value(), boost::none}, {ts10_5, 0, 0, Value(), boost::none});
-    assertLt({ts2_2, 0, 0, Value(), boost::none}, {ts11_3, 0, 0, Value(), boost::none});
-    assertLt({ts10_4, 0, 0, Value(), boost::none}, {ts10_5, 0, 0, Value(), boost::none});
-    assertLt({ts10_4, 0, 0, Value(), boost::none}, {ts11_3, 0, 0, Value(), boost::none});
-    assertLt({ts10_5, 0, 0, Value(), boost::none}, {ts11_3, 0, 0, Value(), boost::none});
+    assertLt({ts2_2, 0, 0, boost::none, Value()}, {ts10_4, 0, 0, boost::none, Value()});
+    assertLt({ts2_2, 0, 0, boost::none, Value()}, {ts10_5, 0, 0, boost::none, Value()});
+    assertLt({ts2_2, 0, 0, boost::none, Value()}, {ts11_3, 0, 0, boost::none, Value()});
+    assertLt({ts10_4, 0, 0, boost::none, Value()}, {ts10_5, 0, 0, boost::none, Value()});
+    assertLt({ts10_4, 0, 0, boost::none, Value()}, {ts11_3, 0, 0, boost::none, Value()});
+    assertLt({ts10_5, 0, 0, boost::none, Value()}, {ts11_3, 0, 0, boost::none, Value()});
 
     // Test using Timestamps and version.
-    assertLt({ts2_2, 0, 0, Value(), boost::none}, {ts2_2, 1, 0, Value(), boost::none});
-    assertLt({ts10_4, 5, 0, Value(), boost::none}, {ts10_4, 10, 0, Value(), boost::none});
+    assertLt({ts2_2, 0, 0, boost::none, Value()}, {ts2_2, 1, 0, boost::none, Value()});
+    assertLt({ts10_4, 5, 0, boost::none, Value()}, {ts10_4, 10, 0, boost::none, Value()});
 
     // Test that the Timestamp is more important than the version, applyOpsIndex, UUID and
     // documentKey.
-    assertLt({ts10_4, 0, 0, Value(Document{{"_id", 0}}), lower_uuid},
-             {ts10_5, 0, 0, Value(Document{{"_id", 0}}), lower_uuid});
-    assertLt({ts2_2, 0, 0, Value(Document{{"_id", 0}}), lower_uuid},
-             {ts10_5, 0, 0, Value(Document{{"_id", 0}}), lower_uuid});
-    assertLt({ts10_4, 0, 0, Value(Document{{"_id", 1}}), lower_uuid},
-             {ts10_5, 0, 0, Value(Document{{"_id", 0}}), lower_uuid});
-    assertLt({ts10_4, 0, 0, Value(Document{{"_id", 0}}), higher_uuid},
-             {ts10_5, 0, 0, Value(Document{{"_id", 0}}), lower_uuid});
-    assertLt({ts10_4, 0, 0, Value(Document{{"_id", 0}}), lower_uuid},
-             {ts10_5, 0, 0, Value(Document{{"_id", 0}}), higher_uuid});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_5, 0, 0, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts2_2, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_5, 0, 0, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 1}})},
+             {ts10_5, 0, 0, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 0, 0, higher_uuid, Value(Document{{"_id", 0}})},
+             {ts10_5, 0, 0, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_5, 0, 0, higher_uuid, Value(Document{{"_id", 0}})});
 
     // Test that when the Timestamp is the same, the version breaks the tie.
-    assertLt({ts10_4, 1, 50, Value(Document{{"_id", 0}}), lower_uuid},
-             {ts10_4, 5, 1, Value(Document{{"_id", 0}}), lower_uuid});
-    assertLt({ts2_2, 1, 0, Value(Document{{"_id", 0}}), higher_uuid},
-             {ts2_2, 2, 0, Value(Document{{"_id", 0}}), lower_uuid});
-    assertLt({ts10_4, 1, 0, Value(Document{{"_id", 1}}), lower_uuid},
-             {ts10_4, 2, 0, Value(Document{{"_id", 0}}), lower_uuid});
+    assertLt({ts10_4, 1, 50, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_4, 5, 1, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts2_2, 1, 0, higher_uuid, Value(Document{{"_id", 0}})},
+             {ts2_2, 2, 0, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 1, 0, lower_uuid, Value(Document{{"_id", 1}})},
+             {ts10_4, 2, 0, lower_uuid, Value(Document{{"_id", 0}})});
 
     // Test that when the Timestamp and version are the same, the applyOpsIndex breaks the tie.
-    assertLt({ts10_4, 1, 6, Value(Document{{"_id", 0}}), lower_uuid},
-             {ts10_4, 1, 50, Value(Document{{"_id", 0}}), lower_uuid});
-    assertLt({ts2_2, 0, 0, Value(Document{{"_id", 0}}), higher_uuid},
-             {ts2_2, 0, 4, Value(Document{{"_id", 0}}), lower_uuid});
+    assertLt({ts10_4, 1, 6, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_4, 1, 50, lower_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts2_2, 0, 0, higher_uuid, Value(Document{{"_id", 0}})},
+             {ts2_2, 0, 4, lower_uuid, Value(Document{{"_id", 0}})});
 
     // Test that when the Timestamp, version, and applyOpsIndex are the same, the UUID breaks the
     // tie.
-    assertLt({ts2_2, 0, 0, Value(Document{{"_id", 0}}), lower_uuid},
-             {ts2_2, 0, 0, Value(Document{{"_id", 0}}), higher_uuid});
-    assertLt({ts10_4, 0, 0, Value(Document{{"_id", 0}}), lower_uuid},
-             {ts10_4, 0, 0, Value(Document{{"_id", 0}}), higher_uuid});
-    assertLt({ts10_4, 1, 2, Value(Document{{"_id", 0}}), lower_uuid},
-             {ts10_4, 1, 2, Value(Document{{"_id", 0}}), higher_uuid});
-    assertLt({ts10_4, 0, 0, Value(Document{{"_id", 1}}), lower_uuid},
-             {ts10_4, 0, 0, Value(Document{{"_id", 0}}), higher_uuid});
-    assertLt({ts10_4, 0, 0, Value(Document{{"_id", 1}}), lower_uuid},
-             {ts10_4, 0, 0, Value(Document{{"_id", 2}}), higher_uuid});
+    assertLt({ts2_2, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts2_2, 0, 0, higher_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_4, 0, 0, higher_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 1, 2, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_4, 1, 2, higher_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 1}})},
+             {ts10_4, 0, 0, higher_uuid, Value(Document{{"_id", 0}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 1}})},
+             {ts10_4, 0, 0, higher_uuid, Value(Document{{"_id", 2}})});
 
     // Test that when the Timestamp, version, applyOpsIndex, and UUID are the same, the documentKey
     // breaks the tie.
-    assertLt({ts2_2, 0, 0, Value(Document{{"_id", 0}}), lower_uuid},
-             {ts2_2, 0, 0, Value(Document{{"_id", 1}}), lower_uuid});
-    assertLt({ts10_4, 0, 0, Value(Document{{"_id", 0}}), lower_uuid},
-             {ts10_4, 0, 0, Value(Document{{"_id", 1}}), lower_uuid});
-    assertLt({ts10_4, 0, 0, Value(Document{{"_id", 1}}), lower_uuid},
-             {ts10_4, 0, 0, Value(Document{{"_id", "string"_sd}}), lower_uuid});
-    assertLt({ts10_4, 0, 0, Value(Document{{"_id", BSONNULL}}), lower_uuid},
-             {ts10_4, 0, 0, Value(Document{{"_id", 0}}), lower_uuid});
+    assertLt({ts2_2, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts2_2, 0, 0, lower_uuid, Value(Document{{"_id", 1}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 0}})},
+             {ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 1}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 1}})},
+             {ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", "string"_sd}})});
+    assertLt({ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", BSONNULL}})},
+             {ts10_4, 0, 0, lower_uuid, Value(Document{{"_id", 0}})});
 }
 
 }  // namspace

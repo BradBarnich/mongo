@@ -8,6 +8,7 @@ import os.path
 
 import datetime
 import optparse
+import pymongo.uri_parser
 
 from . import config as _config
 from . import utils
@@ -80,6 +81,14 @@ def _make_parser():  # pylint: disable=too-many-statements
     parser.add_option("-f", "--findSuites", action="store_true", dest="find_suites",
                       help="Lists the names of the suites that will execute the specified tests.")
 
+    parser.add_option("--genny", dest="genny_executable", metavar="PATH",
+                      help="The path to the genny executable for resmoke to use.")
+
+    parser.add_option("--spawnUsing", type="choice", dest="spawn_using", choices=("python",
+                                                                                  "jasper"),
+                      help=("Allows you to spawn resmoke processes using python or Jasper."
+                            "Defaults to python. Options are 'python' or 'jasper'."))
+
     parser.add_option("--includeWithAnyTags", action="append", dest="include_with_any_tags",
                       metavar="TAG1,TAG2",
                       help=("Comma separated list of tags. For the jstest portion of the suite(s),"
@@ -137,10 +146,10 @@ def _make_parser():  # pylint: disable=too-many-statements
                       help="Writes a JSON file with performance test results.")
 
     parser.add_option("--shellConnString", dest="shell_conn_string", metavar="CONN_STRING",
-                      help="Overrides the default fixture and connect to an existing MongoDB"
-                      " cluster instead. This is useful for connecting to a MongoDB"
-                      " deployment started outside of resmoke.py including one running in a"
-                      " debugger.")
+                      help="Overrides the default fixture and connects with a mongodb:// connection"
+                      " string to an existing MongoDB cluster instead. This is useful for"
+                      " connecting to a MongoDB deployment started outside of resmoke.py including"
+                      " one running in a debugger.")
 
     parser.add_option("--shellPort", dest="shell_port", metavar="PORT",
                       help="Convenience form of --shellConnString for connecting to an"
@@ -395,6 +404,7 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements
         utils.default_if_none(_tags_from_list(config.pop("exclude_with_any_tags")), []))
     _config.FAIL_FAST = not config.pop("continue_on_failure")
     _config.INCLUDE_WITH_ANY_TAGS = _tags_from_list(config.pop("include_with_any_tags"))
+    _config.GENNY_EXECUTABLE = _expand_user(config.pop("genny_executable"))
     _config.JOBS = config.pop("jobs")
     _config.MAJORITY_READ_CONCERN = config.pop("majority_read_concern") == "on"
     _config.MONGO_EXECUTABLE = _expand_user(config.pop("mongo_executable"))
@@ -414,6 +424,7 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements
     _config.SERVICE_EXECUTOR = config.pop("service_executor")
     _config.SHELL_READ_MODE = config.pop("shell_read_mode")
     _config.SHELL_WRITE_MODE = config.pop("shell_write_mode")
+    _config.SPAWN_USING = config.pop("spawn_using")
     _config.STAGGER_JOBS = config.pop("stagger_jobs") == "on"
     _config.STORAGE_ENGINE = config.pop("storage_engine")
     _config.STORAGE_ENGINE_CACHE_SIZE = config.pop("storage_engine_cache_size_gb")
@@ -463,6 +474,11 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements
         conn_string = "mongodb://localhost:" + port
 
     if conn_string is not None:
+        # The --shellConnString command line option must be a MongoDB connection URI, which means it
+        # must specify the mongodb:// or mongodb+srv:// URI scheme. pymongo.uri_parser.parse_uri()
+        # raises an exception if the connection string specified isn't considered a valid MongoDB
+        # connection URI.
+        pymongo.uri_parser.parse_uri(conn_string)
         _config.SHELL_CONN_STRING = conn_string
 
     if config:

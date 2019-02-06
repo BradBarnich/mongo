@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -109,7 +111,7 @@ BSONObj makeMetadataObject() {
 /**
  * Checks the first batch of results from query.
  * 'documents' are the first batch of results returned from tailing the remote oplog.
- * 'lastFetched' optime and hash should be consistent with the predicate in the query.
+ * 'lastFetched' optime should be consistent with the predicate in the query.
  * 'lastOpCommitted' is the OpTime of the most recently committed op of which this node is aware.
  * 'remoteLastOpApplied' is the last OpTime applied on the sync source. This is optional for
  * compatibility with 3.4 servers that do not send OplogQueryMetadata.
@@ -130,7 +132,7 @@ BSONObj makeMetadataObject() {
  * the remote oplog.
  */
 Status checkRemoteOplogStart(const Fetcher::Documents& documents,
-                             OpTimeWithHash lastFetched,
+                             OpTime lastFetched,
                              OpTime lastOpCommitted,
                              boost::optional<OpTime> remoteLastOpApplied,
                              boost::optional<OpTime> remoteLastOpCommitted,
@@ -161,12 +163,12 @@ Status checkRemoteOplogStart(const Fetcher::Documents& documents,
     // failed to detect the rollback if it occurred between sync source selection (when we check the
     // candidate is ahead of us) and sync source resolution (when we got 'requiredRBID'). If the
     // sync source is now behind us, choose a new sync source to prevent going into rollback.
-    if (remoteLastOpApplied && (*remoteLastOpApplied < lastFetched.opTime)) {
+    if (remoteLastOpApplied && (*remoteLastOpApplied < lastFetched)) {
         return Status(ErrorCodes::InvalidSyncSource,
                       str::stream() << "Sync source's last applied OpTime "
                                     << remoteLastOpApplied->toString()
                                     << " is older than our last fetched OpTime "
-                                    << lastFetched.opTime.toString()
+                                    << lastFetched.toString()
                                     << ". Choosing new sync source.");
     }
 
@@ -181,13 +183,13 @@ Status checkRemoteOplogStart(const Fetcher::Documents& documents,
     // OpTime to determine where to start our OplogFetcher.
     if (requireFresherSyncSource && remoteLastOpApplied && remoteLastOpCommitted &&
         std::tie(*remoteLastOpApplied, *remoteLastOpCommitted) <=
-            std::tie(lastFetched.opTime, lastOpCommitted)) {
+            std::tie(lastFetched, lastOpCommitted)) {
         return Status(ErrorCodes::InvalidSyncSource,
                       str::stream()
                           << "Sync source cannot be behind me, and if I am up-to-date with the "
                              "sync source, it must have a higher lastOpCommitted. "
                           << "My last fetched oplog optime: "
-                          << lastFetched.opTime.toString()
+                          << lastFetched.toString()
                           << ", latest oplog optime of sync source: "
                           << remoteLastOpApplied->toString()
                           << ", my lastOpCommitted: "
@@ -210,33 +212,16 @@ Status checkRemoteOplogStart(const Fetcher::Documents& documents,
     auto opTimeResult = OpTime::parseFromOplogEntry(o);
     if (!opTimeResult.isOK()) {
         return Status(ErrorCodes::InvalidBSON,
-                      str::stream() << "our last op time fetched: " << lastFetched.opTime.toString()
-                                    << " (hash: "
-                                    << lastFetched.value
-                                    << ")"
+                      str::stream() << "our last optime fetched: " << lastFetched.toString()
                                     << ". failed to parse optime from first oplog on source: "
                                     << o.toString()
                                     << ": "
                                     << opTimeResult.getStatus().toString());
     }
     auto opTime = opTimeResult.getValue();
-    long long hash = o["h"].numberLong();
-    if (opTime != lastFetched.opTime || hash != lastFetched.value) {
-        std::string message = str::stream()
-            << "Our last op time fetched: " << lastFetched.opTime.toString()
-            << ". source's GTE: " << opTime.toString() << " hashes: (" << lastFetched.value << "/"
-            << hash << ")";
-
-        // In PV1, if the hashes do not match, the optimes should not either since optimes uniquely
-        // identify oplog entries. In that case we fail before we potentially corrupt data. This
-        // should never happen.
-        if (opTime.getTerm() != OpTime::kUninitializedTerm && hash != lastFetched.value &&
-            opTime == lastFetched.opTime) {
-            severe() << "Hashes do not match but OpTimes do. " << message
-                     << ". Source's GTE doc: " << redact(o);
-            fassertFailedNoTrace(40634);
-        }
-
+    if (opTime != lastFetched) {
+        std::string message = str::stream() << "Our last optime fetched: " << lastFetched.toString()
+                                            << ". source's GTE: " << opTime.toString();
         return Status(ErrorCodes::OplogStartMissing, message);
     }
     return Status::OK();
@@ -290,14 +275,14 @@ StatusWith<OplogFetcher::DocumentsInfo> OplogFetcher::validateDocuments(
             continue;
         }
 
-        auto docOpTimeWithHash = AbstractOplogFetcher::parseOpTimeWithHash(doc);
-        if (!docOpTimeWithHash.isOK()) {
-            return docOpTimeWithHash.getStatus();
+        auto docOpTime = OpTime::parseFromOplogEntry(doc);
+        if (!docOpTime.isOK()) {
+            return docOpTime.getStatus();
         }
-        info.lastDocument = docOpTimeWithHash.getValue();
+        info.lastDocument = docOpTime.getValue();
 
         // Check to see if the oplog entry goes back in time for this document.
-        const auto docTS = info.lastDocument.opTime.getTimestamp();
+        const auto docTS = info.lastDocument.getTimestamp();
         if (lastTS >= docTS) {
             return Status(ErrorCodes::OplogOutOfOrder,
                           str::stream() << "Out of order entries in oplog. lastTS: "
@@ -328,7 +313,7 @@ StatusWith<OplogFetcher::DocumentsInfo> OplogFetcher::validateDocuments(
 }
 
 OplogFetcher::OplogFetcher(executor::TaskExecutor* executor,
-                           OpTimeWithHash lastFetched,
+                           OpTime lastFetched,
                            HostAndPort source,
                            NamespaceString nss,
                            ReplSetConfig config,
@@ -434,7 +419,7 @@ StatusWith<BSONObj> OplogFetcher::_onSuccessfulBatch(const Fetcher::QueryRespons
     auto oqMetadata = oqMetadataResult.getValue();
 
     // This lastFetched value is the last OpTime from the previous batch.
-    auto lastFetched = _getLastOpTimeWithHashFetched();
+    auto lastFetched = _getLastOpTimeFetched();
 
     // Check start of remote oplog and, if necessary, stop fetcher to execute rollback.
     if (queryResponse.first) {
@@ -463,8 +448,8 @@ StatusWith<BSONObj> OplogFetcher::_onSuccessfulBatch(const Fetcher::QueryRespons
         firstDocToApply++;
     }
 
-    auto validateResult = OplogFetcher::validateDocuments(
-        documents, queryResponse.first, lastFetched.opTime.getTimestamp());
+    auto validateResult =
+        OplogFetcher::validateDocuments(documents, queryResponse.first, lastFetched.getTimestamp());
     if (!validateResult.isOK()) {
         return validateResult.getStatus();
     }

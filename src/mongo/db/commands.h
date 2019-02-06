@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2009-2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -48,9 +50,12 @@
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DECLARE(failCommand);
 
 class Command;
 class CommandInvocation;
@@ -144,38 +149,6 @@ struct CommandHelpers {
     static BSONObj appendMajorityWriteConcern(const BSONObj& cmdObj);
 
     /**
-     * Returns true if the provided argument is one that is handled by the command processing layer
-     * and should generally be ignored by individual command implementations. In particular,
-     * commands that fail on unrecognized arguments must not fail for any of these.
-     */
-    static bool isGenericArgument(StringData arg) {
-        // Not including "help" since we don't pass help requests through to the command parser.
-        // If that changes, it should be added. When you add to this list, consider whether you
-        // should also change the filterCommandRequestForPassthrough() function.
-        return arg == "$audit" ||                        //
-            arg == "$client" ||                          //
-            arg == "$configServerState" ||               //
-            arg == "$db" ||                              //
-            arg == "allowImplicitCollectionCreation" ||  //
-            arg == "$oplogQueryData" ||                  //
-            arg == "$queryOptions" ||                    //
-            arg == "$readPreference" ||                  //
-            arg == "$replData" ||                        //
-            arg == "$clusterTime" ||                     //
-            arg == "maxTimeMS" ||                        //
-            arg == "readConcern" ||                      //
-            arg == "databaseVersion" ||                  //
-            arg == "shardVersion" ||                     //
-            arg == "tracking_info" ||                    //
-            arg == "writeConcern" ||                     //
-            arg == "lsid" ||                             //
-            arg == "txnNumber" ||                        //
-            arg == "autocommit" ||                       //
-            arg == "startTransaction" ||                 //
-            false;  // These comments tell clang-format to keep this line-oriented.
-    }
-
-    /**
      * Rewrites cmdObj into a format safe to blindly forward to shards.
      *
      * This performs 2 transformations:
@@ -243,6 +216,18 @@ struct CommandHelpers {
     static Status canUseTransactions(StringData dbName, StringData cmdName);
 
     static constexpr StringData kHelpFieldName = "help"_sd;
+
+    /**
+     * Checks if the command passed in is in the list of failCommands defined in the fail point.
+     */
+    static bool shouldActivateFailCommandFailPoint(const BSONObj& data,
+                                                   StringData cmdName,
+                                                   Client* client);
+
+    /**
+     * Possibly uasserts according to the "failCommand" fail point.
+     */
+    static void evaluateFailCommandFailPoint(OperationContext* opCtx, StringData commandName);
 };
 
 /**
@@ -287,14 +272,6 @@ public:
     }
 
     /**
-     * Return true for "user management commands", a distinction that affects
-     * backward compatible output formatting.
-     */
-    virtual bool isUserManagementCommand() const {
-        return false;
-    }
-
-    /**
      * Return true if only the admin ns has privileges to run this command.
      */
     virtual bool adminOnly() const {
@@ -331,7 +308,7 @@ public:
 
     /**
      * Return true if the command requires auth.
-    */
+     */
     virtual bool requiresAuth() const {
         return true;
     }
@@ -420,6 +397,16 @@ public:
                                      rpc::ReplyBuilderInterface* replyBuilder,
                                      const Command& command);
 
+    /**
+     * If true, the logical sessions attached to the command request will be attached to the
+     * request's operation context. Note that returning false can potentially strip the logical
+     * session from the request in multi-staged invocations, like for example, mongos -> mongod.
+     * This can have security implications so think carefully before returning false.
+     */
+    virtual bool attachLogicalSessionsToOpCtx() const {
+        return true;
+    }
+
 private:
     // The full name of the command
     const std::string _name;
@@ -495,6 +482,19 @@ public:
      */
     virtual bool allowsAfterClusterTime() const {
         return true;
+    }
+
+    /**
+     * Returns true if this command invocation is allowed to utilize "speculative" majority reads to
+     * service 'majority' read concern requests. This allows a query to satisfy a 'majority' read
+     * without storage engine support for reading from a historical snapshot.
+     *
+     * Note: This feature is currently only limited to a very small subset of commands (related to
+     * change streams), and is not intended to be generally used, which is why it is disabled by
+     * default.
+     */
+    virtual bool allowsSpeculativeMajorityReads() const {
+        return false;
     }
 
     /**

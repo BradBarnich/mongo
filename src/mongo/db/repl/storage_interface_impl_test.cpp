@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,10 +39,12 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
@@ -126,23 +130,21 @@ void createCollection(OperationContext* opCtx,
 }
 
 /**
- * Create an index on the given collection. Returns the number of indexes that exist on the
+ * Create an index on an empty collection. Returns the number of indexes that exist on the
  * collection after the given index is created.
  */
-int createIndexForColl(OperationContext* opCtx, NamespaceString nss, BSONObj indexSpec) {
+int _createIndexOnEmptyCollection(OperationContext* opCtx, NamespaceString nss, BSONObj indexSpec) {
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
     AutoGetCollection autoColl(opCtx, nss, MODE_X);
     auto coll = autoColl.getCollection();
 
-    MultiIndexBlock indexer(opCtx, coll);
-    ASSERT_OK(indexer.init(indexSpec).getStatus());
-
-    WriteUnitOfWork wunit(opCtx);
-    indexer.commit();
-    wunit.commit();
-
     auto indexCatalog = coll->getIndexCatalog();
     ASSERT(indexCatalog);
+
+    WriteUnitOfWork wunit(opCtx);
+    ASSERT_OK(indexCatalog->createIndexOnEmptyCollection(opCtx, indexSpec).getStatus());
+    wunit.commit();
+
     return indexCatalog->numIndexesReady(opCtx);
 }
 
@@ -151,7 +153,6 @@ int createIndexForColl(OperationContext* opCtx, NamespaceString nss, BSONObj ind
  */
 TimestampedBSONObj makeOplogEntry(OpTime opTime) {
     BSONObjBuilder bob(opTime.toBSON());
-    bob.append("h", 1LL);
     bob.append("op", "c");
     bob.append("ns", "test.t");
     return {bob.obj(), opTime.getTimestamp()};
@@ -160,8 +161,8 @@ TimestampedBSONObj makeOplogEntry(OpTime opTime) {
 /**
  * Counts the number of keys in an index using an IndexAccessMethod::validate call.
  */
-int64_t getIndexKeyCount(OperationContext* opCtx, IndexCatalog* cat, IndexDescriptor* desc) {
-    auto idx = cat->getIndex(desc);
+int64_t getIndexKeyCount(OperationContext* opCtx, IndexCatalog* cat, const IndexDescriptor* desc) {
+    auto idx = cat->getEntry(desc)->accessMethod();
     int64_t numKeys;
     ValidateResults fullRes;
     idx->validate(opCtx, &numKeys, &fullRes);
@@ -2684,7 +2685,7 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeySucceeds) {
     auto indexSpec =
         BSON("name" << indexName << "ns" << nss.ns() << "key" << BSON("a.b" << 1) << "v"
                     << static_cast<int>(kIndexVersion));
-    ASSERT_EQUALS(createIndexForColl(opCtx, nss, indexSpec), 2);
+    ASSERT_EQUALS(_createIndexOnEmptyCollection(opCtx, nss, indexSpec), 2);
 
     MultikeyPaths paths = {{1}};
     ASSERT_OK(storage.setIndexIsMultikey(opCtx, nss, indexName, paths, Timestamp(3, 3)));

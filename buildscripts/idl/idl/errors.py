@@ -1,16 +1,29 @@
-# Copyright (C) 2017 MongoDB Inc.
+# Copyright (C) 2018-present MongoDB, Inc.
 #
-# This program is free software: you can redistribute it and/or  modify
-# it under the terms of the GNU Affero General Public License, version 3,
-# as published by the Free Software Foundation.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# Server Side Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 #
 """
 Common error handling code for IDL compiler.
@@ -86,6 +99,18 @@ ERROR_ID_IS_NODE_VALID_NON_NEGATIVE_INT = "ID0050"
 ERROR_ID_IS_DUPLICATE_COMPARISON_ORDER = "ID0051"
 ERROR_ID_IS_COMMAND_TYPE_EXTRANEOUS = "ID0052"
 ERROR_ID_VALUE_NOT_NUMERIC = "ID0053"
+ERROR_ID_BAD_SETAT_SPECIFIER = "ID0057"
+ERROR_ID_BAD_SOURCE_SPECIFIER = "ID0058"
+ERROR_ID_BAD_DUPLICATE_BEHAVIOR_SPECIFIER = "ID0059"
+ERROR_ID_BAD_NUMERIC_RANGE = "ID0060"
+ERROR_ID_MISSING_SHORTNAME_FOR_POSITIONAL = "ID0061"
+ERROR_ID_INVALID_SHORT_NAME = "ID0062"
+ERROR_ID_INVALID_SINGLE_NAME = "ID0063"
+ERROR_ID_MISSING_SHORT_NAME_WITH_SINGLE_NAME = "ID0064"
+ERROR_ID_IS_NODE_TYPE_SCALAR_OR_MAPPING = "ID0065"
+ERROR_ID_SERVER_PARAMETER_INVALID_ATTR = "ID0066"
+ERROR_ID_SERVER_PARAMETER_REQUIRED_ATTR = "ID0067"
+ERROR_ID_SERVER_PARAMETER_INVALID_METHOD_OVERRIDE = "ID0068"
 
 
 class IDLError(Exception):
@@ -158,9 +183,10 @@ class ParserErrorCollection(object):
     def dump_errors(self):
         # type: () -> None
         """Print the list of errors."""
-        ', '.join(self.to_list())
+        print("Errors found while compiling IDL")
         for error_msg in self.to_list():
             print("%s\n\n" % error_msg)
+        print("Found %s errors" % (len(self.to_list())))
 
     def count(self):
         # type: () -> int
@@ -280,6 +306,19 @@ class ParserContext(object):
 
         return True
 
+    def is_scalar_or_mapping_node(self, node, node_name):
+        # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode], unicode) -> bool
+        # pylint: disable=invalid-name
+        """Return True if the YAML node is a Scalar or Mapping."""
+        if not node.id == "scalar" and not node.id == "mapping":
+            self._add_node_error(
+                node, ERROR_ID_IS_NODE_TYPE_SCALAR_OR_MAPPING,
+                "Illegal node type '%s' for '%s', expected either node type 'scalar' or 'mapping'" %
+                (node.id, node_name))
+            return False
+
+        return True
+
     def is_scalar_bool_node(self, node, node_name):
         # type: (Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode], unicode) -> bool
         """Return True if this YAML node is a Scalar and a valid boolean."""
@@ -377,6 +416,14 @@ class ParserContext(object):
         self._add_error(location, ERROR_ID_BAD_BSON_BINDATA_SUBTYPE_VALUE,
                         ("The bindata_subtype field's value '%s' for %s '%s' is not valid") %
                         (value, ast_type, ast_parent))
+
+    def add_bad_setat_specifier(self, location, specifier):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about a bad set_at specifier."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_BAD_SETAT_SPECIFIER,
+                        ("Unexpected set_at specifier: '%s', expected 'startup' or 'runtime'") %
+                        (specifier))
 
     def add_no_string_data_error(self, location, ast_type, ast_parent):
         # type: (common.SourceLocation, unicode, unicode) -> None
@@ -673,6 +720,79 @@ class ParserContext(object):
         self._add_error(location, ERROR_ID_VALUE_NOT_NUMERIC,
                         ("'%s' requires a numeric value, but %s can not be cast") % (attrname,
                                                                                      value))
+
+    def add_server_parameter_invalid_attr(self, location, attrname, conflicts):
+        # type: (common.SourceLocation, unicode, unicode) -> None
+        """Add an error about invalid fields in a server parameter definition."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_SERVER_PARAMETER_INVALID_ATTR,
+                        ("'%s' attribute not permitted with '%s' server parameter") % (attrname,
+                                                                                       conflicts))
+
+    def add_server_parameter_required_attr(self, location, attrname, required, dependant=None):
+        # type: (common.SourceLocation, unicode, unicode, unicode) -> None
+        """Add an error about missing fields in a server parameter definition."""
+        # pylint: disable=invalid-name
+        qualifier = '' if dependant is None else (" when using '%s' attribute" % (dependant))
+        self._add_error(location, ERROR_ID_SERVER_PARAMETER_REQUIRED_ATTR,
+                        ("'%s' attribute required%s with '%s' server parameter") %
+                        (attrname, qualifier, required))
+
+    def add_server_parameter_invalid_method_override(self, location, method):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about invalid method override in SCP method override."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_SERVER_PARAMETER_INVALID_METHOD_OVERRIDE,
+                        ("No such method to override in server parameter class: '%s'") % (method))
+
+    def add_bad_source_specifier(self, location, value):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about invalid source specifier."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_BAD_SOURCE_SPECIFIER,
+                        ("'%s' is not a valid source specifier") % (value))
+
+    def add_bad_duplicate_behavior(self, location, value):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about invalid duplicate behavior specifier."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_BAD_DUPLICATE_BEHAVIOR_SPECIFIER,
+                        ("'%s' is not a valid duplicate behavior specifier") % (value))
+
+    def add_bad_numeric_range(self, location, attrname, value):
+        # type: (common.SourceLocation, unicode, unicode) -> None
+        """Add an error about invalid range specifier."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_BAD_NUMERIC_RANGE,
+                        ("'%s' is not a valid numeric range for '%s'") % (value, attrname))
+
+    def add_missing_shortname_for_positional_arg(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about required short_name for positional args."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_MISSING_SHORTNAME_FOR_POSITIONAL,
+                        "Missing 'short_name' for positional arg")
+
+    def add_invalid_short_name(self, location, name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about invalid short names."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_INVALID_SHORT_NAME,
+                        ("Invalid 'short_name' value '%s'") % (name))
+
+    def add_invalid_single_name(self, location, name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about invalid single names."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_INVALID_SINGLE_NAME,
+                        ("Invalid 'single_name' value '%s'") % (name))
+
+    def add_missing_short_name_with_single_name(self, location, name):
+        # type: (common.SourceLocation, unicode) -> None
+        """Add an error about missing required short name when using single name."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_MISSING_SHORT_NAME_WITH_SINGLE_NAME,
+                        ("Missing 'short_name' required with 'single_name' value '%s'") % (name))
 
 
 def _assert_unique_error_messages():

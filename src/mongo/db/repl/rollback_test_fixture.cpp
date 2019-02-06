@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,6 +38,8 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/op_observer_noop.h"
+#include "mongo/db/op_observer_registry.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -43,10 +47,8 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/rs_rollback.h"
-#include "mongo/db/session_catalog.h"
 #include "mongo/logger/log_component.h"
 #include "mongo/logger/logger.h"
-
 #include "mongo/stdx/memory.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -64,6 +66,24 @@ ReplSettings createReplSettings() {
     settings.setReplSetString("mySet/node1:12345");
     return settings;
 }
+
+class RollbackTestOpObserver : public OpObserverNoop {
+public:
+    repl::OpTime onDropCollection(OperationContext* opCtx,
+                                  const NamespaceString& collectionName,
+                                  OptionalCollectionUUID uuid,
+                                  std::uint64_t numRecords,
+                                  const CollectionDropType dropType) override {
+        // If the oplog is not disabled for this namespace, then we need to reserve an op time for
+        // the drop.
+        if (!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, collectionName)) {
+            OpObserver::Times::get(opCtx).reservedOpTimes.push_back(dropOpTime);
+        }
+        return {};
+    }
+
+    const repl::OpTime dropOpTime = {Timestamp(Seconds(100), 1U), 1LL};
+};
 
 }  // namespace
 
@@ -92,6 +112,9 @@ void RollbackTest::setUp() {
     // Increase rollback log component verbosity for unit tests.
     mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
         logger::LogComponent::kReplicationRollback, logger::LogSeverity::Debug(2));
+
+    auto observerRegistry = checked_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
+    observerRegistry->addObserver(std::make_unique<RollbackTestOpObserver>());
 }
 
 RollbackTest::ReplicationCoordinatorRollbackMock::ReplicationCoordinatorRollbackMock(
@@ -115,6 +138,11 @@ Status RollbackTest::ReplicationCoordinatorRollbackMock::setFollowerMode(
     return ReplicationCoordinatorMock::setFollowerMode(newState);
 }
 
+Status RollbackTest::ReplicationCoordinatorRollbackMock::setFollowerModeStrict(
+    OperationContext* opCtx, const MemberState& newState) {
+    return setFollowerMode(newState);
+}
+
 std::pair<BSONObj, RecordId> RollbackTest::makeCRUDOp(OpTypeEnum opType,
                                                       Timestamp ts,
                                                       UUID uuid,
@@ -126,7 +154,6 @@ std::pair<BSONObj, RecordId> RollbackTest::makeCRUDOp(OpTypeEnum opType,
 
     BSONObjBuilder bob;
     bob.append("ts", ts);
-    bob.append("h", 1LL);
     bob.append("op", OpType_serializer(opType));
     uuid.appendToBuilder(&bob, "ui");
     bob.append("ns", nss);
@@ -139,18 +166,24 @@ std::pair<BSONObj, RecordId> RollbackTest::makeCRUDOp(OpTypeEnum opType,
 }
 
 
-std::pair<BSONObj, RecordId> RollbackTest::makeCommandOp(
-    Timestamp ts, OptionalCollectionUUID uuid, StringData nss, BSONObj cmdObj, int recordId) {
+std::pair<BSONObj, RecordId> RollbackTest::makeCommandOp(Timestamp ts,
+                                                         OptionalCollectionUUID uuid,
+                                                         StringData nss,
+                                                         BSONObj cmdObj,
+                                                         int recordId,
+                                                         boost::optional<BSONObj> o2) {
 
     BSONObjBuilder bob;
     bob.append("ts", ts);
-    bob.append("h", 1LL);
     bob.append("op", "c");
     if (uuid) {  // Not all ops have UUID fields.
         uuid.get().appendToBuilder(&bob, "ui");
     }
     bob.append("ns", nss);
     bob.append("o", cmdObj);
+    if (o2) {
+        bob.append("o2", *o2);
+    }
 
     return std::make_pair(bob.obj(), RecordId(recordId));
 }
@@ -160,7 +193,8 @@ Collection* RollbackTest::_createCollection(OperationContext* opCtx,
                                             const CollectionOptions& options) {
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
     mongo::WriteUnitOfWork wuow(opCtx);
-    auto db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, nss.db());
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->openDb(opCtx, nss.db());
     ASSERT_TRUE(db);
     db->dropCollection(opCtx, nss.ns()).transitional_ignore();
     auto coll = db->createCollection(opCtx, nss.ns(), options);
@@ -260,7 +294,7 @@ void RollbackResyncsCollectionOptionsTest::resyncCollectionOptionsTest(
     auto coll = _createCollection(_opCtx.get(), nss.toString(), localCollOptions);
 
     auto commonOpUuid = unittest::assertGet(UUID::parse("f005ba11-cafe-bead-f00d-123456789abc"));
-    auto commonOpBson = BSON("ts" << Timestamp(1, 1) << "h" << 1LL << "t" << 1LL << "op"
+    auto commonOpBson = BSON("ts" << Timestamp(1, 1) << "t" << 1LL << "op"
                                   << "n"
                                   << "o"
                                   << BSONObj()

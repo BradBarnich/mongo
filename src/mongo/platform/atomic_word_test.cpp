@@ -1,28 +1,31 @@
-/*    Copyright 2012 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -62,11 +65,23 @@ void testAtomicWordBasicOperations() {
     ASSERT_EQUALS(WordType(0), w.load());
 }
 
-TEST(AtomicWordTests, BasicOperationsUnsigned32Bit) {
-    typedef AtomicUInt32::WordType WordType;
-    testAtomicWordBasicOperations<AtomicUInt32>();
+enum TestEnum { E0, E1, E2, E3 };
 
-    AtomicUInt32 w(0xdeadbeef);
+TEST(AtomicWordTests, BasicOperationsEnum) {
+    MONGO_STATIC_ASSERT(sizeof(AtomicWord<TestEnum>) == sizeof(TestEnum));
+    AtomicWord<TestEnum> w;
+    ASSERT_EQUALS(E0, w.load());
+    ASSERT_EQUALS(E0, w.compareAndSwap(E0, E1));
+    ASSERT_EQUALS(E1, w.load());
+    ASSERT_EQUALS(E1, w.compareAndSwap(E0, E2));
+    ASSERT_EQUALS(E1, w.load());
+}
+
+TEST(AtomicWordTests, BasicOperationsUnsigned32Bit) {
+    typedef unsigned WordType;
+    testAtomicWordBasicOperations<AtomicWord<unsigned>>();
+
+    AtomicWord<unsigned> w(0xdeadbeef);
     ASSERT_EQUALS(WordType(0xdeadbeef), w.compareAndSwap(0, 1));
     ASSERT_EQUALS(WordType(0xdeadbeef), w.compareAndSwap(0xdeadbeef, 0xcafe1234));
     ASSERT_EQUALS(WordType(0xcafe1234), w.fetchAndAdd(0xf000));
@@ -75,10 +90,10 @@ TEST(AtomicWordTests, BasicOperationsUnsigned32Bit) {
 }
 
 TEST(AtomicWordTests, BasicOperationsUnsigned64Bit) {
-    typedef AtomicUInt64::WordType WordType;
-    testAtomicWordBasicOperations<AtomicUInt64>();
+    typedef unsigned long long WordType;
+    testAtomicWordBasicOperations<AtomicWord<unsigned long long>>();
 
-    AtomicUInt64 w(0xdeadbeefcafe1234ULL);
+    AtomicWord<unsigned long long> w(0xdeadbeefcafe1234ULL);
     ASSERT_EQUALS(WordType(0xdeadbeefcafe1234ULL), w.compareAndSwap(0, 1));
     ASSERT_EQUALS(WordType(0xdeadbeefcafe1234ULL),
                   w.compareAndSwap(0xdeadbeefcafe1234ULL, 0xfedcba9876543210ULL));
@@ -88,10 +103,10 @@ TEST(AtomicWordTests, BasicOperationsUnsigned64Bit) {
 }
 
 TEST(AtomicWordTests, BasicOperationsSigned32Bit) {
-    typedef AtomicInt32::WordType WordType;
-    testAtomicWordBasicOperations<AtomicInt32>();
+    typedef int WordType;
+    testAtomicWordBasicOperations<AtomicWord<int>>();
 
-    AtomicInt32 w(0xdeadbeef);
+    AtomicWord<int> w(0xdeadbeef);
     ASSERT_EQUALS(WordType(0xdeadbeef), w.compareAndSwap(0, 1));
     ASSERT_EQUALS(WordType(0xdeadbeef), w.compareAndSwap(0xdeadbeef, 0xcafe1234));
     ASSERT_EQUALS(WordType(0xcafe1234), w.fetchAndAdd(0xf000));
@@ -100,10 +115,10 @@ TEST(AtomicWordTests, BasicOperationsSigned32Bit) {
 }
 
 TEST(AtomicWordTests, BasicOperationsSigned64Bit) {
-    typedef AtomicInt64::WordType WordType;
-    testAtomicWordBasicOperations<AtomicInt64>();
+    typedef long long WordType;
+    testAtomicWordBasicOperations<AtomicWord<long long>>();
 
-    AtomicInt64 w(0xdeadbeefcafe1234ULL);
+    AtomicWord<long long> w(0xdeadbeefcafe1234ULL);
     ASSERT_EQUALS(WordType(0xdeadbeefcafe1234LL), w.compareAndSwap(0, 1));
     ASSERT_EQUALS(WordType(0xdeadbeefcafe1234LL),
                   w.compareAndSwap(0xdeadbeefcafe1234LL, 0xfedcba9876543210LL));
@@ -156,32 +171,6 @@ struct Chars {
 
 std::ostream& operator<<(std::ostream& os, const Chars& chars) {
     return (os << chars._storage.data());
-}
-
-TEST(AtomicWordTests, BasicOperationsComplex) {
-    using WordType = Chars;
-
-    AtomicWord<WordType> checkZero(AtomicWord<WordType>::ZeroInitTag{});
-    ASSERT_EQUALS(WordType(""), checkZero.load());
-
-    AtomicWord<WordType> w;
-
-    ASSERT_EQUALS(WordType(), w.load());
-
-    w.store("b");
-    ASSERT_EQUALS(WordType("b"), w.load());
-
-    ASSERT_EQUALS(WordType("b"), w.swap("c"));
-    ASSERT_EQUALS(WordType("c"), w.load());
-
-    ASSERT_EQUALS(WordType("c"), w.compareAndSwap("a", "b"));
-    ASSERT_EQUALS(WordType("c"), w.load());
-    ASSERT_EQUALS(WordType("c"), w.compareAndSwap("c", "b"));
-    ASSERT_EQUALS(WordType("b"), w.load());
-
-    w.store("foo");
-    ASSERT_EQUALS(WordType("foo"), w.compareAndSwap("foo", "bar"));
-    ASSERT_EQUALS(WordType("bar"), w.load());
 }
 
 template <typename T>

@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -32,6 +34,7 @@
 
 #include "mongo/db/s/collection_sharding_state.h"
 
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/s/stale_exception.h"
@@ -70,8 +73,9 @@ public:
             stdx::lock_guard<stdx::mutex> lg(_mutex);
 
             for (auto& coll : _collections) {
-                ScopedCollectionMetadata metadata = coll.second->getMetadata(opCtx);
-                if (metadata->isSharded()) {
+                const auto optMetadata = coll.second->getCurrentMetadataIfKnown();
+                if (optMetadata) {
+                    const auto& metadata = *optMetadata;
                     versionB.appendTimestamp(coll.first, metadata->getShardVersion().toLong());
                 }
             }
@@ -107,6 +111,28 @@ private:
 
 const auto kUnshardedCollection = std::make_shared<UnshardedCollection>();
 
+ChunkVersion getOperationReceivedVersion(OperationContext* opCtx, const NamespaceString& nss) {
+    auto& oss = OperationShardingState::get(opCtx);
+
+    // If there is a version attached to the OperationContext, use it as the received version,
+    // otherwise get the received version from the ShardedConnectionInfo
+    if (oss.hasShardVersion()) {
+        return oss.getShardVersion(nss);
+    } else if (auto const info = ShardedConnectionInfo::get(opCtx->getClient(), false)) {
+        auto connectionShardVersion = info->getVersion(nss.ns());
+
+        // For backwards compatibility with map/reduce, which can access up to 2 sharded collections
+        // in a single call, the lack of version for a namespace on the collection must be treated
+        // as UNSHARDED
+        return connectionShardVersion.value_or(ChunkVersion::UNSHARDED());
+    } else {
+        // There is no shard version information on either 'opCtx' or 'client'. This means that the
+        // operation represented by 'opCtx' is unversioned, and the shard version is always OK for
+        // unversioned operations.
+        return ChunkVersion::IGNORED();
+    }
+}
+
 }  // namespace
 
 CollectionShardingState::CollectionShardingState(NamespaceString nss) : _nss(std::move(nss)) {}
@@ -125,37 +151,49 @@ void CollectionShardingState::report(OperationContext* opCtx, BSONObjBuilder* bu
     collectionsMap->report(opCtx, builder);
 }
 
-ScopedCollectionMetadata CollectionShardingState::getMetadata(OperationContext* opCtx) {
+ScopedCollectionMetadata CollectionShardingState::getMetadataForOperation(OperationContext* opCtx) {
+    const auto receivedShardVersion = getOperationReceivedVersion(opCtx, _nss);
+
+    if (ChunkVersion::isIgnoredVersion(receivedShardVersion)) {
+        return {kUnshardedCollection};
+    }
+
     const auto atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
     auto optMetadata = _getMetadata(atClusterTime);
+
     if (!optMetadata)
         return {kUnshardedCollection};
 
-    return std::move(*optMetadata);
+    return {std::move(*optMetadata)};
+}
+
+ScopedCollectionMetadata CollectionShardingState::getCurrentMetadata() {
+    auto optMetadata = _getMetadata(boost::none);
+
+    if (!optMetadata)
+        return {kUnshardedCollection};
+
+    return {std::move(*optMetadata)};
+}
+
+boost::optional<ScopedCollectionMetadata> CollectionShardingState::getCurrentMetadataIfKnown() {
+    return _getMetadata(boost::none);
+}
+
+boost::optional<ChunkVersion> CollectionShardingState::getCurrentShardVersionIfKnown() {
+    const auto optMetadata = _getMetadata(boost::none);
+    if (!optMetadata)
+        return boost::none;
+
+    const auto& metadata = *optMetadata;
+    if (!metadata->isSharded())
+        return ChunkVersion::UNSHARDED();
+
+    return metadata->getCollVersion();
 }
 
 void CollectionShardingState::checkShardVersionOrThrow(OperationContext* opCtx) {
-    auto& oss = OperationShardingState::get(opCtx);
-
-    const auto receivedShardVersion = [&] {
-        // If there is a version attached to the OperationContext, use it as the received version,
-        // otherwise get the received version from the ShardedConnectionInfo
-        if (oss.hasShardVersion()) {
-            return oss.getShardVersion(_nss);
-        } else if (auto const info = ShardedConnectionInfo::get(opCtx->getClient(), false)) {
-            auto connectionShardVersion = info->getVersion(_nss.ns());
-
-            // For backwards compatibility with map/reduce, which can access up to 2 sharded
-            // collections in a single call, the lack of version for a namespace on the collection
-            // must be treated as UNSHARDED
-            return connectionShardVersion.value_or(ChunkVersion::UNSHARDED());
-        } else {
-            // There is no shard version information on either 'opCtx' or 'client'. This means that
-            // the operation represented by 'opCtx' is unversioned, and the shard version is always
-            // OK for unversioned operations.
-            return ChunkVersion::IGNORED();
-        }
-    }();
+    const auto receivedShardVersion = getOperationReceivedVersion(opCtx, _nss);
 
     if (ChunkVersion::isIgnoredVersion(receivedShardVersion)) {
         return;
@@ -165,8 +203,7 @@ void CollectionShardingState::checkShardVersionOrThrow(OperationContext* opCtx) 
     invariant(repl::ReadConcernArgs::get(opCtx).getLevel() !=
               repl::ReadConcernLevel::kAvailableReadConcern);
 
-    // Set this for error messaging purposes before potentially returning false.
-    auto metadata = getMetadata(opCtx);
+    const auto metadata = getMetadataForOperation(opCtx);
     const auto wantedShardVersion =
         metadata->isSharded() ? metadata->getShardVersion() : ChunkVersion::UNSHARDED();
 
@@ -176,6 +213,7 @@ void CollectionShardingState::checkShardVersionOrThrow(OperationContext* opCtx) 
     if (criticalSectionSignal) {
         // Set migration critical section on operation sharding state: operation will wait for the
         // migration to finish before returning failure and retrying.
+        auto& oss = OperationShardingState::get(opCtx);
         oss.setMigrationCriticalSectionSignal(criticalSectionSignal);
 
         uasserted(StaleConfigInfo(_nss, receivedShardVersion, wantedShardVersion),

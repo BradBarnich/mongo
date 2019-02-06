@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
@@ -127,8 +129,6 @@ StageConstraints DocumentSourceChangeStreamTransform::constraints(
                                  TransactionRequirement::kNotAllowed,
                                  ChangeStreamRequirement::kChangeStreamStage);
 
-    constraints.canSwapWithMatch = true;
-    constraints.canSwapWithLimit = true;
     // This transformation could be part of a 'collectionless' change stream on an entire
     // database or cluster, mark as independent of any collection if so.
     constraints.isIndependentOfAnyCollection = _isIndependentOfAnyCollection;
@@ -229,8 +229,9 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
         // unsharded when the entry was last populated.
         auto it = _documentKeyCache.find(uuid.getUuid());
         if (it == _documentKeyCache.end() || !it->second.isFinal) {
-            auto docKeyFields = pExpCtx->mongoProcessInterface->collectDocumentKeyFields(
-                pExpCtx->opCtx, NamespaceStringOrUUID(nss.db().toString(), uuid.getUuid()));
+            auto docKeyFields =
+                pExpCtx->mongoProcessInterface->collectDocumentKeyFieldsForHostedCollection(
+                    pExpCtx->opCtx, nss, uuid.getUuid());
             if (it == _documentKeyCache.end() || docKeyFields.second) {
                 _documentKeyCache[uuid.getUuid()] = DocumentKeyCacheEntry(docKeyFields);
             }
@@ -350,7 +351,8 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
 
     // Note that 'documentKey' and/or 'uuid' might be missing, in which case they will not appear
     // in the output.
-    ResumeTokenData resumeTokenData = getResumeToken(ts, uuid, documentKey);
+    auto resumeTokenData = getResumeToken(ts, uuid, documentKey);
+    auto resumeToken = ResumeToken(resumeTokenData).toDocument();
 
     // Add some additional fields only relevant to transactions.
     if (_txnContext) {
@@ -359,15 +361,20 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
         doc.addField(DocumentSourceChangeStream::kLsidField, Value(_txnContext->lsid));
     }
 
-    doc.addField(DocumentSourceChangeStream::kIdField,
-                 Value(ResumeToken(resumeTokenData).toDocument()));
+    doc.addField(DocumentSourceChangeStream::kIdField, Value(resumeToken));
     doc.addField(DocumentSourceChangeStream::kOperationTypeField, Value(operationType));
     doc.addField(DocumentSourceChangeStream::kClusterTimeField, Value(resumeTokenData.clusterTime));
 
-    // If we're in a sharded environment, we'll need to merge the results by their sort key, so add
-    // that as metadata.
-    if (pExpCtx->needsMerge) {
+    // We set the resume token as the document's sort key in both the sharded and non-sharded cases,
+    // since we will subsequently rely upon it to generate a correct postBatchResumeToken.
+    // TODO SERVER-38539: when returning results for merging, we first check whether 'mergeByPBRT'
+    // has been set. If not, then the request was sent from an older mongoS which cannot merge by
+    // raw resume tokens, and we must use the old sort key format. This check, and the 'mergeByPBRT'
+    // flag, are no longer necessary in 4.4; all change streams will be merged by resume token.
+    if (pExpCtx->needsMerge && !pExpCtx->mergeByPBRT) {
         doc.setSortKeyMetaField(BSON("" << ts << "" << uuid << "" << documentKey));
+    } else {
+        doc.setSortKeyMetaField(resumeToken.toBson());
     }
 
     // "invalidate" and "newShardDetected" entries have fewer fields.
@@ -431,6 +438,11 @@ DocumentSource::GetModPathsReturn DocumentSourceChangeStreamTransform::getModifi
 
 DocumentSource::GetNextResult DocumentSourceChangeStreamTransform::getNext() {
     pExpCtx->checkForInterrupt();
+
+    uassert(50988,
+            "Illegal attempt to execute an internal change stream stage on mongos. A $changeStream "
+            "stage must be the first stage in a pipeline",
+            !pExpCtx->inMongos);
 
     // If we're unwinding an 'applyOps' from a transaction, check if there are any documents we have
     // stored that can be returned.

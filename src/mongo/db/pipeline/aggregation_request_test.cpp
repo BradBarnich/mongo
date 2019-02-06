@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -57,15 +59,16 @@ TEST(AggregationRequestTest, ShouldParseAllKnownOptions) {
     NamespaceString nss("a.collection");
     const BSONObj inputBson = fromjson(
         "{pipeline: [{$match: {a: 'abc'}}], explain: false, allowDiskUse: true, fromMongos: true, "
-        "needsMerge: true, bypassDocumentValidation: true, collation: {locale: 'en_US'}, cursor: "
-        "{batchSize: 10}, hint: {a: 1}, maxTimeMS: 100, readConcern: {level: 'linearizable'}, "
-        "$queryOptions: {$readPreference: 'nearest'}, comment: 'agg_comment', exchange: {policy: "
-        "'roundrobin', consumers:NumberInt(2)}}");
+        "needsMerge: true, mergeByPBRT: true, bypassDocumentValidation: true, collation: {locale: "
+        "'en_US'}, cursor: {batchSize: 10}, hint: {a: 1}, maxTimeMS: 100, readConcern: {level: "
+        "'linearizable'}, $queryOptions: {$readPreference: 'nearest'}, comment: 'agg_comment', "
+        "exchange: {policy: 'roundrobin', consumers:NumberInt(2)}}");
     auto request = unittest::assertGet(AggregationRequest::parseFromBSON(nss, inputBson));
     ASSERT_FALSE(request.getExplain());
     ASSERT_TRUE(request.shouldAllowDiskUse());
     ASSERT_TRUE(request.isFromMongos());
     ASSERT_TRUE(request.needsMerge());
+    ASSERT_TRUE(request.mergeByPBRT());
     ASSERT_TRUE(request.shouldBypassDocumentValidation());
     ASSERT_EQ(request.getBatchSize(), 10);
     ASSERT_BSONOBJ_EQ(request.getHint(), BSON("a" << 1));
@@ -153,6 +156,7 @@ TEST(AggregationRequestTest, ShouldNotSerializeOptionalValuesIfEquivalentToDefau
     request.setAllowDiskUse(false);
     request.setFromMongos(false);
     request.setNeedsMerge(false);
+    request.setMergeByPBRT(false);
     request.setBypassDocumentValidation(false);
     request.setCollation(BSONObj());
     request.setHint(BSONObj());
@@ -174,6 +178,7 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
     request.setAllowDiskUse(true);
     request.setFromMongos(true);
     request.setNeedsMerge(true);
+    request.setMergeByPBRT(true);
     request.setBypassDocumentValidation(true);
     request.setBatchSize(10);
     request.setMaxTimeMS(10u);
@@ -197,6 +202,7 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
                  {AggregationRequest::kAllowDiskUseName, true},
                  {AggregationRequest::kFromMongosName, true},
                  {AggregationRequest::kNeedsMergeName, true},
+                 {AggregationRequest::kMergeByPBRTName, true},
                  {bypassDocumentValidationCommandOption(), true},
                  {AggregationRequest::kCollationName, collationObj},
                  {AggregationRequest::kCursorName,
@@ -375,6 +381,13 @@ TEST(AggregationRequestTest, ShouldRejectFromMongosIfNeedsMerge34AlsoPresent) {
     ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
 }
 
+TEST(AggregationRequestTest, ShouldRejectNonBoolMergeByPBRT) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson(
+        "{pipeline: [{$match: {a: 'abc'}}], cursor: {}, mergeByPBRT: 1, fromMongos: true}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
 TEST(AggregationRequestTest, ShouldRejectNonBoolAllowDiskUse) {
     NamespaceString nss("a.collection");
     const BSONObj inputBson =
@@ -494,6 +507,12 @@ TEST(AggregationRequestTest, ShouldRejectExchangeInvalidSpec) {
     ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
 }
 
+TEST(AggregationRequestTest, ShouldRejectInvalidWriteConcern) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson =
+        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, writeConcern: 'invalid'}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
 //
 // Ignore fields parsed elsewhere.
 //
@@ -502,13 +521,6 @@ TEST(AggregationRequestTest, ShouldIgnoreQueryOptions) {
     NamespaceString nss("a.collection");
     const BSONObj inputBson =
         fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, $queryOptions: {}}");
-    ASSERT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
-}
-
-TEST(AggregationRequestTest, ShouldIgnoreWriteConcernOption) {
-    NamespaceString nss("a.collection");
-    const BSONObj inputBson =
-        fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, writeConcern: 'invalid'}");
     ASSERT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
 }
 

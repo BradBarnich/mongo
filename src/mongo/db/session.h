@@ -1,23 +1,25 @@
-/*
- *    Copyright (C) 2017 MongoDB, Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,11 +32,11 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
 
 namespace mongo {
-
-class OperationContext;
 
 /**
  * A decorable container for state associated with an active session running on a MongoD or MongoS
@@ -43,8 +45,11 @@ class OperationContext;
 class Session : public Decorable<Session> {
     MONGO_DISALLOW_COPYING(Session);
 
+    friend class ObservableSession;
+    friend class SessionCatalog;
+
 public:
-    explicit Session(LogicalSessionId sessionId);
+    explicit Session(LogicalSessionId sessionId) : _sessionId(std::move(sessionId)) {}
 
     /**
      * The logical session id that this object represents.
@@ -53,32 +58,24 @@ public:
         return _sessionId;
     }
 
-    /**
-     * Sets the current operation running on this Session.
-     */
-    void setCurrentOperation(OperationContext* currentOperation);
-
-    /**
-     * Clears the current operation running on this Session.
-     */
-    void clearCurrentOperation();
-
-    /**
-     * Returns a pointer to the current operation running on this Session, or nullptr if there is no
-     * operation currently running on this Session.
-     */
-    OperationContext* getCurrentOperation() const;
+    OperationContext* currentOperation_forTest() const {
+        return _checkoutOpCtx;
+    }
 
 private:
     // The id of the session with which this object is associated
     const LogicalSessionId _sessionId;
 
-    // Protects the member variables below.
-    mutable stdx::mutex _mutex;
-
     // A pointer back to the currently running operation on this Session, or nullptr if there
     // is no operation currently running for the Session.
-    OperationContext* _currentOperation{nullptr};
+    //
+    // May be read by holders of the SessionCatalog mutex. May only be set when clear or cleared
+    // when set, and the opCtx being set or cleared must have its client locked at the time.
+    OperationContext* _checkoutOpCtx{nullptr};
+
+    // Counter indicating the number of times ObservableSession::kill has been called on this
+    // session, which have not yet had a corresponding call to checkOutSessionForKill.
+    int _killsRequested{0};
 };
 
 }  // namespace mongo

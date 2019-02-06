@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-2019 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -193,13 +193,13 @@ create_data(TABLE_INFO *t)
 static void
 corrupt_metadata(void)
 {
-	FILE *fp;
 	struct stat sb;
-	long off;
+	FILE *fp;
 	size_t meta_size;
-	bool corrupted;
+	long off;
 	uint8_t *buf, *corrupt;
 	char path[256];
+	bool corrupted;
 
 	/*
 	 * Open the file, read its contents. Find the string "corrupt" and
@@ -271,7 +271,7 @@ verify_metadata(WT_CONNECTION *conn, TABLE_INFO *tables)
 {
 	TABLE_INFO *t;
 	WT_CURSOR *cursor;
-	int ret;
+	WT_DECL_RET;
 	const char *kv;
 
 	/*
@@ -425,16 +425,9 @@ static void
 wt_open_corrupt(const char *sfx)
 {
 	WT_CONNECTION *conn;
-	int ret;
+	WT_DECL_RET;
 	char buf[1024];
 
-#ifdef HAVE_ATTACH
-	WT_UNUSED(buf);
-	WT_UNUSED(conn);
-	WT_UNUSED(ret);
-	WT_UNUSED(sfx);
-#else
-	conn = NULL;
 	if (sfx != NULL)
 		testutil_check(__wt_snprintf(buf, sizeof(buf),
 		    "%s.%s", home, sfx));
@@ -450,7 +443,6 @@ wt_open_corrupt(const char *sfx)
 		fprintf(stderr,
 		    "OPEN_CORRUPT: wiredtiger_open returned %d\n", ret);
 	testutil_assert(ret == WT_TRY_SALVAGE || ret == 0);
-#endif
 	exit (EXIT_SUCCESS);
 }
 
@@ -545,7 +537,7 @@ run_all_verification(const char *sfx, TABLE_INFO *t)
 static void
 setup_database(const char *src, const char *turtle_dir, const char *meta_dir)
 {
-	int ret;
+	WT_DECL_RET;
 	char buf[1024];
 
 	/*
@@ -685,7 +677,7 @@ main(int argc, char *argv[])
 	};
 	TABLE_INFO *t;
 	TEST_OPTS *opts, _opts;
-	int ret;
+	WT_DECL_RET;
 	char buf[1024];
 
 	opts = &_opts;

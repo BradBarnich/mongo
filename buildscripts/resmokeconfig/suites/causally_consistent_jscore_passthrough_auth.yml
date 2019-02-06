@@ -105,7 +105,6 @@ selector:
   - jstests/core/drop3.js
   # Logical sessions require that only one user be authenticated,
   # but this suite puts us in a multi-auth state.
-  - jstests/core/list_all_local_cursors.js # Too many users authenticated
   - jstests/core/list_all_sessions.js # Too many users authenticated
   - jstests/core/list_sessions.js # Too many users authenticated
   # The following tests fail because of divergent dropCollection behavior between standalones and 
@@ -170,8 +169,8 @@ executor:
               assert.commandWorked(res);
           } else {
               // If 'username' already exists, then attempts to create a user with the same name
-              // will fail with a duplicate key error.
-              assert.commandFailedWithCode(res, ErrorCodes.DuplicateKey);
+              // will fail with error code 51003.
+              assert.commandFailedWithCode(res, 51003);
           }
 
           // Log out as the __system user and auth as the newly created user.
@@ -225,7 +224,6 @@ executor:
           replication:
             heartbeats: 2
           tracking: 0
-        numInitialSyncAttempts: 1
     num_rs_nodes_per_shard: 2
     # TODO SERVER-32572 remove voting_secondaries: true
     shard_options:

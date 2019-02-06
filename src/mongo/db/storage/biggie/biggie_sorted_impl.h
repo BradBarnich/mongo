@@ -1,25 +1,24 @@
-// biggie_sorted_impl.h
-
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,6 +38,7 @@ namespace biggie {
 class SortedDataBuilderInterface : public ::mongo::SortedDataBuilderInterface {
 public:
     SortedDataBuilderInterface(OperationContext* opCtx,
+                               bool unique,
                                bool dupsAllowed,
                                Ordering order,
                                const std::string& prefix,
@@ -51,6 +51,7 @@ public:
 
 private:
     OperationContext* _opCtx;
+    bool _unique;
     bool _dupsAllowed;
     // Order of the keys.
     Ordering _order;
@@ -74,6 +75,7 @@ public:
     // Truncate is not required at the time of writing but will be when the truncate command is
     // created
     Status truncate(OperationContext* opCtx);
+    SortedDataInterface(OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
     SortedDataInterface(const Ordering& ordering, bool isUnique, StringData ident);
     virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* opCtx,
                                                        bool dupsAllowed) override;
@@ -85,9 +87,7 @@ public:
                          const BSONObj& key,
                          const RecordId& loc,
                          bool dupsAllowed) override;
-    virtual Status dupKeyCheck(OperationContext* opCtx,
-                               const BSONObj& key,
-                               const RecordId& loc) override;
+    virtual Status dupKeyCheck(OperationContext* opCtx, const BSONObj& key) override;
     virtual void fullValidate(OperationContext* opCtx,
                               long long* numKeysOut,
                               ValidateResults* fullResults) const override;
@@ -171,6 +171,18 @@ public:
     };
 
 private:
+    /**
+     * Returns false only when the index is partial and the IndexKeyEntry's record id does not match
+     * the provided rid from the given key.
+     *
+     * Returns true in all other cases.
+     */
+    bool ifPartialCheckRecordIdEquals(OperationContext* opCtx,
+                                      const std::string key,
+                                      const RecordId rid) const;
+
+    bool keyExists(OperationContext* opCtx, const BSONObj& key);
+
     const Ordering _order;
     // These two are the same as before.
     std::string _prefix;
@@ -184,6 +196,8 @@ private:
     std::string _KSForIdentEnd;
     // This stores whether or not the end position is inclusive.
     bool _isUnique;
+    // Whether or not the index is partial
+    bool _isPartial;
 };
 }  // namespace biggie
 }  // namespace mongo

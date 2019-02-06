@@ -84,6 +84,8 @@ scratch
 /mongos
 /mongoshim
 /mongosniff
+/mongotrafficreader
+/wt
 
 *.tgz
 *.zip
@@ -94,6 +96,7 @@ scratch
 /libmongotestfiles.*
 /libmongoshellfiles.*
 /sharedclient
+/genny
 
 /emr.jar
 *.class
@@ -112,6 +115,7 @@ scratch
 /perftest
 /clientTest
 /httpClientTest
+/genny_results
 
 # benchrun files
 /benchrun_embedded
@@ -141,6 +145,8 @@ debian/mongodb
 .cproject
 .project
 .pydevproject
+.externalToolBuilders/
+.settings/
 
 # Idea CLion project artifacts
 .idea
@@ -149,8 +155,9 @@ CMakeLists.txt
 # XCode projects
 .xcworkspace
 
-# VSCode projects
+# Visual Studio and VSCode projects
 .vscode/
+.vs/
 
 # Windows MSI builder artifacts
 *.msi
@@ -166,3 +173,4 @@ src/mongo/embedded/java/jar/build/
 local.properties
 
 compile_commands.json
+generated_resmoke_config

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-2019 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -303,8 +303,7 @@ class test_txn19(wttest.WiredTigerTestCase, suite_subprocess):
         if expect_fail:
             self.check_file_contains_one_of(errfile,
                 ['/log file.*corrupted/',
-                'WT_ERROR: non-specific WiredTiger error',
-                '/No such file/'])
+                'WT_TRY_SALVAGE: database corruption detected'])
         else:
             self.check_empty_file(errfile)
             if self.expect_warning_corruption():

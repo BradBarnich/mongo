@@ -3,7 +3,7 @@
 /**
  * Runs findAndModify, update, delete, find, and getMore within a transaction.
  *
- * @tags: [uses_transactions]
+ * @tags: [uses_transactions, state_functions_share_transaction]
  */
 load('jstests/concurrency/fsm_workload_helpers/cleanup_txns.js');
 var $config = (function() {
@@ -26,43 +26,26 @@ var $config = (function() {
         // startTransaction, and essentially join the already running transaction.
         let joinAndRetry = false;
 
-        // startNewTxn is true if the transaction fails with TransactionTooOld or NoSuchTransaction.
-        // TransactionTooOld occurs when a transaction on this session with a higher txnNumber has
-        // started and NoSuchTransaction can occur if a transaction on this session with the same
-        // txnNumber was aborted. In this case, we will start a new transaction to bump the
-        // txnNumber and then re-run the command.
-        let startNewTxn = true;
-
         do {
             try {
-                if (startNewTxn) {
-                    // We pass `ignoreActiveTxn = true` to startTransaction so that we will not
-                    // throw `Transaction already in progress on this session` when trying to start
-                    // a new transaction on a session that already has a transaction running on it.
-                    // We instead will catch the error that the server later throws, and will re-run
-                    // the command with 'startTransaction = false' so that we join the already
-                    // running transaction.
-                    data.session.startTransaction_forTesting({readConcern: {level: 'snapshot'}},
-                                                             {ignoreActiveTxn: true});
-                    data.txnNumber++;
-                }
-                startNewTxn = false;
                 joinAndRetry = false;
 
                 func();
-
             } catch (e) {
                 if (e.code === ErrorCodes.TransactionTooOld ||
-                    e.code === ErrorCodes.NoSuchTransaction) {
-                    startNewTxn = true;
+                    e.code === ErrorCodes.NoSuchTransaction ||
+                    e.code === ErrorCodes.TransactionCommitted) {
+                    // We pass `ignoreActiveTxn = true` to startTransaction so that we will not
+                    // throw `Transaction already in progress on this session` when trying to start
+                    // a new transaction on this client session that already has an active
+                    // transaction on it. We instead will catch the ConflictingOperationInProgress
+                    // error that the server later throws, and will re-run the command with
+                    // 'startTransaction = false' so that we join the already running transaction.
+                    data.session.startTransaction_forTesting({readConcern: {level: 'snapshot'}},
+                                                             {ignoreActiveTxn: true});
+                    data.txnNumber++;
+                    joinAndRetry = true;
                     continue;
-                }
-
-                if (e.code === ErrorCodes.TransactionCommitted) {
-                    // If running in the same_session workload, it is possible another worker thread
-                    // has already committed this transaction, but a new one has not yet been
-                    // started.
-                    break;
                 }
 
                 if ((e.hasOwnProperty('errorLabels') &&
@@ -74,16 +57,18 @@ var $config = (function() {
 
                 throw e;
             }
-        } while (startNewTxn || joinAndRetry);
+        } while (joinAndRetry);
     }
 
     const states = {
 
         init: function init(db, collName) {
             this.session = db.getMongo().startSession({causalConsistency: true});
-            this.txnNumber = -1;
             this.sessionDb = this.session.getDatabase(db.getName());
             this.iteration = 1;
+
+            this.session.startTransaction_forTesting({readConcern: {level: 'snapshot'}});
+            this.txnNumber = 0;
         },
 
         runFindAndModify: function runFindAndModify(db, collName) {
@@ -149,6 +134,9 @@ var $config = (function() {
                     throw e;
                 }
             } while (shouldJoin);
+
+            this.session.startTransaction_forTesting({readConcern: {level: 'snapshot'}});
+            this.txnNumber++;
         },
     };
 
@@ -165,7 +153,7 @@ var $config = (function() {
         };
     }
 
-    function setup(db, collName) {
+    function setup(db, collName, cluster) {
         assertWhenOwnColl.commandWorked(db.runCommand({create: collName}));
         const bulk = db[collName].initializeUnorderedBulkOp();
 
@@ -176,6 +164,12 @@ var $config = (function() {
         const res = bulk.execute({w: 'majority'});
         assertWhenOwnColl.commandWorked(res);
         assertWhenOwnColl.eq(this.numDocs, res.nInserted);
+
+        if (cluster.isSharded()) {
+            // Advance each router's cluster time to be >= the time of the writes, so the first
+            // global snapshots chosen by each is guaranteed to include the inserted documents.
+            cluster.synchronizeMongosClusterTimes();
+        }
     }
 
     function teardown(db, collName, cluster) {
@@ -216,7 +210,7 @@ var $config = (function() {
 
     return {
         threadCount: 5,
-        iterations: 10,
+        iterations: 20,
         states: states,
         transitions: transitions,
         data: {

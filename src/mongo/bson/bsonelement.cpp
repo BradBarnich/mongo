@@ -1,24 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -56,6 +57,9 @@ using std::dec;
 using std::hex;
 using std::string;
 
+const double BSONElement::kLongLongMaxPlusOneAsDouble =
+    scalbn(1, std::numeric_limits<long long>::digits);
+
 string BSONElement::jsonString(JsonStringFormat format, bool includeFieldNames, int pretty) const {
     std::stringstream s;
     BSONElement::jsonStringStream(format, includeFieldNames, pretty, s);
@@ -89,7 +93,7 @@ void BSONElement::jsonStringStream(JsonStringFormat format,
             if (number() >= -std::numeric_limits<double>::max() &&
                 number() <= std::numeric_limits<double>::max()) {
                 auto origPrecision = s.precision();
-                auto guard = MakeGuard([&s, origPrecision]() { s.precision(origPrecision); });
+                auto guard = makeGuard([&s, origPrecision]() { s.precision(origPrecision); });
                 s.precision(16);
                 s << number();
             }
@@ -213,7 +217,7 @@ void BSONElement::jsonStringStream(JsonStringFormat format,
             auto origFill = s.fill();
             auto origFmtF = s.flags();
             auto origWidth = s.width();
-            auto guard = MakeGuard([&s, origFill, origFmtF, origWidth] {
+            auto guard = makeGuard([&s, origFill, origFmtF, origWidth] {
                 s.fill(origFill);
                 s.setf(origFmtF);
                 s.width(origWidth);
@@ -855,54 +859,47 @@ StringBuilder& operator<<(StringBuilder& s, const BSONElement& e) {
     return s;
 }
 
-template <>
-bool BSONElement::coerce<std::string>(std::string* out) const {
+bool BSONElement::coerce(std::string* out) const {
     if (type() != mongo::String)
         return false;
     *out = String();
     return true;
 }
 
-template <>
-bool BSONElement::coerce<int>(int* out) const {
+bool BSONElement::coerce(int* out) const {
     if (!isNumber())
         return false;
     *out = numberInt();
     return true;
 }
 
-template <>
-bool BSONElement::coerce<long long>(long long* out) const {
+bool BSONElement::coerce(long long* out) const {
     if (!isNumber())
         return false;
     *out = numberLong();
     return true;
 }
 
-template <>
-bool BSONElement::coerce<double>(double* out) const {
+bool BSONElement::coerce(double* out) const {
     if (!isNumber())
         return false;
     *out = numberDouble();
     return true;
 }
 
-template <>
-bool BSONElement::coerce<Decimal128>(Decimal128* out) const {
+bool BSONElement::coerce(Decimal128* out) const {
     if (!isNumber())
         return false;
     *out = numberDecimal();
     return true;
 }
 
-template <>
-bool BSONElement::coerce<bool>(bool* out) const {
+bool BSONElement::coerce(bool* out) const {
     *out = trueValue();
     return true;
 }
 
-template <>
-bool BSONElement::coerce<std::vector<std::string>>(std::vector<std::string>* out) const {
+bool BSONElement::coerce(std::vector<std::string>* out) const {
     if (type() != mongo::Array)
         return false;
     return Obj().coerceVector<std::string>(out);
@@ -914,7 +911,7 @@ bool BSONObj::coerceVector(std::vector<T>* out) const {
     while (i.more()) {
         BSONElement e = i.next();
         T t;
-        if (!e.coerce<T>(&t))
+        if (!e.coerce(&t))
             return false;
         out->push_back(t);
     }

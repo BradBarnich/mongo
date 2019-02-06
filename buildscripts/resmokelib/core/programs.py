@@ -10,7 +10,8 @@ import os
 import os.path
 import stat
 
-from . import process as _process
+from . import jasper_process
+from . import process
 from .. import config
 from .. import utils
 
@@ -22,7 +23,7 @@ from .. import utils
 
 # The default verbosity setting for any tests that are not started with an Evergreen task id. This
 # will apply to any tests run locally.
-DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY = {"replication": {"rollback": 2}}
+DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY = {"replication": {"rollback": 2}, "transaction": 4}
 
 # The default verbosity setting for any tests running in Evergreen i.e. started with an Evergreen
 # task id.
@@ -30,6 +31,14 @@ DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY = {
     "replication": {"election": 4, "heartbeats": 2, "initialSync": 2, "rollback": 2},
     "storage": {"recovery": 2}, "transaction": 4
 }
+
+
+def make_process(*args, **kwargs):
+    """Choose whether to use python built in process or jasper."""
+    process_cls = process.Process
+    if config.SPAWN_USING == "jasper":
+        process_cls = jasper_process.Process
+    return process_cls(*args, **kwargs)
 
 
 def default_mongod_log_component_verbosity():
@@ -98,7 +107,9 @@ def mongod_program(  # pylint: disable=too-many-branches
         "wiredTigerIndexConfigString": config.WT_INDEX_CONFIG,
     }
 
-    if config.STORAGE_ENGINE == "rocksdb":
+    if config.STORAGE_ENGINE == "inMemory":
+        shortcut_opts["inMemorySizeGB"] = config.STORAGE_ENGINE_CACHE_SIZE
+    elif config.STORAGE_ENGINE == "rocksdb":
         shortcut_opts["rocksdbCacheSizeGB"] = config.STORAGE_ENGINE_CACHE_SIZE
     elif config.STORAGE_ENGINE == "wiredTiger" or config.STORAGE_ENGINE is None:
         shortcut_opts["wiredTigerCacheSizeGB"] = config.STORAGE_ENGINE_CACHE_SIZE
@@ -140,7 +151,7 @@ def mongod_program(  # pylint: disable=too-many-branches
     _set_keyfile_permissions(kwargs)
 
     process_kwargs = utils.default_if_none(process_kwargs, {})
-    return _process.Process(logger, args, **process_kwargs)
+    return make_process(logger, args, **process_kwargs)
 
 
 def mongos_program(logger, executable=None, process_kwargs=None, **kwargs):
@@ -164,7 +175,7 @@ def mongos_program(logger, executable=None, process_kwargs=None, **kwargs):
     _set_keyfile_permissions(kwargs)
 
     process_kwargs = utils.default_if_none(process_kwargs, {})
-    return _process.Process(logger, args, **process_kwargs)
+    return make_process(logger, args, **process_kwargs)
 
 
 def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,too-many-statements
@@ -174,21 +185,25 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
 
     The shell is started with the given connection string and arguments constructed from 'kwargs'.
     """
-    connection_string = utils.default_if_none(config.SHELL_CONN_STRING, connection_string)
 
-    executable = utils.default_if_none(executable, config.DEFAULT_MONGO_EXECUTABLE)
+    executable = utils.default_if_none(
+        utils.default_if_none(executable, config.MONGO_EXECUTABLE), config.DEFAULT_MONGO_EXECUTABLE)
     args = [executable]
 
     eval_sb = []  # String builder.
     global_vars = kwargs.pop("global_vars", {}).copy()
 
+    if filename is not None:
+        test_name = os.path.splitext(os.path.basename(filename))[0]
+    else:
+        test_name = None
     shortcut_opts = {
         "enableMajorityReadConcern": (config.MAJORITY_READ_CONCERN, True),
         "noJournal": (config.NO_JOURNAL, False),
         "serviceExecutor": (config.SERVICE_EXECUTOR, ""),
         "storageEngine": (config.STORAGE_ENGINE, ""),
         "storageEngineCacheSizeGB": (config.STORAGE_ENGINE_CACHE_SIZE, ""),
-        "testName": (os.path.splitext(os.path.basename(filename))[0], ""),
+        "testName": (test_name, ""),
         "transportLayer": (config.TRANSPORT_LAYER, ""),
         "wiredTigerCollectionConfigString": (config.WT_COLL_CONFIG, ""),
         "wiredTigerEngineConfigString": (config.WT_ENGINE_CONFIG, ""),
@@ -286,13 +301,14 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
     if connection_string is not None:
         args.append(connection_string)
 
-    # Have the mongos shell run the specified file.
-    args.append(filename)
+    # Have the mongo shell run the specified file.
+    if filename is not None:
+        args.append(filename)
 
     _set_keyfile_permissions(test_data)
 
     process_kwargs = utils.default_if_none(process_kwargs, {})
-    return _process.Process(logger, args, **process_kwargs)
+    return make_process(logger, args, **process_kwargs)
 
 
 def _format_shell_vars(sb, path, value):
@@ -331,6 +347,13 @@ def dbtest_program(logger, executable=None, suites=None, process_kwargs=None, **
     return generic_program(logger, args, process_kwargs=process_kwargs, **kwargs)
 
 
+def genny_program(logger, executable=None, process_kwargs=None, **kwargs):
+    """Return a Process instance that starts a genny executable with arguments constructed from 'kwargs'."""
+    executable = utils.default_if_none(executable, config.DEFAULT_GENNY_EXECUTABLE)
+    args = [executable]
+    return generic_program(logger, args, process_kwargs, **kwargs)
+
+
 def generic_program(logger, args, process_kwargs=None, **kwargs):
     """Return a Process instance that starts an arbitrary executable.
 
@@ -345,7 +368,7 @@ def generic_program(logger, args, process_kwargs=None, **kwargs):
     _apply_kwargs(args, kwargs)
 
     process_kwargs = utils.default_if_none(process_kwargs, {})
-    return _process.Process(logger, args, **process_kwargs)
+    return make_process(logger, args, **process_kwargs)
 
 
 def _apply_set_parameters(args, set_parameter):

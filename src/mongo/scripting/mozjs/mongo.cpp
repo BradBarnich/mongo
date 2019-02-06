@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -108,6 +110,23 @@ DBClientBase* getConnection(JS::CallArgs& args) {
     return getConnectionRef(args).get();
 }
 
+bool isUnacknowledged(const BSONObj& cmdObj) {
+    auto wc = cmdObj["writeConcern"];
+    return wc && wc["w"].isNumber() && wc["w"].safeNumberLong() == 0;
+}
+
+void returnOk(JSContext* cx, JS::CallArgs& args) {
+    ValueReader(cx, args.rval()).fromBSON(BSON("ok" << 1), nullptr, false);
+}
+
+void runFireAndForgetCommand(const std::shared_ptr<DBClientBase>& conn,
+                             const std::string& database,
+                             BSONObj body,
+                             const BSONObj& extraFields = {}) {
+    auto request = OpMsgRequest::fromDBAndBody(database, body, extraFields);
+    conn->runFireAndForgetCommand(request);
+}
+
 void setCursor(MozJSImplScope* scope,
                JS::HandleObject target,
                std::unique_ptr<DBClientCursor> cursor,
@@ -133,6 +152,17 @@ void setCursorHandle(MozJSImplScope* scope,
         scope->trackedNew<CursorHandleInfo::CursorTracker>(std::move(ns), cursorId, *client));
 }
 
+void setHiddenMongo(JSContext* cx, JS::HandleValue value, JS::CallArgs& args) {
+    ObjectWrapper o(cx, args.rval());
+    if (!o.hasField(InternedString::_mongo)) {
+        o.defineProperty(InternedString::_mongo, value, JSPROP_READONLY | JSPROP_PERMANENT);
+    }
+}
+
+void setHiddenMongo(JSContext* cx, JS::CallArgs& args) {
+    setHiddenMongo(cx, args.thisv(), args);
+}
+
 void setHiddenMongo(JSContext* cx,
                     std::shared_ptr<DBClientBase> resPtr,
                     DBClientBase* origConn,
@@ -141,7 +171,7 @@ void setHiddenMongo(JSContext* cx,
     // If the connection that ran the command is the same as conn, then we set a hidden "_mongo"
     // property on the returned object that is just "this" Mongo object.
     if (resPtr.get() == origConn) {
-        o.defineProperty(InternedString::_mongo, args.thisv(), JSPROP_READONLY | JSPROP_PERMANENT);
+        setHiddenMongo(cx, args.thisv(), args);
     } else {
         JS::RootedObject newMongo(cx);
 
@@ -166,13 +196,12 @@ void setHiddenMongo(JSContext* cx,
 
         JS::RootedValue value(cx);
         value.setObjectOrNull(newMongo);
-
-        o.defineProperty(InternedString::_mongo, value, JSPROP_READONLY | JSPROP_PERMANENT);
+        setHiddenMongo(cx, value, args);
     }
 }
 }  // namespace
 
-void MongoBase::finalize(JSFreeOp* fop, JSObject* obj) {
+void MongoBase::finalize(js::FreeOp* fop, JSObject* obj) {
     auto conn = static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(obj));
 
     if (conn) {
@@ -210,6 +239,13 @@ void MongoBase::Functions::runCommand::call(JSContext* cx, JS::CallArgs args) {
 
     BSONObj cmdObj = ValueWriter(cx, args.get(1)).toBSON();
 
+    if (isUnacknowledged(cmdObj)) {
+        runFireAndForgetCommand(conn, database, cmdObj);
+        setHiddenMongo(cx, args);
+        returnOk(cx, args);
+        return;
+    }
+
     int queryOptions = ValueWriter(cx, args.get(2)).toInt32();
     BSONObj cmdRes;
     auto resTuple = conn->runCommandWithTarget(database, cmdObj, cmdRes, conn, queryOptions);
@@ -242,6 +278,14 @@ void MongoBase::Functions::runCommandWithMetadata::call(JSContext* cx, JS::CallA
     BSONObj commandArgs = ValueWriter(cx, args.get(2)).toBSON();
 
     const auto& conn = getConnectionRef(args);
+
+    if (isUnacknowledged(commandArgs)) {
+        runFireAndForgetCommand(conn, database, commandArgs, metadata);
+        setHiddenMongo(cx, args);
+        returnOk(cx, args);
+        return;
+    }
+
     auto resTuple = conn->runCommandWithTarget(
         OpMsgRequest::fromDBAndBody(database, commandArgs, metadata), conn);
     auto res = std::move(std::get<0>(resTuple));
@@ -572,7 +616,7 @@ void MongoBase::Functions::copyDatabaseWithSCRAM::call(JSContext* cx, JS::CallAr
     BSONObj inputObj = BSON(saslCommandPayloadFieldName << "");
     bool isServerDone = false;
 
-    while (!session->isDone()) {
+    while (!session->isSuccess()) {
         std::string payload;
         BSONType type;
 
@@ -713,8 +757,7 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
         host = ValueWriter(cx, args.get(0)).toString();
     }
 
-    auto statusWithHost = MongoURI::parse(host);
-    auto cs = uassertStatusOK(statusWithHost);
+    auto cs = uassertStatusOK(MongoURI::parse(host));
 
     boost::optional<std::string> appname = cs.getAppName();
     std::string errmsg;
@@ -733,7 +776,7 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
     JS_SetPrivate(thisv, scope->trackedNew<std::shared_ptr<DBClientBase>>(conn.release()));
 
     o.setBoolean(InternedString::slaveOk, false);
-    o.setString(InternedString::host, cs.toString());
+    o.setString(InternedString::host, cs.connectionString().toString());
     auto defaultDB = cs.getDatabase() == "" ? "test" : cs.getDatabase();
     o.setString(InternedString::defaultDB, defaultDB);
 

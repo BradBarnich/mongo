@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -55,6 +57,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/add_shard_cmd_gen.h"
 #include "mongo/db/s/add_shard_util.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/task_executor.h"
@@ -578,7 +581,7 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
     invariant(shard);
     auto targeter = shard->getTargeter();
 
-    auto stopMonitoringGuard = MakeGuard([&] {
+    auto stopMonitoringGuard = makeGuard([&] {
         if (shardConnectionString.type() == ConnectionString::SET) {
             // This is a workaround for the case were we could have some bad shard being
             // requested to be added and we put that bad connection string on the global replica set
@@ -757,7 +760,7 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
     shardDetails.append("name", shardType.getName());
     shardDetails.append("host", shardConnectionString.toString());
 
-    Grid::get(opCtx)->catalogClient()->logChange(
+    ShardingLogging::get(opCtx)->logChange(
         opCtx, "addShard", "", shardDetails.obj(), ShardingCatalogClient::kMajorityWriteConcern);
 
     // Ensure the added shard is visible to this process.
@@ -767,7 +770,7 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
                 "Could not find shard metadata for shard after adding it. This most likely "
                 "indicates that the shard was removed immediately after it was added."};
     }
-    stopMonitoringGuard.Dismiss();
+    stopMonitoringGuard.dismiss();
 
     return shardType.getName();
 }
@@ -810,7 +813,7 @@ StatusWith<ShardDrainingStatus> ShardingCatalogManager::removeShard(OperationCon
         log() << "going to start draining shard: " << name;
 
         // Record start in changelog
-        const Status logStatus = Grid::get(opCtx)->catalogClient()->logChangeChecked(
+        const Status logStatus = ShardingLogging::get(opCtx)->logChangeChecked(
             opCtx,
             "removeShard.start",
             "",
@@ -882,7 +885,7 @@ StatusWith<ShardDrainingStatus> ShardingCatalogManager::removeShard(OperationCon
     shardRegistry->reload(opCtx);
 
     // Record finish in changelog
-    Grid::get(opCtx)->catalogClient()->logChange(
+    ShardingLogging::get(opCtx)->logChange(
         opCtx, "removeShard", "", BSON("shard" << name), ShardingCatalogClient::kLocalWriteConcern);
 
     return ShardDrainingStatus::COMPLETED;

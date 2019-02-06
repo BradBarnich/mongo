@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -43,7 +45,7 @@ class UUIDCatalogTest : public unittest::Test {
 public:
     UUIDCatalogTest()
         : nss("testdb", "testcol"),
-          col(stdx::make_unique<CollectionMock>(nss)),
+          col(nss),
           colUUID(CollectionUUID::gen()),
           nextUUID(CollectionUUID::gen()),
           prevUUID(CollectionUUID::gen()) {
@@ -64,7 +66,7 @@ protected:
     UUIDCatalog catalog;
     OperationContextNoop opCtx;
     NamespaceString nss;
-    Collection col;
+    CollectionMock col;
     CollectionUUID colUUID;
     CollectionUUID nextUUID;
     CollectionUUID prevUUID;
@@ -94,7 +96,7 @@ TEST_F(UUIDCatalogTest, LookupNSSByUUID) {
 TEST_F(UUIDCatalogTest, InsertAfterLookup) {
     auto newUUID = CollectionUUID::gen();
     NamespaceString newNss(nss.db(), "newcol");
-    Collection newCol(stdx::make_unique<CollectionMock>(newNss));
+    CollectionMock newCol(newNss);
 
     // Ensure that looking up non-existing UUIDs doesn't affect later registration of those UUIDs.
     ASSERT(catalog.lookupCollectionByUUID(newUUID) == nullptr);
@@ -110,17 +112,17 @@ TEST_F(UUIDCatalogTest, OnDropCollection) {
     ASSERT(catalog.lookupCollectionByUUID(colUUID) == nullptr);
 }
 
-TEST_F(UUIDCatalogTest, OnRenameCollection) {
-    auto oldUUID = CollectionUUID::gen();
+TEST_F(UUIDCatalogTest, RenameCollection) {
+    auto uuid = CollectionUUID::gen();
     NamespaceString oldNss(nss.db(), "oldcol");
-    Collection oldCol(stdx::make_unique<CollectionMock>(oldNss));
-    catalog.onCreateCollection(&opCtx, &oldCol, oldUUID);
-    ASSERT_EQUALS(catalog.lookupCollectionByUUID(oldUUID), &oldCol);
+    CollectionMock collection(oldNss);
+    catalog.onCreateCollection(&opCtx, &collection, uuid);
+    ASSERT_EQUALS(catalog.lookupCollectionByUUID(uuid), &collection);
 
     NamespaceString newNss(nss.db(), "newcol");
-    Collection newCol(stdx::make_unique<CollectionMock>(newNss));
-    catalog.onRenameCollection(&opCtx, &newCol, oldUUID);
-    ASSERT_EQUALS(catalog.lookupCollectionByUUID(oldUUID), &newCol);
+    catalog.setCollectionNamespace(&opCtx, &collection, oldNss, newNss);
+    ASSERT_EQ(collection.ns(), newNss);
+    ASSERT_EQUALS(catalog.lookupCollectionByUUID(uuid), &collection);
 }
 
 TEST_F(UUIDCatalogTest, NonExistingNextCol) {
@@ -128,19 +130,19 @@ TEST_F(UUIDCatalogTest, NonExistingNextCol) {
     ASSERT_FALSE(catalog.next(nss.db(), nextUUID));
 
     NamespaceString newNss("anotherdb", "newcol");
-    Collection newCol(stdx::make_unique<CollectionMock>(newNss));
+    CollectionMock newCol(newNss);
     catalog.onCreateCollection(&opCtx, &newCol, nextUUID);
     ASSERT_FALSE(catalog.next(nss.db(), colUUID));
 
     NamespaceString prevNss(nss.db(), "prevcol");
-    Collection prevCol(stdx::make_unique<CollectionMock>(prevNss));
+    CollectionMock prevCol(prevNss);
     catalog.onCreateCollection(&opCtx, &prevCol, prevUUID);
     ASSERT_FALSE(catalog.next(nss.db(), colUUID));
 }
 
 TEST_F(UUIDCatalogTest, ExistingNextCol) {
     NamespaceString nextNss(nss.db(), "next");
-    Collection nextCol(stdx::make_unique<CollectionMock>(nextNss));
+    CollectionMock nextCol(nextNss);
     catalog.onCreateCollection(&opCtx, &nextCol, nextUUID);
     auto next = catalog.next(nss.db(), colUUID);
     ASSERT_TRUE(next);
@@ -152,19 +154,19 @@ TEST_F(UUIDCatalogTest, NonExistingPrevCol) {
     ASSERT_FALSE(catalog.prev(nss.db(), prevUUID));
 
     NamespaceString newNss("anotherdb", "newcol");
-    Collection newCol(stdx::make_unique<CollectionMock>(newNss));
+    CollectionMock newCol(newNss);
     catalog.onCreateCollection(&opCtx, &newCol, nextUUID);
     ASSERT_FALSE(catalog.prev(nss.db(), colUUID));
 
     NamespaceString nextNss(nss.db(), "nextcol");
-    Collection nextCol(stdx::make_unique<CollectionMock>(nextNss));
+    CollectionMock nextCol(nextNss);
     catalog.onCreateCollection(&opCtx, &nextCol, nextUUID);
     ASSERT_FALSE(catalog.prev(nss.db(), colUUID));
 }
 
 TEST_F(UUIDCatalogTest, ExistingPrevCol) {
     NamespaceString prevNss(nss.db(), "prevcol");
-    Collection prevCol(stdx::make_unique<CollectionMock>(prevNss));
+    CollectionMock prevCol(prevNss);
     catalog.onCreateCollection(&opCtx, &prevCol, prevUUID);
     auto prev = catalog.prev(nss.db(), colUUID);
     ASSERT_TRUE(prev);
@@ -181,11 +183,11 @@ TEST_F(UUIDCatalogTest, NextPrevColOnEmptyCatalog) {
 
 TEST_F(UUIDCatalogTest, InvalidateOrdering) {
     NamespaceString prevNss(nss.db(), "prevcol");
-    Collection prevCol(stdx::make_unique<CollectionMock>(prevNss));
+    CollectionMock prevCol(prevNss);
     catalog.onCreateCollection(&opCtx, &prevCol, prevUUID);
 
     NamespaceString nextNss(nss.db(), "nextcol");
-    Collection nextCol(stdx::make_unique<CollectionMock>(nextNss));
+    CollectionMock nextCol(nextNss);
     catalog.onCreateCollection(&opCtx, &nextCol, nextUUID);
 
     catalog.onDropCollection(&opCtx, colUUID);
@@ -211,7 +213,7 @@ TEST_F(UUIDCatalogTest, LookupNSSByUUIDForClosedCatalogReturnsOldNSSIfDropped) {
 TEST_F(UUIDCatalogTest, LookupNSSByUUIDForClosedCatalogReturnsNewlyCreatedNSS) {
     auto newUUID = CollectionUUID::gen();
     NamespaceString newNss(nss.db(), "newcol");
-    Collection newCol(stdx::make_unique<CollectionMock>(newNss));
+    CollectionMock newCol(newNss);
 
     // Ensure that looking up non-existing UUIDs doesn't affect later registration of those UUIDs.
     catalog.onCloseCatalog(&opCtx);
@@ -229,7 +231,7 @@ TEST_F(UUIDCatalogTest, LookupNSSByUUIDForClosedCatalogReturnsNewlyCreatedNSS) {
 
 TEST_F(UUIDCatalogTest, LookupNSSByUUIDForClosedCatalogReturnsFreshestNSS) {
     NamespaceString newNss(nss.db(), "newcol");
-    Collection newCol(stdx::make_unique<CollectionMock>(newNss));
+    CollectionMock newCol(newNss);
     catalog.onCloseCatalog(&opCtx);
     catalog.onDropCollection(&opCtx, colUUID);
     ASSERT(catalog.lookupCollectionByUUID(colUUID) == nullptr);

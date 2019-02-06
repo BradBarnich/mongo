@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -40,12 +42,14 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/exec/delete.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
@@ -53,6 +57,7 @@
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/remove_saver.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/util/log.h"
@@ -60,6 +65,14 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+MONGO_EXPORT_SERVER_PARAMETER(rangeDeleterBatchSize, int, 0)
+    ->withValidator([](const int& newVal) {
+        if (newVal < 0) {
+            return Status(ErrorCodes::BadValue, "rangeDeleterBatchSize must not be negative");
+        }
+        return Status::OK();
+    });
 
 MONGO_EXPORT_SERVER_PARAMETER(rangeDeleterBatchDelayMS, int, 20)
     ->withValidator([](const int& newVal) {
@@ -107,6 +120,13 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
     int maxToDelete,
     CollectionRangeDeleter* forTestOnly) {
 
+    if (maxToDelete <= 0) {
+        maxToDelete = rangeDeleterBatchSize.load();
+        if (maxToDelete <= 0) {
+            maxToDelete = std::max(int(internalQueryExecYieldIterations.load()), 1);
+        }
+    }
+
     StatusWith<int> wrote = 0;
 
     auto range = boost::optional<ChunkRange>(boost::none);
@@ -115,48 +135,21 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
     {
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-
         auto* const collection = autoColl.getCollection();
-        auto* const css = CollectionShardingRuntime::get(opCtx, nss);
-        auto& metadataManager = css->_metadataManager;
+        auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
+        auto& metadataManager = csr->_metadataManager;
+
+        if (!_checkCollectionMetadataStillValid(
+                opCtx, nss, epoch, forTestOnly, collection, metadataManager)) {
+            return boost::none;
+        }
+
         auto* const self = forTestOnly ? forTestOnly : &metadataManager->_rangesToClean;
-
-        const auto scopedCollectionMetadata =
-            metadataManager->getActiveMetadata(metadataManager, boost::none);
-
-        if (!scopedCollectionMetadata) {
-            LOG(0) << "Abandoning any range deletions because the metadata for " << nss.ns()
-                   << " was reset";
-            stdx::lock_guard<stdx::mutex> lk(css->_metadataManager->_managerLock);
-            css->_metadataManager->_clearAllCleanups(lk);
-            return boost::none;
-        }
-
-        const auto& metadata = *scopedCollectionMetadata;
-
-        if (!forTestOnly && (!collection || !metadata->isSharded())) {
-            if (!collection) {
-                LOG(0) << "Abandoning any range deletions left over from dropped " << nss.ns();
-            } else {
-                LOG(0) << "Abandoning any range deletions left over from previously sharded"
-                       << nss.ns();
-            }
-
-            stdx::lock_guard<stdx::mutex> lk(css->_metadataManager->_managerLock);
-            css->_metadataManager->_clearAllCleanups(lk);
-            return boost::none;
-        }
-
-        if (!forTestOnly && metadata->getCollVersion().epoch() != epoch) {
-            LOG(1) << "Range deletion task for " << nss.ns() << " epoch " << epoch << " woke;"
-                   << " (current is " << metadata->getCollVersion() << ")";
-            return boost::none;
-        }
 
         bool writeOpLog = false;
 
         {
-            stdx::lock_guard<stdx::mutex> scopedLock(css->_metadataManager->_managerLock);
+            stdx::lock_guard<stdx::mutex> scopedLock(csr->_metadataManager->_managerLock);
             if (self->isEmpty()) {
                 LOG(1) << "No further range deletions scheduled on " << nss.ns();
                 return boost::none;
@@ -209,14 +202,18 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
                                      << "max"
                                      << range->getMax()));
             } catch (const DBException& e) {
-                stdx::lock_guard<stdx::mutex> scopedLock(css->_metadataManager->_managerLock);
-                css->_metadataManager->_clearAllCleanups(
+                stdx::lock_guard<stdx::mutex> scopedLock(csr->_metadataManager->_managerLock);
+                csr->_metadataManager->_clearAllCleanups(
                     scopedLock,
                     e.toStatus("cannot push startRangeDeletion record to Op Log,"
                                " abandoning scheduled range deletions"));
                 return boost::none;
             }
         }
+
+        const auto scopedCollectionMetadata =
+            metadataManager->getActiveMetadata(metadataManager, boost::none);
+        const auto& metadata = *scopedCollectionMetadata;
 
         try {
             wrote = self->_doDeletion(
@@ -244,7 +241,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         const auto clientOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
 
         // Wait for replication outside the lock
-        const auto status = [&] {
+        const auto replicationStatus = [&] {
             try {
                 WriteConcernResult unusedWCResult;
                 return waitForWriteConcern(
@@ -258,15 +255,22 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         // Don't allow lock interrupts while cleaning up.
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-        auto* const css = CollectionShardingRuntime::get(opCtx, nss);
-        auto& metadataManager = css->_metadataManager;
+        auto* const collection = autoColl.getCollection();
+        auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
+        auto& metadataManager = csr->_metadataManager;
+
+        if (!_checkCollectionMetadataStillValid(
+                opCtx, nss, epoch, forTestOnly, collection, metadataManager)) {
+            return boost::none;
+        }
+
         auto* const self = forTestOnly ? forTestOnly : &metadataManager->_rangesToClean;
 
-        stdx::lock_guard<stdx::mutex> scopedLock(css->_metadataManager->_managerLock);
+        stdx::lock_guard<stdx::mutex> scopedLock(csr->_metadataManager->_managerLock);
 
-        if (!status.isOK()) {
+        if (!replicationStatus.isOK()) {
             LOG(0) << "Error when waiting for write concern after removing " << nss << " range "
-                   << redact(range->toString()) << " : " << redact(status.reason());
+                   << redact(range->toString()) << " : " << redact(replicationStatus.reason());
 
             // If range were already popped (e.g. by dropping nss during the waitForWriteConcern
             // above) its notification would have been triggered, so this check suffices to ensure
@@ -275,7 +279,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
                 invariant(!self->isEmpty() && self->_orphans.front().notification == notification);
                 LOG(0) << "Abandoning deletion of latest range in " << nss.ns() << " after local "
                        << "deletions because of replication failure";
-                self->_pop(status);
+                self->_pop(replicationStatus);
             }
         } else {
             LOG(0) << "Finished deleting documents in " << nss.ns() << " range "
@@ -289,7 +293,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
                    << redact(self->_orphans.front().range.toString()) << " next.";
         }
 
-        return Date_t::now() + stdx::chrono::milliseconds{rangeDeleterBatchDelayMS.load()};
+        return Date_t::now() + Milliseconds(rangeDeleterBatchDelayMS.load());
     }
 
     invariant(range);
@@ -297,7 +301,50 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
     invariant(wrote.getValue() > 0);
 
     notification.abandon();
-    return Date_t::now() + stdx::chrono::milliseconds{rangeDeleterBatchDelayMS.load()};
+    return Date_t::now() + Milliseconds(rangeDeleterBatchDelayMS.load());
+}
+
+bool CollectionRangeDeleter::_checkCollectionMetadataStillValid(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    OID const& epoch,
+    CollectionRangeDeleter* forTestOnly,
+    Collection* collection,
+    std::shared_ptr<MetadataManager> metadataManager) {
+
+    const auto scopedCollectionMetadata =
+        metadataManager->getActiveMetadata(metadataManager, boost::none);
+
+    if (!scopedCollectionMetadata) {
+        LOG(0) << "Abandoning any range deletions because the metadata for " << nss.ns()
+               << " was reset";
+        stdx::lock_guard<stdx::mutex> lk(metadataManager->_managerLock);
+        metadataManager->_clearAllCleanups(lk);
+        return false;
+    }
+
+    const auto& metadata = *scopedCollectionMetadata;
+
+    if (!forTestOnly && (!collection || !metadata->isSharded())) {
+        if (!collection) {
+            LOG(0) << "Abandoning any range deletions left over from dropped " << nss.ns();
+        } else {
+            LOG(0) << "Abandoning any range deletions left over from previously sharded"
+                   << nss.ns();
+        }
+
+        stdx::lock_guard<stdx::mutex> lk(metadataManager->_managerLock);
+        metadataManager->_clearAllCleanups(lk);
+        return false;
+    }
+
+    if (!forTestOnly && metadata->getCollVersion().epoch() != epoch) {
+        LOG(1) << "Range deletion task for " << nss.ns() << " epoch " << epoch << " woke;"
+               << " (current is " << metadata->getCollVersion() << ")";
+        return false;
+    }
+
+    return true;
 }
 
 StatusWith<int> CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
@@ -333,7 +380,8 @@ StatusWith<int> CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
     LOG(1) << "begin removal of " << min << " to " << max << " in " << nss.ns();
 
     const auto indexName = idx->indexName();
-    IndexDescriptor* descriptor = collection->getIndexCatalog()->findIndexByName(opCtx, indexName);
+    const IndexDescriptor* descriptor =
+        collection->getIndexCatalog()->findIndexByName(opCtx, indexName);
     if (!descriptor) {
         std::string msg = str::stream() << "shard key index with name " << indexName << " on '"
                                         << nss.ns() << "' was dropped";
@@ -341,53 +389,45 @@ StatusWith<int> CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
         return {ErrorCodes::InternalError, msg};
     }
 
-    boost::optional<Helpers::RemoveSaver> saver;
+    auto deleteStageParams = std::make_unique<DeleteStageParams>();
+    deleteStageParams->fromMigrate = true;
+    deleteStageParams->isMulti = true;
+    deleteStageParams->returnDeleted = true;
+
     if (serverGlobalParams.moveParanoia) {
-        saver.emplace("moveChunk", nss.ns(), "cleaning");
+        deleteStageParams->removeSaver =
+            std::make_unique<RemoveSaver>("moveChunk", nss.ns(), "cleaning");
     }
 
-    auto halfOpen = BoundInclusion::kIncludeStartKeyOnly;
-    auto manual = PlanExecutor::YIELD_MANUAL;
-    auto forward = InternalPlanner::FORWARD;
-    auto fetch = InternalPlanner::IXSCAN_FETCH;
+    auto exec = InternalPlanner::deleteWithIndexScan(opCtx,
+                                                     collection,
+                                                     std::move(deleteStageParams),
+                                                     descriptor,
+                                                     min,
+                                                     max,
+                                                     BoundInclusion::kIncludeStartKeyOnly,
+                                                     PlanExecutor::YIELD_MANUAL,
+                                                     InternalPlanner::FORWARD);
 
-    auto exec = InternalPlanner::indexScan(
-        opCtx, collection, descriptor, min, max, halfOpen, manual, forward, fetch);
+    PlanYieldPolicy planYieldPolicy(exec.get(), PlanExecutor::YIELD_MANUAL);
 
     int numDeleted = 0;
     do {
-        RecordId rloc;
-        BSONObj obj;
-        PlanExecutor::ExecState state = exec->getNext(&obj, &rloc);
+        BSONObj deletedObj;
+        PlanExecutor::ExecState state = exec->getNext(&deletedObj, nullptr);
+
         if (state == PlanExecutor::IS_EOF) {
             break;
         }
-        if (state == PlanExecutor::FAILURE || state == PlanExecutor::DEAD) {
-            warning() << PlanExecutor::statestr(state) << " - cursor error while trying to delete "
-                      << redact(min) << " to " << redact(max) << " in " << nss << ": "
-                      << redact(WorkingSetCommon::toStatusString(obj))
-                      << ", stats: " << Explain::getWinningPlanStats(exec.get());
-            break;
-        }
-        invariant(PlanExecutor::ADVANCED == state);
 
-        exec->saveState();
-        writeConflictRetry(opCtx, "delete range", nss.ns(), [&] {
-            WriteUnitOfWork wuow(opCtx);
-            if (saver) {
-                uassertStatusOK(saver->goingToDelete(obj));
-            }
-            collection->deleteDocument(opCtx, kUninitializedStmtId, rloc, nullptr, true);
-            wuow.commit();
-        });
-        auto restoreStateStatus = exec->restoreState();
-        if (!restoreStateStatus.isOK()) {
-            warning() << "error restoring cursor state while trying to delete " << redact(min)
-                      << " to " << redact(max) << " in " << nss
-                      << ", stats: " << Explain::getWinningPlanStats(exec.get()) << ": "
-                      << redact(restoreStateStatus);
+        if (state == PlanExecutor::FAILURE) {
+            warning() << PlanExecutor::statestr(state) << " - cursor error while trying to delete "
+                      << redact(min) << " to " << redact(max) << " in " << nss
+                      << ": FAILURE, stats: " << Explain::getWinningPlanStats(exec.get());
             break;
         }
+
+        invariant(PlanExecutor::ADVANCED == state);
         ShardingStatistics::get(opCtx).countDocsDeletedOnDonor.addAndFetch(1);
 
     } while (++numDeleted < maxToDelete);

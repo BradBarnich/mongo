@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,9 +28,8 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
 
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/locker_noop.h"
 #include "mongo/db/db_raii.h"
@@ -37,13 +38,14 @@
 #include "mongo/db/keys_collection_manager.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
-#include "mongo/db/operation_context_session_mongod.h"
+#include "mongo/db/op_observer_impl.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface_local.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/s/config_server_test_fixture.h"
@@ -51,11 +53,10 @@
 #include "mongo/util/clock_source_mock.h"
 
 namespace mongo {
+namespace {
 
 using repl::OplogEntry;
 using unittest::assertGet;
-
-namespace {
 
 class OpObserverTest : public ServiceContextMongoDTest {
 public:
@@ -65,6 +66,7 @@ public:
 
         auto service = getServiceContext();
         auto opCtx = cc().makeOperationContext();
+        repl::StorageInterface::set(service, stdx::make_unique<repl::StorageInterfaceMock>());
 
         // Set up ReplicationCoordinator and create oplog.
         repl::ReplicationCoordinator::set(
@@ -98,6 +100,132 @@ private:
         return settings;
     }
 };
+
+TEST_F(OpObserverTest, StartIndexBuildExpectedOplogEntry) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    auto uuid = CollectionUUID::gen();
+    NamespaceString nss("test.coll");
+    UUID indexBuildUUID = UUID::gen();
+
+    BSONObj specX = BSON("key" << BSON("x" << 1) << "name"
+                               << "x_1"
+                               << "v"
+                               << 2);
+    BSONObj specA = BSON("key" << BSON("a" << 1) << "name"
+                               << "a_1"
+                               << "v"
+                               << 2);
+    std::vector<BSONObj> specs = {specX, specA};
+
+    // Write to the oplog.
+    {
+        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        opObserver.onStartIndexBuild(
+            opCtx.get(), nss, uuid, indexBuildUUID, specs, false /*fromMigrate*/);
+        wunit.commit();
+    }
+
+    // Create expected startIndexBuild command.
+    BSONObjBuilder startIndexBuildBuilder;
+    startIndexBuildBuilder.append("startIndexBuild", nss.coll());
+    indexBuildUUID.appendToBuilder(&startIndexBuildBuilder, "indexBuildUUID");
+    BSONArrayBuilder indexesArr(startIndexBuildBuilder.subarrayStart("indexes"));
+    indexesArr.append(specX);
+    indexesArr.append(specA);
+    indexesArr.done();
+    BSONObj startIndexBuildCmd = startIndexBuildBuilder.done();
+
+    // Ensure the startIndexBuild fields were correctly set.
+    auto oplogEntry = getSingleOplogEntry(opCtx.get());
+    auto o = oplogEntry.getObjectField("o");
+    ASSERT_BSONOBJ_EQ(startIndexBuildCmd, o);
+}
+
+TEST_F(OpObserverTest, CommitIndexBuildExpectedOplogEntry) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    auto uuid = CollectionUUID::gen();
+    NamespaceString nss("test.coll");
+    UUID indexBuildUUID = UUID::gen();
+
+    BSONObj specX = BSON("key" << BSON("x" << 1) << "name"
+                               << "x_1"
+                               << "v"
+                               << 2);
+    BSONObj specA = BSON("key" << BSON("a" << 1) << "name"
+                               << "a_1"
+                               << "v"
+                               << 2);
+    std::vector<BSONObj> specs = {specX, specA};
+
+    // Write to the oplog.
+    {
+        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        opObserver.onCommitIndexBuild(
+            opCtx.get(), nss, uuid, indexBuildUUID, specs, false /*fromMigrate*/);
+        wunit.commit();
+    }
+
+    // Create expected commitIndexBuild command.
+    BSONObjBuilder commitIndexBuildBuilder;
+    commitIndexBuildBuilder.append("commitIndexBuild", nss.coll());
+    indexBuildUUID.appendToBuilder(&commitIndexBuildBuilder, "indexBuildUUID");
+    BSONArrayBuilder indexesArr(commitIndexBuildBuilder.subarrayStart("indexes"));
+    indexesArr.append(specX);
+    indexesArr.append(specA);
+    indexesArr.done();
+    BSONObj commitIndexBuildCmd = commitIndexBuildBuilder.done();
+
+    // Ensure the commitIndexBuild fields were correctly set.
+    auto oplogEntry = getSingleOplogEntry(opCtx.get());
+    auto o = oplogEntry.getObjectField("o");
+    ASSERT_BSONOBJ_EQ(commitIndexBuildCmd, o);
+}
+
+TEST_F(OpObserverTest, AbortIndexBuildExpectedOplogEntry) {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    auto uuid = CollectionUUID::gen();
+    NamespaceString nss("test.coll");
+    UUID indexBuildUUID = UUID::gen();
+
+    BSONObj specX = BSON("key" << BSON("x" << 1) << "name"
+                               << "x_1"
+                               << "v"
+                               << 2);
+    BSONObj specA = BSON("key" << BSON("a" << 1) << "name"
+                               << "a_1"
+                               << "v"
+                               << 2);
+    std::vector<BSONObj> specs = {specX, specA};
+
+    // Write to the oplog.
+    {
+        AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
+        WriteUnitOfWork wunit(opCtx.get());
+        opObserver.onAbortIndexBuild(
+            opCtx.get(), nss, uuid, indexBuildUUID, specs, false /*fromMigrate*/);
+        wunit.commit();
+    }
+
+    // Create expected abortIndexBuild command.
+    BSONObjBuilder abortIndexBuildBuilder;
+    abortIndexBuildBuilder.append("abortIndexBuild", nss.coll());
+    indexBuildUUID.appendToBuilder(&abortIndexBuildBuilder, "indexBuildUUID");
+    BSONArrayBuilder indexesArr(abortIndexBuildBuilder.subarrayStart("indexes"));
+    indexesArr.append(specX);
+    indexesArr.append(specA);
+    indexesArr.done();
+    BSONObj abortIndexBuildCmd = abortIndexBuildBuilder.done();
+
+    // Ensure the abortIndexBuild fields were correctly set.
+    auto oplogEntry = getSingleOplogEntry(opCtx.get());
+    auto o = oplogEntry.getObjectField("o");
+    ASSERT_BSONOBJ_EQ(abortIndexBuildCmd, o);
+}
 
 TEST_F(OpObserverTest, CollModWithCollectionOptionsAndTTLInfo) {
     OpObserverImpl opObserver;
@@ -214,7 +342,8 @@ TEST_F(OpObserverTest, OnDropCollectionReturnsDropOpTime) {
     {
         AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
-        opObserver.onDropCollection(opCtx.get(), nss, uuid);
+        opObserver.onDropCollection(
+            opCtx.get(), nss, uuid, 0U, OpObserver::CollectionDropType::kTwoPhase);
         dropOpTime = OpObserver::Times::get(opCtx.get()).reservedOpTimes.front();
         wunit.commit();
     }
@@ -246,7 +375,7 @@ TEST_F(OpObserverTest, OnRenameCollectionReturnsRenameOpTime) {
         AutoGetDb autoDb(opCtx.get(), sourceNss.db(), MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
         opObserver.onRenameCollection(
-            opCtx.get(), sourceNss, targetNss, uuid, dropTargetUuid, stayTemp);
+            opCtx.get(), sourceNss, targetNss, uuid, dropTargetUuid, 0U, stayTemp);
         renameOpTime = OpObserver::Times::get(opCtx.get()).reservedOpTimes.front();
         wunit.commit();
     }
@@ -279,7 +408,7 @@ TEST_F(OpObserverTest, OnRenameCollectionOmitsDropTargetFieldIfDropTargetUuidIsN
     {
         AutoGetDb autoDb(opCtx.get(), sourceNss.db(), MODE_X);
         WriteUnitOfWork wunit(opCtx.get());
-        opObserver.onRenameCollection(opCtx.get(), sourceNss, targetNss, uuid, {}, stayTemp);
+        opObserver.onRenameCollection(opCtx.get(), sourceNss, targetNss, uuid, {}, 0U, stayTemp);
         wunit.commit();
     }
 
@@ -296,14 +425,13 @@ TEST_F(OpObserverTest, OnRenameCollectionOmitsDropTargetFieldIfDropTargetUuidIsN
 /**
  * Test fixture for testing OpObserver behavior specific to the SessionCatalog.
  */
-class OpObserverSessionCatalogTest : public OpObserverTest {
+class OpObserverSessionCatalogRollbackTest : public OpObserverTest {
 public:
     void setUp() override {
         OpObserverTest::setUp();
+
         auto opCtx = cc().makeOperationContext();
-        auto sessionCatalog = SessionCatalog::get(getServiceContext());
-        sessionCatalog->reset_forTest();
-        sessionCatalog->onStepUp(opCtx.get());
+        MongoDSessionCatalog::onStepUp(opCtx.get());
     }
 
     /**
@@ -328,155 +456,46 @@ public:
     }
 };
 
-TEST_F(OpObserverSessionCatalogTest, OnRollbackInvalidatesSessionCatalogIfSessionOpsRolledBack) {
-    OpObserverImpl opObserver;
-    auto opCtx = cc().makeOperationContext();
-    const NamespaceString nss("testDB", "testColl");
-
-    // Create a session.
-    auto sessionCatalog = SessionCatalog::get(getServiceContext());
-    auto sessionId = makeLogicalSessionIdForTest();
-    auto session = sessionCatalog->getOrCreateSession(opCtx.get(), sessionId);
-    const auto txnParticipant = TransactionParticipant::getFromNonCheckedOutSession(session.get());
-    txnParticipant->refreshFromStorageIfNeeded(opCtx.get());
-
-    // Simulate a write occurring on that session.
-    const TxnNumber txnNum = 0;
-    const StmtId stmtId = 1000;
-    simulateSessionWrite(opCtx.get(), txnParticipant, nss, txnNum, stmtId);
-
-    // Check that the statement executed.
-    ASSERT(txnParticipant->checkStatementExecutedNoOplogEntryFetch(txnNum, stmtId));
-
-    // The OpObserver should invalidate in-memory session state, so the check after this should
-    // fail.
-    OpObserver::RollbackObserverInfo rbInfo;
-    rbInfo.rollbackSessionIds = {UUID::gen()};
-    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
-    ASSERT_THROWS_CODE(txnParticipant->checkStatementExecutedNoOplogEntryFetch(txnNum, stmtId),
-                       DBException,
-                       ErrorCodes::ConflictingOperationInProgress);
-}
-
-TEST_F(OpObserverSessionCatalogTest,
+TEST_F(OpObserverSessionCatalogRollbackTest,
        OnRollbackDoesntInvalidateSessionCatalogIfNoSessionOpsRolledBack) {
-    OpObserverImpl opObserver;
-    auto opCtx = cc().makeOperationContext();
     const NamespaceString nss("testDB", "testColl");
 
-    // Create a session.
-    auto sessionCatalog = SessionCatalog::get(getServiceContext());
     auto sessionId = makeLogicalSessionIdForTest();
-    auto session = sessionCatalog->getOrCreateSession(opCtx.get(), sessionId);
-    const auto txnParticipant = TransactionParticipant::getFromNonCheckedOutSession(session.get());
-    txnParticipant->refreshFromStorageIfNeeded(opCtx.get());
 
-    // Simulate a write occurring on that session.
     const TxnNumber txnNum = 0;
     const StmtId stmtId = 1000;
-    simulateSessionWrite(opCtx.get(), txnParticipant, nss, txnNum, stmtId);
 
-    // Check that the statement executed.
-    ASSERT(txnParticipant->checkStatementExecutedNoOplogEntryFetch(txnNum, stmtId));
+    {
+        auto opCtx = cc().makeOperationContext();
+        opCtx->setLogicalSessionId(sessionId);
+        MongoDOperationContextSession ocs(opCtx.get());
+        const auto txnParticipant = TransactionParticipant::get(opCtx.get());
+        txnParticipant->refreshFromStorageIfNeeded();
 
-    // The OpObserver should not invalidate the in-memory session state, so the check after this
-    // should still succeed.
-    OpObserver::RollbackObserverInfo rbInfo;
-    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
-    ASSERT(txnParticipant->checkStatementExecutedNoOplogEntryFetch(txnNum, stmtId));
-}
+        // Simulate a write occurring on that session
+        simulateSessionWrite(opCtx.get(), txnParticipant, nss, txnNum, stmtId);
 
-/**
- * Test fixture with sessions and an extra-large oplog for testing large transactions.
- */
-class OpObserverLargeTransactionTest : public OpObserverSessionCatalogTest {
-private:
-    repl::ReplSettings createReplSettings() override {
-        repl::ReplSettings settings;
-        // We need an oplog comfortably large enough to hold an oplog entry that exceeds the BSON
-        // size limit.  Otherwise we will get the wrong error code when trying to write one.
-        settings.setOplogSizeBytes(BSONObjMaxInternalSize + 2 * 1024 * 1024);
-        settings.setReplSetString("mySet/node1:12345");
-        return settings;
+        // Check that the statement executed
+        ASSERT(txnParticipant->checkStatementExecutedNoOplogEntryFetch(stmtId));
     }
-};
 
-// Tests that a transaction aborts if it becomes too large only during the commit.
-TEST_F(OpObserverLargeTransactionTest, TransactionTooLargeWhileCommitting) {
-    OpObserverImpl opObserver;
-    auto opCtx = cc().makeOperationContext();
-    const NamespaceString nss("testDB", "testColl");
+    // Because there are no sessions to rollback, the OpObserver should not invalidate the in-memory
+    // session state, so the check after this should still succeed.
+    {
+        auto opCtx = cc().makeOperationContext();
 
-    // Create a session.
-    auto sessionCatalog = SessionCatalog::get(getServiceContext());
-    auto sessionId = makeLogicalSessionIdForTest();
-    auto session = sessionCatalog->getOrCreateSession(opCtx.get(), sessionId);
-    auto uuid = CollectionUUID::gen();
+        OpObserverImpl opObserver;
+        OpObserver::RollbackObserverInfo rbInfo;
+        opObserver.onReplicationRollback(opCtx.get(), rbInfo);
+    }
 
-    // Simulate adding transaction data to a session.
-    const TxnNumber txnNum = 0;
-    opCtx->setLogicalSessionId(sessionId);
-    opCtx->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx.get(), true, false, true);
-    auto txnParticipant = TransactionParticipant::get(opCtx.get());
-    txnParticipant->unstashTransactionResources(opCtx.get(), "insert");
-
-    // This size is crafted such that two operations of this size are not too big to fit in a single
-    // oplog entry, but two operations plus oplog overhead are too big to fit in a single oplog
-    // entry.
-    constexpr size_t kHalfTransactionSize = BSONObjMaxInternalSize / 2 - 175;
-    std::unique_ptr<uint8_t[]> halfTransactionData(new uint8_t[kHalfTransactionSize]());
-    auto operation = repl::OplogEntry::makeInsertOperation(
-        nss,
-        uuid,
-        BSON(
-            "_id" << 0 << "data"
-                  << BSONBinData(halfTransactionData.get(), kHalfTransactionSize, BinDataGeneral)));
-    txnParticipant->addTransactionOperation(opCtx.get(), operation);
-    txnParticipant->addTransactionOperation(opCtx.get(), operation);
-    ASSERT_THROWS_CODE(opObserver.onTransactionCommit(opCtx.get(), boost::none, boost::none),
-                       AssertionException,
-                       ErrorCodes::TransactionTooLarge);
-}
-
-TEST_F(OpObserverTest, OnRollbackInvalidatesAuthCacheWhenAuthNamespaceRolledBack) {
-    OpObserverImpl opObserver;
-    auto opCtx = cc().makeOperationContext();
-    auto authMgr = AuthorizationManager::get(getServiceContext());
-    auto initCacheGen = authMgr->getCacheGeneration();
-
-    // Verify that the rollback op observer invalidates the user cache for each auth namespace by
-    // checking that the cache generation changes after a call to the rollback observer method.
-    auto nss = AuthorizationManager::rolesCollectionNamespace;
-    OpObserver::RollbackObserverInfo rbInfo;
-    rbInfo.rollbackNamespaces = {AuthorizationManager::rolesCollectionNamespace};
-    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
-    ASSERT_NE(initCacheGen, authMgr->getCacheGeneration());
-
-    initCacheGen = authMgr->getCacheGeneration();
-    rbInfo.rollbackNamespaces = {AuthorizationManager::usersCollectionNamespace};
-    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
-    ASSERT_NE(initCacheGen, authMgr->getCacheGeneration());
-
-    initCacheGen = authMgr->getCacheGeneration();
-    rbInfo.rollbackNamespaces = {AuthorizationManager::versionCollectionNamespace};
-    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
-    ASSERT_NE(initCacheGen, authMgr->getCacheGeneration());
-}
-
-TEST_F(OpObserverTest, OnRollbackDoesntInvalidateAuthCacheWhenNoAuthNamespaceRolledBack) {
-    OpObserverImpl opObserver;
-    auto opCtx = cc().makeOperationContext();
-    auto authMgr = AuthorizationManager::get(getServiceContext());
-    auto initCacheGen = authMgr->getCacheGeneration();
-
-    // Verify that the rollback op observer doesn't invalidate the user cache.
-    auto nss = AuthorizationManager::rolesCollectionNamespace;
-    OpObserver::RollbackObserverInfo rbInfo;
-    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
-    auto newCacheGen = authMgr->getCacheGeneration();
-    ASSERT_EQ(newCacheGen, initCacheGen);
+    {
+        auto opCtx = cc().makeOperationContext();
+        opCtx->setLogicalSessionId(sessionId);
+        MongoDOperationContextSession ocs(opCtx.get());
+        const auto txnParticipant = TransactionParticipant::get(opCtx.get());
+        ASSERT(txnParticipant->checkStatementExecutedNoOplogEntryFetch(stmtId));
+    }
 }
 
 TEST_F(OpObserverTest, MultipleAboutToDeleteAndOnDelete) {
@@ -492,33 +511,64 @@ TEST_F(OpObserverTest, MultipleAboutToDeleteAndOnDelete) {
     opObserver.onDelete(opCtx.get(), nss, uuid, {}, false, {});
 }
 
+DEATH_TEST_F(OpObserverTest, AboutToDeleteMustPreceedOnDelete, "invariant") {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    opCtx->swapLockState(stdx::make_unique<LockerNoop>());
+    NamespaceString nss = {"test", "coll"};
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+}
+
+DEATH_TEST_F(OpObserverTest, EachOnDeleteRequiresAboutToDelete, "invariant") {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+    opCtx->swapLockState(stdx::make_unique<LockerNoop>());
+    NamespaceString nss = {"test", "coll"};
+    opObserver.aboutToDelete(opCtx.get(), nss, {});
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+}
+
+DEATH_TEST_F(OpObserverTest,
+             NodeCrashesIfShardIdentityDocumentRolledBack,
+             "Fatal Assertion 50712") {
+    OpObserverImpl opObserver;
+    auto opCtx = cc().makeOperationContext();
+
+    OpObserver::RollbackObserverInfo rbInfo;
+    rbInfo.shardIdentityRolledBack = true;
+    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
+}
+
 /**
  * Test fixture for testing OpObserver behavior specific to multi-document transactions.
  */
 
-class OpObserverTransactionTest : public OpObserverSessionCatalogTest {
+class OpObserverTransactionTest : public OpObserverTest {
 public:
     void setUp() override {
-        OpObserverSessionCatalogTest::setUp();
-
-        // Create a session.
+        OpObserverTest::setUp();
         _opCtx = cc().makeOperationContext();
-        auto sessionCatalog = SessionCatalog::get(getServiceContext());
-        auto sessionId = makeLogicalSessionIdForTest();
-        _session = sessionCatalog->getOrCreateSession(opCtx(), sessionId);
 
-        const auto txnParticipant = TransactionParticipant::getFromNonCheckedOutSession(session());
-        txnParticipant->refreshFromStorageIfNeeded(opCtx());
-
-        opCtx()->setLogicalSessionId(sessionId);
         _opObserver.emplace();
+
+        MongoDSessionCatalog::onStepUp(opCtx());
         _times.emplace(opCtx());
+
+        opCtx()->setLogicalSessionId(makeLogicalSessionIdForTest());
+        opCtx()->setTxnNumber(txnNum());
+        _sessionCheckout = std::make_unique<MongoDOperationContextSession>(opCtx());
+
+        const auto txnParticipant = TransactionParticipant::get(opCtx());
+        txnParticipant->beginOrContinue(*opCtx()->getTxnNumber(), false, true);
     }
 
     void tearDown() override {
+        _sessionCheckout.reset();
         _times.reset();
         _opCtx.reset();
-        OpObserverSessionCatalogTest::tearDown();
+
+        OpObserverTest::tearDown();
     }
 
 
@@ -529,18 +579,6 @@ protected:
         ASSERT_BSONOBJ_EQ(session()->getSessionId().toBSON(), oplogEntry.getObjectField("lsid"));
         ASSERT_EQ(*opCtx()->getTxnNumber(), oplogEntry.getField("txnNumber").safeNumberLong());
         ASSERT_EQ(expectedStmtId, oplogEntry.getIntField("stmtId"));
-    }
-
-    OperationContext* opCtx() {
-        return _opCtx.get();
-    }
-
-    Session* session() {
-        return _session->get();
-    }
-
-    OpObserverImpl& opObserver() {
-        return *_opObserver;
     }
 
     void assertTxnRecord(TxnNumber txnNum,
@@ -562,12 +600,12 @@ protected:
         ASSERT_EQ(txnState != boost::none,
                   txnRecordObj.hasField(SessionTxnRecord::kStateFieldName));
 
-        const auto txnParticipant = TransactionParticipant::getFromNonCheckedOutSession(session());
+        const auto txnParticipant = TransactionParticipant::get(session());
         if (!opTime.isNull()) {
             ASSERT_EQ(opTime, txnRecord.getLastWriteOpTime());
-            ASSERT_EQ(opTime, txnParticipant->getLastWriteOpTime(txnNum));
+            ASSERT_EQ(opTime, txnParticipant->getLastWriteOpTime());
         } else {
-            ASSERT_EQ(txnRecord.getLastWriteOpTime(), txnParticipant->getLastWriteOpTime(txnNum));
+            ASSERT_EQ(txnRecord.getLastWriteOpTime(), txnParticipant->getLastWriteOpTime());
         }
     }
 
@@ -579,6 +617,22 @@ protected:
         ASSERT(!cursor->more());
     }
 
+    Session* session() {
+        return OperationContextSession::get(opCtx());
+    }
+
+    OpObserverImpl& opObserver() {
+        return *_opObserver;
+    }
+
+    OperationContext* opCtx() {
+        return _opCtx.get();
+    }
+
+    TxnNumber& txnNum() {
+        return _txnNum;
+    }
+
 private:
     class ExposeOpObserverTimes : public OpObserver {
     public:
@@ -586,20 +640,64 @@ private:
     };
 
     ServiceContext::UniqueOperationContext _opCtx;
+
     boost::optional<OpObserverImpl> _opObserver;
     boost::optional<ExposeOpObserverTimes::ReservedTimes> _times;
-    boost::optional<ScopedSession> _session;
+
+    std::unique_ptr<MongoDOperationContextSession> _sessionCheckout;
+    TxnNumber _txnNum = 0;
 };
+
+/**
+ * Test fixture with sessions and an extra-large oplog for testing large transactions.
+ */
+class OpObserverLargeTransactionTest : public OpObserverTransactionTest {
+private:
+    repl::ReplSettings createReplSettings() override {
+        repl::ReplSettings settings;
+        // We need an oplog comfortably large enough to hold an oplog entry that exceeds the BSON
+        // size limit.  Otherwise we will get the wrong error code when trying to write one.
+        settings.setOplogSizeBytes(BSONObjMaxInternalSize + 2 * 1024 * 1024);
+        settings.setReplSetString("mySet/node1:12345");
+        return settings;
+    }
+};
+
+// Tests that a transaction aborts if it becomes too large only during the commit.
+TEST_F(OpObserverLargeTransactionTest, TransactionTooLargeWhileCommitting) {
+    const NamespaceString nss("testDB", "testColl");
+    auto uuid = CollectionUUID::gen();
+
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+
+    // This size is crafted such that two operations of this size are not too big to fit in a single
+    // oplog entry, but two operations plus oplog overhead are too big to fit in a single oplog
+    // entry.
+    constexpr size_t kHalfTransactionSize = BSONObjMaxInternalSize / 2 - 175;
+    std::unique_ptr<uint8_t[]> halfTransactionData(new uint8_t[kHalfTransactionSize]());
+    auto operation = repl::OplogEntry::makeInsertOperation(
+        nss,
+        uuid,
+        BSON(
+            "_id" << 0 << "data"
+                  << BSONBinData(halfTransactionData.get(), kHalfTransactionSize, BinDataGeneral)));
+    txnParticipant->addTransactionOperation(opCtx(), operation);
+    txnParticipant->addTransactionOperation(opCtx(), operation);
+    ASSERT_THROWS_CODE(opObserver().onTransactionCommit(
+                           opCtx(),
+                           boost::none,
+                           boost::none,
+                           txnParticipant->retrieveCompletedTransactionOperations(opCtx())),
+                       AssertionException,
+                       ErrorCodes::TransactionTooLarge);
+}
 
 TEST_F(OpObserverTransactionTest, TransactionalPrepareTest) {
     const NamespaceString nss1("testDB", "testColl");
     const NamespaceString nss2("testDB2", "testColl2");
     auto uuid1 = CollectionUUID::gen();
     auto uuid2 = CollectionUUID::gen();
-    const TxnNumber txnNum = 2;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "insert");
 
@@ -636,7 +734,8 @@ TEST_F(OpObserverTransactionTest, TransactionalPrepareTest) {
     {
         WriteUnitOfWork wuow(opCtx());
         OplogSlot slot = repl::getNextOpTime(opCtx());
-        opObserver().onTransactionPrepare(opCtx(), slot);
+        opObserver().onTransactionPrepare(
+            opCtx(), slot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.opTime.getTimestamp());
     }
 
@@ -695,10 +794,6 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedCommitTest) {
     const auto doc = BSON("_id" << 0 << "data"
                                 << "x");
 
-    const TxnNumber txnNum = 2;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "insert");
 
@@ -715,7 +810,8 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedCommitTest) {
         txnParticipant->transitionToPreparedforTest();
         const auto prepareSlot = repl::getNextOpTime(opCtx());
         prepareTimestamp = prepareSlot.opTime.getTimestamp();
-        opObserver().onTransactionPrepare(opCtx(), prepareSlot);
+        opObserver().onTransactionPrepare(
+            opCtx(), prepareSlot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
 
         commitSlot = repl::getNextOpTime(opCtx());
     }
@@ -723,7 +819,13 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedCommitTest) {
     // Mimic committing the transaction.
     opCtx()->setWriteUnitOfWork(nullptr);
     opCtx()->lockState()->unsetMaxLockTimeout();
-    opObserver().onTransactionCommit(opCtx(), commitSlot, prepareTimestamp);
+
+    txnParticipant->transitionToCommittingWithPrepareforTest();
+    opObserver().onTransactionCommit(
+        opCtx(),
+        commitSlot,
+        prepareTimestamp,
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
 
     repl::OplogInterfaceLocal oplogInterface(opCtx(), NamespaceString::kRsOplogNamespace.ns());
     auto oplogIter = oplogInterface.makeIterator();
@@ -765,10 +867,6 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedAbortTest) {
     const auto doc = BSON("_id" << 0 << "data"
                                 << "x");
 
-    const TxnNumber txnNum = 2;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "insert");
 
@@ -783,7 +881,8 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedAbortTest) {
 
         txnParticipant->transitionToPreparedforTest();
         const auto prepareSlot = repl::getNextOpTime(opCtx());
-        opObserver().onTransactionPrepare(opCtx(), prepareSlot);
+        opObserver().onTransactionPrepare(
+            opCtx(), prepareSlot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
         abortSlot = repl::getNextOpTime(opCtx());
     }
 
@@ -791,7 +890,7 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedAbortTest) {
     opCtx()->setWriteUnitOfWork(nullptr);
     opCtx()->lockState()->unsetMaxLockTimeout();
     opObserver().onTransactionAbort(opCtx(), abortSlot);
-    txnParticipant->transitionToAbortedforTest();
+    txnParticipant->transitionToAbortedWithPrepareforTest();
 
     repl::OplogInterfaceLocal oplogInterface(opCtx(), NamespaceString::kRsOplogNamespace.ns());
     auto oplogIter = oplogInterface.makeIterator();
@@ -830,10 +929,6 @@ TEST_F(OpObserverTransactionTest, TransactionalPreparedAbortTest) {
 TEST_F(OpObserverTransactionTest, TransactionalUnpreparedAbortTest) {
     const NamespaceString nss("testDB", "testColl");
     const auto uuid = CollectionUUID::gen();
-    const TxnNumber txnNum = 2;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "insert");
 
@@ -847,7 +942,7 @@ TEST_F(OpObserverTransactionTest, TransactionalUnpreparedAbortTest) {
         AutoGetCollection autoColl(opCtx(), nss, MODE_IX);
         opObserver().onInserts(opCtx(), nss, uuid, insert.begin(), insert.end(), false);
 
-        txnParticipant->transitionToAbortedforTest();
+        txnParticipant->transitionToAbortedWithoutPrepareforTest();
         opObserver().onTransactionAbort(opCtx(), boost::none);
     }
 
@@ -858,10 +953,6 @@ TEST_F(OpObserverTransactionTest, TransactionalUnpreparedAbortTest) {
 }
 
 TEST_F(OpObserverTransactionTest, PreparingEmptyTransactionLogsEmptyApplyOps) {
-    const TxnNumber txnNum = 2;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "prepareTransaction");
     txnParticipant->transitionToPreparedforTest();
@@ -869,7 +960,8 @@ TEST_F(OpObserverTransactionTest, PreparingEmptyTransactionLogsEmptyApplyOps) {
     {
         WriteUnitOfWork wuow(opCtx());
         OplogSlot slot = repl::getNextOpTime(opCtx());
-        opObserver().onTransactionPrepare(opCtx(), slot);
+        opObserver().onTransactionPrepare(
+            opCtx(), slot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.opTime.getTimestamp());
     }
 
@@ -885,10 +977,6 @@ TEST_F(OpObserverTransactionTest, PreparingEmptyTransactionLogsEmptyApplyOps) {
 }
 
 TEST_F(OpObserverTransactionTest, PreparingTransactionWritesToTransactionTable) {
-    const TxnNumber txnNum = 2;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "prepareTransaction");
     txnParticipant->transitionToPreparedforTest();
@@ -898,21 +986,18 @@ TEST_F(OpObserverTransactionTest, PreparingTransactionWritesToTransactionTable) 
         WriteUnitOfWork wuow(opCtx());
         OplogSlot slot = repl::getNextOpTime(opCtx());
         prepareOpTime = slot.opTime;
-        opObserver().onTransactionPrepare(opCtx(), slot);
+        opObserver().onTransactionPrepare(
+            opCtx(), slot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.opTime.getTimestamp());
     }
 
     ASSERT_EQ(prepareOpTime.getTimestamp(), opCtx()->recoveryUnit()->getPrepareTimestamp());
     txnParticipant->stashTransactionResources(opCtx());
-    assertTxnRecord(txnNum, prepareOpTime, DurableTxnStateEnum::kPrepared);
+    assertTxnRecord(txnNum(), prepareOpTime, DurableTxnStateEnum::kPrepared);
     txnParticipant->unstashTransactionResources(opCtx(), "abortTransaction");
 }
 
 TEST_F(OpObserverTransactionTest, AbortingUnpreparedTransactionDoesNotWriteToTransactionTable) {
-    const TxnNumber txnNum = 2;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "prepareTransaction");
 
@@ -926,10 +1011,6 @@ TEST_F(OpObserverTransactionTest, AbortingUnpreparedTransactionDoesNotWriteToTra
 }
 
 TEST_F(OpObserverTransactionTest, AbortingPreparedTransactionWritesToTransactionTable) {
-    const TxnNumber txnNum = 2;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "prepareTransaction");
 
@@ -937,7 +1018,8 @@ TEST_F(OpObserverTransactionTest, AbortingPreparedTransactionWritesToTransaction
     {
         WriteUnitOfWork wuow(opCtx());
         OplogSlot slot = repl::getNextOpTime(opCtx());
-        opObserver().onTransactionPrepare(opCtx(), slot);
+        opObserver().onTransactionPrepare(
+            opCtx(), slot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.opTime.getTimestamp());
         txnParticipant->transitionToPreparedforTest();
         abortSlot = repl::getNextOpTime(opCtx());
@@ -947,23 +1029,19 @@ TEST_F(OpObserverTransactionTest, AbortingPreparedTransactionWritesToTransaction
     opCtx()->setWriteUnitOfWork(nullptr);
     opCtx()->lockState()->unsetMaxLockTimeout();
     opObserver().onTransactionAbort(opCtx(), abortSlot);
-    txnParticipant->transitionToAbortedforTest();
+    txnParticipant->transitionToAbortedWithPrepareforTest();
 
     txnParticipant->stashTransactionResources(opCtx());
 
     // Abort the storage-transaction without calling the OpObserver.
     txnParticipant->shutdown();
 
-    assertTxnRecord(txnNum, {}, DurableTxnStateEnum::kAborted);
+    assertTxnRecord(txnNum(), {}, DurableTxnStateEnum::kAborted);
 }
 
 TEST_F(OpObserverTransactionTest, CommittingUnpreparedNonEmptyTransactionWritesToTransactionTable) {
     const NamespaceString nss("testDB", "testColl");
     const auto uuid = CollectionUUID::gen();
-    const TxnNumber txnNum = 2;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "prepareTransaction");
 
@@ -977,22 +1055,26 @@ TEST_F(OpObserverTransactionTest, CommittingUnpreparedNonEmptyTransactionWritesT
         opObserver().onInserts(opCtx(), nss, uuid, insert.begin(), insert.end(), false);
     }
 
-    opObserver().onTransactionCommit(opCtx(), boost::none, boost::none);
+    opObserver().onTransactionCommit(
+        opCtx(),
+        boost::none,
+        boost::none,
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
     opCtx()->getWriteUnitOfWork()->commit();
 
-    assertTxnRecord(txnNum, {}, DurableTxnStateEnum::kCommitted);
+    assertTxnRecord(txnNum(), {}, DurableTxnStateEnum::kCommitted);
 }
 
 TEST_F(OpObserverTransactionTest,
        CommittingUnpreparedEmptyTransactionDoesNotWriteToTransactionTable) {
-    const TxnNumber txnNum = 2;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "prepareTransaction");
 
-    opObserver().onTransactionCommit(opCtx(), boost::none, boost::none);
+    opObserver().onTransactionCommit(
+        opCtx(),
+        boost::none,
+        boost::none,
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
 
     txnParticipant->stashTransactionResources(opCtx());
 
@@ -1003,10 +1085,6 @@ TEST_F(OpObserverTransactionTest,
 }
 
 TEST_F(OpObserverTransactionTest, CommittingPreparedTransactionWritesToTransactionTable) {
-    const TxnNumber txnNum = 2;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "prepareTransaction");
 
@@ -1015,7 +1093,8 @@ TEST_F(OpObserverTransactionTest, CommittingPreparedTransactionWritesToTransacti
         WriteUnitOfWork wuow(opCtx());
         OplogSlot slot = repl::getNextOpTime(opCtx());
         prepareOpTime = slot.opTime;
-        opObserver().onTransactionPrepare(opCtx(), slot);
+        opObserver().onTransactionPrepare(
+            opCtx(), slot, txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
         opCtx()->recoveryUnit()->setPrepareTimestamp(slot.opTime.getTimestamp());
         txnParticipant->transitionToPreparedforTest();
     }
@@ -1027,9 +1106,15 @@ TEST_F(OpObserverTransactionTest, CommittingPreparedTransactionWritesToTransacti
     // Mimic committing the transaction.
     opCtx()->setWriteUnitOfWork(nullptr);
     opCtx()->lockState()->unsetMaxLockTimeout();
-    opObserver().onTransactionCommit(opCtx(), commitSlot, prepareOpTime.getTimestamp());
 
-    assertTxnRecord(txnNum, commitOpTime, DurableTxnStateEnum::kCommitted);
+    txnParticipant->transitionToCommittingWithPrepareforTest();
+    opObserver().onTransactionCommit(
+        opCtx(),
+        commitSlot,
+        prepareOpTime.getTimestamp(),
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
+
+    assertTxnRecord(txnNum(), commitOpTime, DurableTxnStateEnum::kCommitted);
 }
 
 TEST_F(OpObserverTransactionTest, TransactionalInsertTest) {
@@ -1037,10 +1122,6 @@ TEST_F(OpObserverTransactionTest, TransactionalInsertTest) {
     const NamespaceString nss2("testDB2", "testColl2");
     auto uuid1 = CollectionUUID::gen();
     auto uuid2 = CollectionUUID::gen();
-    const TxnNumber txnNum = 2;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "insert");
 
@@ -1063,7 +1144,11 @@ TEST_F(OpObserverTransactionTest, TransactionalInsertTest) {
     AutoGetCollection autoColl2(opCtx(), nss2, MODE_IX);
     opObserver().onInserts(opCtx(), nss1, uuid1, inserts1.begin(), inserts1.end(), false);
     opObserver().onInserts(opCtx(), nss2, uuid2, inserts2.begin(), inserts2.end(), false);
-    opObserver().onTransactionCommit(opCtx(), boost::none, boost::none);
+    opObserver().onTransactionCommit(
+        opCtx(),
+        boost::none,
+        boost::none,
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
     auto oplogEntryObj = getSingleOplogEntry(opCtx());
     checkCommonFields(oplogEntryObj);
     OplogEntry oplogEntry = assertGet(OplogEntry::parse(oplogEntryObj));
@@ -1114,10 +1199,6 @@ TEST_F(OpObserverTransactionTest, TransactionalUpdateTest) {
     const NamespaceString nss2("testDB2", "testColl2");
     auto uuid1 = CollectionUUID::gen();
     auto uuid2 = CollectionUUID::gen();
-    const TxnNumber txnNum = 3;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod opSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "update");
 
@@ -1144,7 +1225,11 @@ TEST_F(OpObserverTransactionTest, TransactionalUpdateTest) {
     AutoGetCollection autoColl2(opCtx(), nss2, MODE_IX);
     opObserver().onUpdate(opCtx(), update1);
     opObserver().onUpdate(opCtx(), update2);
-    opObserver().onTransactionCommit(opCtx(), boost::none, boost::none);
+    opObserver().onTransactionCommit(
+        opCtx(),
+        boost::none,
+        boost::none,
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
     auto oplogEntry = getSingleOplogEntry(opCtx());
     checkCommonFields(oplogEntry);
     auto o = oplogEntry.getObjectField("o");
@@ -1180,10 +1265,6 @@ TEST_F(OpObserverTransactionTest, TransactionalDeleteTest) {
     const NamespaceString nss2("testDB2", "testColl2");
     auto uuid1 = CollectionUUID::gen();
     auto uuid2 = CollectionUUID::gen();
-    const TxnNumber txnNum = 3;
-    opCtx()->setTxnNumber(txnNum);
-
-    OperationContextSessionMongod sessionTxnState(opCtx(), true, false, true);
 
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "delete");
@@ -1201,7 +1282,11 @@ TEST_F(OpObserverTransactionTest, TransactionalDeleteTest) {
                                BSON("_id" << 1 << "data"
                                           << "y"));
     opObserver().onDelete(opCtx(), nss2, uuid2, 0, false, boost::none);
-    opObserver().onTransactionCommit(opCtx(), boost::none, boost::none);
+    opObserver().onTransactionCommit(
+        opCtx(),
+        boost::none,
+        boost::none,
+        txnParticipant->retrieveCompletedTransactionOperations(opCtx()));
     auto oplogEntry = getSingleOplogEntry(opCtx());
     checkCommonFields(oplogEntry);
     auto o = oplogEntry.getObjectField("o");
@@ -1224,35 +1309,6 @@ TEST_F(OpObserverTransactionTest, TransactionalDeleteTest) {
     ASSERT_BSONOBJ_EQ(oExpected, o);
     ASSERT_FALSE(oplogEntry.hasField("prepare"));
     ASSERT_FALSE(oplogEntry.getBoolField("prepare"));
-}
-
-DEATH_TEST_F(OpObserverTest, AboutToDeleteMustPreceedOnDelete, "invariant") {
-    OpObserverImpl opObserver;
-    auto opCtx = cc().makeOperationContext();
-    opCtx->swapLockState(stdx::make_unique<LockerNoop>());
-    NamespaceString nss = {"test", "coll"};
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
-}
-
-DEATH_TEST_F(OpObserverTest, EachOnDeleteRequiresAboutToDelete, "invariant") {
-    OpObserverImpl opObserver;
-    auto opCtx = cc().makeOperationContext();
-    opCtx->swapLockState(stdx::make_unique<LockerNoop>());
-    NamespaceString nss = {"test", "coll"};
-    opObserver.aboutToDelete(opCtx.get(), nss, {});
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
-}
-
-DEATH_TEST_F(OpObserverTest,
-             NodeCrashesIfShardIdentityDocumentRolledBack,
-             "Fatal Assertion 50712") {
-    OpObserverImpl opObserver;
-    auto opCtx = cc().makeOperationContext();
-
-    OpObserver::RollbackObserverInfo rbInfo;
-    rbInfo.shardIdentityRolledBack = true;
-    opObserver.onReplicationRollback(opCtx.get(), rbInfo);
 }
 
 }  // namespace

@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2018 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
@@ -34,7 +36,7 @@
 
 #include "mongo/base/initializer.h"
 #include "mongo/config.h"
-#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/uuid_catalog.h"
@@ -44,18 +46,17 @@
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/global_settings.h"
-#include "mongo/db/index_rebuilder.h"
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/storage_interface_impl.h"
-#include "mongo/db/session_catalog.h"
 #include "mongo/db/session_killer.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/ttl.h"
+#include "mongo/embedded/index_builds_coordinator_embedded.h"
 #include "mongo/embedded/logical_session_cache_factory_embedded.h"
 #include "mongo/embedded/periodic_runner_embedded.h"
 #include "mongo/embedded/replication_coordinator_embedded.h"
@@ -97,6 +98,10 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
     return Status::OK();
 }
 
+void setUpCatalog(ServiceContext* serviceContext) {
+    DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
+}
+
 // Create a minimalistic replication coordinator to provide a limited interface for users. Not
 // functional to provide any replication logic.
 ServiceContext::ConstructorActionRegisterer replicationManagerInitializer(
@@ -111,6 +116,9 @@ ServiceContext::ConstructorActionRegisterer replicationManagerInitializer(
         auto replCoord = std::make_unique<ReplicationCoordinatorEmbedded>(serviceContext);
         repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
         repl::setOplogCollectionName(serviceContext);
+
+        IndexBuildsCoordinator::set(serviceContext,
+                                    std::make_unique<IndexBuildsCoordinatorEmbedded>());
     });
 
 MONGO_INITIALIZER(fsyncLockedForWriting)(InitializerContext* context) {
@@ -137,41 +145,41 @@ using std::endl;
 
 void shutdown(ServiceContext* srvContext) {
 
-    Client::initThreadIfNotAlready();
-    auto const client = Client::getCurrent();
-    auto const serviceContext = client->getServiceContext();
-    invariant(srvContext == serviceContext);
-
-    serviceContext->setKillAllOperations();
-
-    // We should always be able to acquire the global lock at shutdown.
-    // Close all open databases, shutdown storage engine and run all deinitializers.
-    auto shutdownOpCtx = serviceContext->makeOperationContext(client);
     {
-        UninterruptibleLockGuard noInterrupt(shutdownOpCtx->lockState());
-        Lock::GlobalLock lk(shutdownOpCtx.get(), MODE_X);
-        DatabaseHolder::getDatabaseHolder().closeAll(shutdownOpCtx.get(), "shutdown");
+        ThreadClient tc(srvContext);
+        auto const client = Client::getCurrent();
+        auto const serviceContext = client->getServiceContext();
 
-        LogicalSessionCache::set(serviceContext, nullptr);
+        serviceContext->setKillAllOperations();
 
-        // Shut down the background periodic task runner
-        if (auto runner = serviceContext->getPeriodicRunner()) {
-            runner->shutdown();
+        // We should always be able to acquire the global lock at shutdown.
+        // Close all open databases, shutdown storage engine and run all deinitializers.
+        auto shutdownOpCtx = serviceContext->makeOperationContext(client);
+        {
+            UninterruptibleLockGuard noInterrupt(shutdownOpCtx->lockState());
+            Lock::GlobalLock lk(shutdownOpCtx.get(), MODE_X);
+            auto databaseHolder = DatabaseHolder::get(shutdownOpCtx.get());
+            databaseHolder->closeAll(shutdownOpCtx.get());
+
+            LogicalSessionCache::set(serviceContext, nullptr);
+
+            // Shut down the background periodic task runner, before the storage engine.
+            if (auto runner = serviceContext->getPeriodicRunner()) {
+                runner->shutdown();
+            }
+
+            repl::ReplicationCoordinator::get(serviceContext)->shutdown(shutdownOpCtx.get());
+            IndexBuildsCoordinator::get(serviceContext)->shutdown();
+
+            // Global storage engine may not be started in all cases before we exit
+            if (serviceContext->getStorageEngine()) {
+                shutdownGlobalStorageEngineCleanly(serviceContext);
+            }
+
+            Status status = mongo::runGlobalDeinitializers();
+            uassertStatusOKWithContext(status, "Global deinitilization failed");
         }
-
-        // Global storage engine may not be started in all cases before we exit
-        if (serviceContext->getStorageEngine()) {
-            shutdownGlobalStorageEngineCleanly(serviceContext);
-        }
-
-        Status status = mongo::runGlobalDeinitializers();
-        uassertStatusOKWithContext(status, "Global deinitilization failed");
     }
-    shutdownOpCtx.reset();
-
-    if (Client::getCurrent())
-        Client::destroy();
-
     setGlobalServiceContext(nullptr);
 
     log(LogComponent::kControl) << "now exiting";
@@ -217,7 +225,14 @@ ServiceContext* initialize(const char* yaml_config) {
 
     DEV log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
 
+    // The periodic runner is required by the storage engine to be running beforehand.
+    auto periodicRunner = std::make_unique<PeriodicRunnerEmbedded>(
+        serviceContext, serviceContext->getPreciseClockSource());
+    periodicRunner->startup();
+    serviceContext->setPeriodicRunner(std::move(periodicRunner));
+
     initializeStorageEngine(serviceContext, StorageEngineInitFlags::kAllowNoLockFile);
+    setUpCatalog(serviceContext);
 
     // Warn if we detect configurations for multiple registered storage engines in the same
     // configuration file/environment.
@@ -299,15 +314,6 @@ ServiceContext* initialize(const char* yaml_config) {
 
     // This is for security on certain platforms (nonce generation)
     srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));
-
-    if (!storageGlobalParams.readOnly) {
-        restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
-    }
-
-    auto periodicRunner = std::make_unique<PeriodicRunnerEmbedded>(
-        serviceContext, serviceContext->getPreciseClockSource());
-    periodicRunner->startup();
-    serviceContext->setPeriodicRunner(std::move(periodicRunner));
 
     // Set up the logical session cache
     auto sessionCache = makeLogicalSessionCacheEmbedded();

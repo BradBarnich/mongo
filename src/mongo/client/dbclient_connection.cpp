@@ -1,30 +1,33 @@
 // dbclient.cpp - connect to a Mongo database as a database, from C++
 
-/*    Copyright 2009 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
@@ -45,7 +48,6 @@
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
-#include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
@@ -173,6 +175,14 @@ void DBClientConnection::_auth(const BSONObj& params) {
     DBClientBase::_auth(params);
 }
 
+Status DBClientConnection::authenticateInternalUser() {
+    if (autoReconnect) {
+        _internalAuthOnReconnect = true;
+    }
+
+    return DBClientBase::authenticateInternalUser();
+}
+
 bool DBClientConnection::connect(const HostAndPort& server,
                                  StringData applicationName,
                                  std::string& errmsg) {
@@ -292,25 +302,8 @@ Status DBClientConnection::connectSocketOnly(const HostAndPort& serverAddress) {
                                     << ", address resolved to 0.0.0.0");
     }
 
-    transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode;
-#ifdef MONGO_CONFIG_SSL
-    // Prefer to get SSL mode directly from our URI, but if it is not set, fall back to
-    // checking global SSL params. DBClientConnections create through the shell will have a
-    // meaningful URI set, but DBClientConnections created from within the server may not.
-    auto options = _uri.getOptions();
-    auto iter = options.find("ssl");
-    if (iter != options.end()) {
-        if (iter->second == "true") {
-            sslMode = transport::kEnableSSL;
-        } else {
-            sslMode = transport::kDisableSSL;
-        }
-    }
-
-#endif
-
-    auto tl = getGlobalServiceContext()->getTransportLayer();
-    auto sws = tl->connect(serverAddress, sslMode, _socketTimeout.value_or(Milliseconds{5000}));
+    auto sws = getGlobalServiceContext()->getTransportLayer()->connect(
+        serverAddress, _uri.getSSLMode(), _socketTimeout.value_or(Milliseconds{5000}));
     if (!sws.isOK()) {
         return Status(ErrorCodes::HostUnreachable,
                       str::stream() << "couldn't connect to server " << _serverAddress.toString()
@@ -338,6 +331,7 @@ Status DBClientConnection::connectSocketOnly(const HostAndPort& serverAddress) {
 
 void DBClientConnection::logout(const string& dbname, BSONObj& info) {
     authCache.erase(dbname);
+    _internalAuthOnReconnect = false;
     runCommand(dbname, BSON("logout" << 1), info);
 }
 
@@ -451,7 +445,7 @@ void DBClientConnection::_checkConnection() {
         throwSocketError(SocketErrorKind::FAILED_STATE, toString());
 
     // Don't hammer reconnects, backoff if needed
-    autoReconnectBackoff.nextSleepMillis();
+    sleepFor(_autoReconnectBackoff.nextSleep());
 
     LOG(_logLevel) << "trying reconnect to " << toString() << endl;
     string errmsg;
@@ -467,16 +461,18 @@ void DBClientConnection::_checkConnection() {
     }
 
     LOG(_logLevel) << "reconnect " << toString() << " ok" << endl;
-    for (map<string, BSONObj>::const_iterator i = authCache.begin(); i != authCache.end(); i++) {
-        try {
-            DBClientConnection::_auth(i->second);
-        } catch (AssertionException& ex) {
-            if (ex.code() != ErrorCodes::AuthenticationFailed)
-                throw;
-            LOG(_logLevel) << "reconnect: auth failed "
-                           << i->second[auth::getSaslCommandUserDBFieldName()]
-                           << i->second[auth::getSaslCommandUserFieldName()] << ' ' << ex.what()
-                           << std::endl;
+    if (_internalAuthOnReconnect) {
+        uassertStatusOK(authenticateInternalUser());
+    } else {
+        for (const auto& kv : authCache) {
+            try {
+                DBClientConnection::_auth(kv.second);
+            } catch (ExceptionFor<ErrorCodes::AuthenticationFailed>& ex) {
+                LOG(_logLevel) << "reconnect: auth failed "
+                               << kv.second[auth::getSaslCommandUserDBFieldName()]
+                               << kv.second[auth::getSaslCommandUserFieldName()] << ' ' << ex.what()
+                               << std::endl;
+            }
         }
     }
 }
@@ -550,7 +546,7 @@ DBClientConnection::DBClientConnection(bool _autoReconnect,
                                        MongoURI uri,
                                        const HandshakeValidationHook& hook)
     : autoReconnect(_autoReconnect),
-      autoReconnectBackoff(1000, 2000),
+      _autoReconnectBackoff(Seconds(1), Seconds(2)),
       _hook(hook),
       _uri(std::move(uri)) {
     _numConnections.fetchAndAdd(1);
@@ -558,17 +554,17 @@ DBClientConnection::DBClientConnection(bool _autoReconnect,
 
 void DBClientConnection::say(Message& toSend, bool isRetry, string* actualServer) {
     checkConnection();
-    auto killSessionOnError = MakeGuard([this] { _markFailed(kEndSession); });
+    auto killSessionOnError = makeGuard([this] { _markFailed(kEndSession); });
 
     toSend.header().setId(nextMessageId());
     toSend.header().setResponseToMsgId(0);
     uassertStatusOK(
         _session->sinkMessage(uassertStatusOK(_compressorManager.compressMessage(toSend))));
-    killSessionOnError.Dismiss();
+    killSessionOnError.dismiss();
 }
 
 bool DBClientConnection::recv(Message& m, int lastRequestId) {
-    auto killSessionOnError = MakeGuard([this] { _markFailed(kEndSession); });
+    auto killSessionOnError = makeGuard([this] { _markFailed(kEndSession); });
     auto swm = _session->sourceMessage();
     if (!swm.isOK()) {
         return false;
@@ -583,7 +579,7 @@ bool DBClientConnection::recv(Message& m, int lastRequestId) {
         m = uassertStatusOK(_compressorManager.decompressMessage(m));
     }
 
-    killSessionOnError.Dismiss();
+    killSessionOnError.dismiss();
     return true;
 }
 
@@ -592,7 +588,7 @@ bool DBClientConnection::call(Message& toSend,
                               bool assertOk,
                               string* actualServer) {
     checkConnection();
-    auto killSessionOnError = MakeGuard([this] { _markFailed(kEndSession); });
+    auto killSessionOnError = makeGuard([this] { _markFailed(kEndSession); });
     auto maybeThrow = [&](const auto& errStatus) {
         if (assertOk)
             uasserted(10278,
@@ -624,7 +620,7 @@ bool DBClientConnection::call(Message& toSend,
         response = uassertStatusOK(_compressorManager.decompressMessage(response));
     }
 
-    killSessionOnError.Dismiss();
+    killSessionOnError.dismiss();
     return true;
 }
 
@@ -670,6 +666,6 @@ void DBClientConnection::handleNotMasterResponse(const BSONObj& replyBody,
     _markFailed(kSetFlag);
 }
 
-AtomicInt32 DBClientConnection::_numConnections;
+AtomicWord<int> DBClientConnection::_numConnections;
 
 }  // namespace mongo

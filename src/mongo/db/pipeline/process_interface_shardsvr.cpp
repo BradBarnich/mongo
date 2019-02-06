@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
@@ -42,17 +44,14 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/ops/write_ops_gen.h"
-#include "mongo/db/pipeline/document_source_cursor.h"
-#include "mongo/db/pipeline/pipeline_d.h"
+#include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/session_catalog.h"
-#include "mongo/db/stats/fill_locker_info.h"
-#include "mongo/db/stats/storage_stats.h"
-#include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/query/document_source_merge_cursors.h"
 #include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/log.h"
 
@@ -68,155 +67,65 @@ using write_ops::UpdateOpEntry;
 
 namespace {
 
-/**
- * Builds an ordered insert op on namespace 'nss' and documents to be written 'objs'.
- */
-Insert buildInsertOp(const NamespaceString& nss,
-                     std::vector<BSONObj>&& objs,
-                     bool bypassDocValidation) {
-    Insert insertOp(nss);
-    insertOp.setDocuments(std::move(objs));
-    insertOp.setWriteCommandBase([&] {
-        write_ops::WriteCommandBase wcb;
-        wcb.setOrdered(true);
-        wcb.setBypassDocumentValidation(bypassDocValidation);
-        return wcb;
-    }());
-    return insertOp;
-}
-
-/**
- * Builds an ordered update op on namespace 'nss' with update entries {q: <queries>, u: <updates>}.
- *
- * Note that 'queries' and 'updates' must be the same length.
- */
-Update buildUpdateOp(const NamespaceString& nss,
-                     std::vector<BSONObj>&& queries,
-                     std::vector<BSONObj>&& updates,
-                     bool upsert,
-                     bool multi,
-                     bool bypassDocValidation) {
-    Update updateOp(nss);
-    updateOp.setUpdates([&] {
-        std::vector<UpdateOpEntry> updateEntries;
-        for (size_t index = 0; index < queries.size(); ++index) {
-            updateEntries.push_back([&] {
-                UpdateOpEntry entry;
-                entry.setQ(std::move(queries[index]));
-                entry.setU(std::move(updates[index]));
-                entry.setUpsert(upsert);
-                entry.setMulti(multi);
-                return entry;
-            }());
-        }
-        return updateEntries;
-    }());
-    updateOp.setWriteCommandBase([&] {
-        write_ops::WriteCommandBase wcb;
-        wcb.setOrdered(true);
-        wcb.setBypassDocumentValidation(bypassDocValidation);
-        return wcb;
-    }());
-    return updateOp;
-}
-
-// Returns true if the field names of 'keyPattern' are exactly those in 'uniqueKeyPaths', and each
-// of the elements of 'keyPattern' is numeric, i.e. not "text", "$**", or any other special type of
-// index.
-bool keyPatternNamesExactPaths(const BSONObj& keyPattern,
-                               const std::set<FieldPath>& uniqueKeyPaths) {
-    size_t nFieldsMatched = 0;
-    for (auto&& elem : keyPattern) {
-        if (!elem.isNumber()) {
-            return false;
-        }
-        if (uniqueKeyPaths.find(elem.fieldNameStringData()) == uniqueKeyPaths.end()) {
-            return false;
-        }
-        ++nFieldsMatched;
+// Attaches the write concern to the given batch request. If it looks like 'writeConcern' has
+// been default initialized to {w: 0, wtimeout: 0} then we do not bother attaching it.
+void attachWriteConcern(BatchedCommandRequest* request, const WriteConcernOptions& writeConcern) {
+    if (!writeConcern.wMode.empty() || writeConcern.wNumNodes > 0) {
+        request->setWriteConcern(writeConcern.toBSON());
     }
-    return nFieldsMatched == uniqueKeyPaths.size();
-}
-
-bool supportsUniqueKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                       const IndexCatalogEntry* index,
-                       const std::set<FieldPath>& uniqueKeyPaths) {
-    return (index->descriptor()->unique() && !index->descriptor()->isPartial() &&
-            keyPatternNamesExactPaths(index->descriptor()->keyPattern(), uniqueKeyPaths) &&
-            CollatorInterface::collatorsMatch(index->getCollator(), expCtx->getCollator()));
 }
 
 }  // namespace
 
-std::pair<std::vector<FieldPath>, bool> MongoInterfaceShardServer::collectDocumentKeyFields(
-    OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const {
+void MongoInterfaceShardServer::checkRoutingInfoEpochOrThrow(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& nss,
+    ChunkVersion targetCollectionVersion) const {
+    auto catalogCache = Grid::get(expCtx->opCtx)->catalogCache();
+    return catalogCache->checkEpochOrThrow(nss, targetCollectionVersion);
+}
+
+std::pair<std::vector<FieldPath>, bool>
+MongoInterfaceShardServer::collectDocumentKeyFieldsForHostedCollection(OperationContext* opCtx,
+                                                                       const NamespaceString& nss,
+                                                                       UUID uuid) const {
     invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
 
-    boost::optional<UUID> uuid;
-    NamespaceString nss;
-    if (nssOrUUID.uuid()) {
-        uuid = *(nssOrUUID.uuid());
-        nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(*uuid);
-        // An empty namespace indicates that the collection has been dropped. Treat it as unsharded
-        // and mark the fields as final.
-        if (nss.isEmpty()) {
-            return {{"_id"}, true};
-        }
-    } else if (nssOrUUID.nss()) {
-        nss = *(nssOrUUID.nss());
-    }
-
-    // Before taking a collection lock to retrieve the shard key fields, consult the catalog cache
-    // to determine whether the collection is sharded in the first place.
-    auto catalogCache = Grid::get(opCtx)->catalogCache();
-
-    const bool collectionIsSharded = catalogCache && [&]() {
-        auto routingInfo = catalogCache->getCollectionRoutingInfo(opCtx, nss);
-        return routingInfo.isOK() && routingInfo.getValue().cm();
+    const auto metadata = [opCtx, &nss]() -> ScopedCollectionMetadata {
+        Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
+        Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_IS);
+        return CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
     }();
 
-    // Collection exists and is not sharded, mark as not final.
-    if (!collectionIsSharded) {
+    if (!metadata->isSharded() || !metadata->uuidMatches(uuid)) {
+        // An unsharded collection can still become sharded so is not final. If the uuid doesn't
+        // match the one stored in the ScopedCollectionMetadata, this implies that the collection
+        // has been dropped and recreated as sharded. We don't know what the old document key fields
+        // might have been in this case so we return just _id.
         return {{"_id"}, false};
     }
 
-    auto scm = [opCtx, &nss]() -> ScopedCollectionMetadata {
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
-    }();
-
-    // If the UUID is set in 'nssOrUuid', check that the UUID in the ScopedCollectionMetadata
-    // matches. Otherwise, this implies that the collection has been dropped and recreated as
-    // sharded.
-    if (!scm->isSharded() || (uuid && !scm->uuidMatches(*uuid))) {
-        return {{"_id"}, false};
-    }
-
-    // Unpack the shard key.
-    std::vector<FieldPath> result;
-    bool gotId = false;
-    for (auto& field : scm->getKeyPatternFields()) {
-        result.emplace_back(field->dottedField());
-        gotId |= (result.back().fullPath() == "_id");
-    }
-    if (!gotId) {  // If not part of the shard key, "_id" comes last.
-        result.emplace_back("_id");
-    }
-    // Collection is now sharded so the document key fields will never change, mark as final.
-    return {result, true};
+    // Unpack the shard key. Collection is now sharded so the document key fields will never change,
+    // mark as final.
+    return {_shardKeyToDocumentKeyFields(metadata->getKeyPatternFields()), true};
 }
 
 void MongoInterfaceShardServer::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                        const NamespaceString& ns,
-                                       std::vector<BSONObj>&& objs) {
+                                       std::vector<BSONObj>&& objs,
+                                       const WriteConcernOptions& wc,
+                                       boost::optional<OID> targetEpoch) {
     BatchedCommandResponse response;
     BatchWriteExecStats stats;
 
-    ClusterWriter::write(
-        expCtx->opCtx,
-        BatchedCommandRequest(buildInsertOp(ns, std::move(objs), expCtx->bypassDocumentValidation)),
-        &stats,
-        &response);
+    BatchedCommandRequest insertCommand(
+        buildInsertOp(ns, std::move(objs), expCtx->bypassDocumentValidation));
+
+    // If applicable, attach a write concern to the batched command request.
+    attachWriteConcern(&insertCommand, wc);
+
+    ClusterWriter::write(expCtx->opCtx, insertCommand, &stats, &response, targetEpoch);
+
     // TODO SERVER-35403: Add more context for which shard produced the error.
     uassertStatusOKWithContext(response.toStatus(), "Insert failed: ");
 }
@@ -225,21 +134,70 @@ void MongoInterfaceShardServer::update(const boost::intrusive_ptr<ExpressionCont
                                        const NamespaceString& ns,
                                        std::vector<BSONObj>&& queries,
                                        std::vector<BSONObj>&& updates,
+                                       const WriteConcernOptions& wc,
                                        bool upsert,
-                                       bool multi) {
+                                       bool multi,
+                                       boost::optional<OID> targetEpoch) {
     BatchedCommandResponse response;
     BatchWriteExecStats stats;
-    ClusterWriter::write(expCtx->opCtx,
-                         BatchedCommandRequest(buildUpdateOp(ns,
-                                                             std::move(queries),
-                                                             std::move(updates),
-                                                             upsert,
-                                                             multi,
-                                                             expCtx->bypassDocumentValidation)),
-                         &stats,
-                         &response);
+
+    BatchedCommandRequest updateCommand(buildUpdateOp(ns,
+                                                      std::move(queries),
+                                                      std::move(updates),
+                                                      upsert,
+                                                      multi,
+                                                      expCtx->bypassDocumentValidation));
+
+    // If applicable, attach a write concern to the batched command request.
+    attachWriteConcern(&updateCommand, wc);
+
+    ClusterWriter::write(expCtx->opCtx, updateCommand, &stats, &response, targetEpoch);
+
     // TODO SERVER-35403: Add more context for which shard produced the error.
     uassertStatusOKWithContext(response.toStatus(), "Update failed: ");
+}
+
+unique_ptr<Pipeline, PipelineDeleter> MongoInterfaceShardServer::attachCursorSourceToPipeline(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* ownedPipeline) {
+    std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
+                                                        PipelineDeleter(expCtx->opCtx));
+
+    invariant(pipeline->getSources().empty() ||
+              !dynamic_cast<DocumentSourceMergeCursors*>(pipeline->getSources().front().get()));
+
+    // $lookup on a sharded collection is not allowed in a transaction. We assume that if we're in
+    // a transaction, the foreign collection is unsharded. Otherwise, we may access the catalog
+    // cache, and attempt to do a network request while holding locks.
+    // TODO: SERVER-39162 allow $lookup in sharded transactions.
+    auto txnParticipant = TransactionParticipant::get(expCtx->opCtx);
+    const bool inTxn = txnParticipant && txnParticipant->inMultiDocumentTransaction();
+
+    const bool isSharded = [&]() {
+        if (inTxn || !ShardingState::get(expCtx->opCtx)->enabled()) {
+            // Sharding isn't enabled or we're in a transaction. In either case we assume it's
+            // unsharded.
+            return false;
+        } else if (expCtx->ns.db() == "local") {
+            // This may be a change stream examining the oplog. We know the oplog (or any local
+            // collections for that matter) will never be sharded.
+            return false;
+        }
+        return uassertStatusOK(getCollectionRoutingInfoForTxnCmd(expCtx->opCtx, expCtx->ns)).cm() !=
+            nullptr;
+    }();
+
+    if (isSharded) {
+        // For a sharded collection we may have to establish cursors on a remote host.
+        return sharded_agg_helpers::targetShardsAndAddMergeCursors(expCtx, pipeline.release());
+    }
+
+    // Perform a "local read", the same as if we weren't a shard server.
+
+    // TODO SERVER-39015 we should do a shard version check here after we acquire a lock within
+    // this function, to be sure the collection didn't become sharded between the time we checked
+    // whether it's sharded and the time we took the lock.
+
+    return MongoInterfaceStandalone::attachCursorSourceToPipeline(expCtx, pipeline.release());
 }
 
 }  // namespace mongo

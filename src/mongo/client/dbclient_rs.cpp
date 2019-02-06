@@ -1,28 +1,31 @@
-/*    Copyright 2009 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
@@ -294,11 +297,7 @@ DBClientConnection* DBClientReplicaSet::checkMaster() {
 
     _masterHost = h;
 
-    MongoURI masterUri;
-    if (!_uri.isValid())
-        masterUri = MongoURI(ConnectionString(_masterHost));
-    else
-        masterUri = _uri.cloneURIForServer(_masterHost);
+    MongoURI masterUri = _uri.cloneURIForServer(_masterHost);
 
     string errmsg;
     DBClientConnection* newConn = NULL;
@@ -358,6 +357,14 @@ bool DBClientReplicaSet::checkLastHost(const ReadPreferenceSetting* readPref) {
 }
 
 void DBClientReplicaSet::_authConnection(DBClientConnection* conn) {
+    if (_internalAuthRequested) {
+        auto status = conn->authenticateInternalUser();
+        if (!status.isOK()) {
+            warning() << "cached auth failed for set " << _setName << ": " << status;
+        }
+        return;
+    }
+
     for (map<string, BSONObj>::const_iterator i = _auths.begin(); i != _auths.end(); ++i) {
         try {
             conn->auth(i->second);
@@ -370,6 +377,7 @@ void DBClientReplicaSet::_authConnection(DBClientConnection* conn) {
 }
 
 void DBClientReplicaSet::logoutAll(DBClientConnection* conn) {
+    _internalAuthRequested = false;
     for (map<string, BSONObj>::const_iterator i = _auths.begin(); i != _auths.end(); ++i) {
         BSONObj response;
         try {
@@ -403,33 +411,26 @@ bool DBClientReplicaSet::connect() {
     return _getMonitor()->getHostOrRefresh(anyUpHost).getNoThrow().isOK();
 }
 
-static bool isAuthenticationException(const DBException& ex) {
-    return ex.code() == ErrorCodes::AuthenticationFailed;
-}
-
-void DBClientReplicaSet::_auth(const BSONObj& params) {
+template <typename Authenticate>
+Status DBClientReplicaSet::_runAuthLoop(Authenticate authCb) {
     // We prefer to authenticate against a primary, but otherwise a secondary is ok too
     // Empty tag matches every secondary
-    shared_ptr<ReadPreferenceSetting> readPref(
-        new ReadPreferenceSetting(ReadPreference::PrimaryPreferred, TagSet()));
+    const auto readPref =
+        std::make_shared<ReadPreferenceSetting>(ReadPreference::PrimaryPreferred, TagSet());
 
-    LOG(3) << "dbclient_rs authentication of " << _getMonitor()->getName() << endl;
+    LOG(3) << "dbclient_rs authentication of " << _getMonitor()->getName();
 
     // NOTE that we retry MAX_RETRY + 1 times, since we're always primary preferred we don't
     // fallback to the primary.
     Status lastNodeStatus = Status::OK();
     for (size_t retry = 0; retry < MAX_RETRY + 1; retry++) {
         try {
-            DBClientConnection* conn = selectNodeUsingTags(readPref);
-
-            if (conn == NULL) {
+            auto conn = selectNodeUsingTags(readPref);
+            if (conn == nullptr) {
                 break;
             }
 
-            conn->auth(params);
-
-            // Cache the new auth information since we now validated it's good
-            _auths[params[saslCommandUserDBFieldName].str()] = params.getOwned();
+            authCb(conn);
 
             // Ensure the only child connection open is the one we authenticated against - other
             // child connections may not have full authentication information.
@@ -442,27 +443,46 @@ void DBClientReplicaSet::_auth(const BSONObj& params) {
                 resetMaster();
             }
 
-            return;
-        } catch (const DBException& ex) {
-            // We care if we can't authenticate (i.e. bad password) in credential params.
-            if (isAuthenticationException(ex)) {
-                throw;
+            return Status::OK();
+        } catch (const DBException& e) {
+            auto status = e.toStatus();
+            if (status == ErrorCodes::AuthenticationFailed) {
+                return status;
             }
 
             lastNodeStatus =
-                ex.toStatus(str::stream() << "can't authenticate against replica set node "
-                                          << _lastSlaveOkHost);
+                status.withContext(str::stream() << "can't authenticate against replica set node "
+                                                 << _lastSlaveOkHost);
             _invalidateLastSlaveOkCache(lastNodeStatus);
         }
     }
 
     if (lastNodeStatus.isOK()) {
-        StringBuilder assertMsgB;
-        assertMsgB << "Failed to authenticate, no good nodes in " << _getMonitor()->getName();
-        uasserted(ErrorCodes::HostNotFound, assertMsgB.str());
+        return Status(ErrorCodes::HostNotFound,
+                      str::stream() << "Failed to authenticate, no good nodes in "
+                                    << _getMonitor()->getName());
     } else {
-        uassertStatusOK(lastNodeStatus);
+        return lastNodeStatus;
     }
+}
+
+Status DBClientReplicaSet::authenticateInternalUser() {
+    if (!auth::isInternalAuthSet()) {
+        return {ErrorCodes::AuthenticationFailed,
+                "No authentication parameters set for internal user"};
+    }
+
+    _internalAuthRequested = true;
+    return _runAuthLoop(
+        [&](DBClientConnection* conn) { uassertStatusOK(conn->authenticateInternalUser()); });
+}
+
+void DBClientReplicaSet::_auth(const BSONObj& params) {
+    uassertStatusOK(_runAuthLoop([&](DBClientConnection* conn) {
+        conn->auth(params);
+        // Cache the new auth information since we now validated it's good
+        _auths[params[saslCommandUserDBFieldName].str()] = params.getOwned();
+    }));
 }
 
 void DBClientReplicaSet::logout(const string& dbname, BSONObj& info) {
@@ -709,7 +729,7 @@ DBClientConnection* DBClientReplicaSet::selectNodeUsingTags(
     // callback. We should eventually not need this after we remove the
     // callback.
     DBClientConnection* newConn = dynamic_cast<DBClientConnection*>(
-        globalConnPool.get(_lastSlaveOkHost.toString(), _so_timeout));
+        globalConnPool.get(_uri.cloneURIForServer(_lastSlaveOkHost), _so_timeout));
 
     // Assert here instead of returning NULL since the contract of this method is such
     // that returning NULL means none of the nodes were good, which is not the case here.

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,24 +37,30 @@
 #include <algorithm>
 
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bson_comparator_interface_base.h"
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/exec/write_stage_common.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/ops/update_lifecycle.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/duplicate_key_error_info.h"
+#include "mongo/db/update/path_support.h"
 #include "mongo/db/update/storage_validation.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeUpsertPerformsInsert);
 
 using std::string;
 using std::unique_ptr;
@@ -133,7 +141,7 @@ bool shouldRestartUpdateIfNoLongerMatches(const UpdateStageParams& params) {
 
 const std::vector<std::unique_ptr<FieldRef>>* getImmutableFields(OperationContext* opCtx,
                                                                  const NamespaceString& ns) {
-    auto metadata = CollectionShardingState::get(opCtx, ns)->getMetadata(opCtx);
+    auto metadata = CollectionShardingState::get(opCtx, ns)->getMetadataForOperation(opCtx);
     if (metadata->isSharded()) {
         const std::vector<std::unique_ptr<FieldRef>>& fields = metadata->getKeyPatternFields();
         // Return shard-keys as immutable for the update system.
@@ -159,15 +167,16 @@ CollectionUpdateArgs::StoreDocOption getStoreDocMode(const UpdateRequest& update
 
 const char* UpdateStage::kStageType = "UPDATE";
 
+const UpdateStats UpdateStage::kEmptyUpdateStats;
+
 UpdateStage::UpdateStage(OperationContext* opCtx,
                          const UpdateStageParams& params,
                          WorkingSet* ws,
                          Collection* collection,
                          PlanStage* child)
-    : PlanStage(kStageType, opCtx),
+    : RequiresMutableCollectionStage(kStageType, opCtx, collection),
       _params(params),
       _ws(ws),
-      _collection(collection),
       _idRetrying(WorkingSet::INVALID_ID),
       _idReturning(WorkingSet::INVALID_ID),
       _updatedRecordIds(params.request->isMulti() ? new RecordIdSet() : NULL),
@@ -191,7 +200,6 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
     const UpdateRequest* request = _params.request;
     UpdateDriver* driver = _params.driver;
     CanonicalQuery* cq = _params.canonicalQuery;
-    UpdateLifecycle* lifecycle = request->getLifecycle();
 
     // If asked to return new doc, default to the oldObj, in case nothing changes.
     BSONObj newObj = oldObj.value();
@@ -203,7 +211,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
     // only enable in-place mutations if the underlying storage engine offers support for
     // writing damage events.
     _doc.reset(oldObj.value(),
-               (_collection->updateWithDamagesSupported()
+               (collection()->updateWithDamagesSupported()
                     ? mutablebson::Document::kInPlaceEnabled
                     : mutablebson::Document::kInPlaceDisabled));
 
@@ -213,22 +221,25 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
 
     Status status = Status::OK();
     const bool validateForStorage = getOpCtx()->writesAreReplicated() && _enforceOkForStorage;
+    const bool isInsert = false;
     FieldRefSet immutablePaths;
     if (getOpCtx()->writesAreReplicated() && !request->isFromMigration()) {
-        if (lifecycle) {
-            auto immutablePathsVector =
-                getImmutableFields(getOpCtx(), request->getNamespaceString());
-            if (immutablePathsVector) {
-                immutablePaths.fillFrom(
-                    transitional_tools_do_not_use::unspool_vector(*immutablePathsVector));
-            }
+        auto immutablePathsVector = getImmutableFields(getOpCtx(), request->getNamespaceString());
+        if (immutablePathsVector) {
+            immutablePaths.fillFrom(
+                transitional_tools_do_not_use::unspool_vector(*immutablePathsVector));
         }
         immutablePaths.keepShortest(&idFieldRef);
     }
     if (!driver->needMatchDetails()) {
         // If we don't need match details, avoid doing the rematch
-        status = driver->update(
-            StringData(), &_doc, validateForStorage, immutablePaths, &logObj, &docWasModified);
+        status = driver->update(StringData(),
+                                &_doc,
+                                validateForStorage,
+                                immutablePaths,
+                                isInsert,
+                                &logObj,
+                                &docWasModified);
     } else {
         // If there was a matched field, obtain it.
         MatchDetails matchDetails;
@@ -241,8 +252,13 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
         if (matchDetails.hasElemMatchKey())
             matchedField = matchDetails.elemMatchKey();
 
-        status = driver->update(
-            matchedField, &_doc, validateForStorage, immutablePaths, &logObj, &docWasModified);
+        status = driver->update(matchedField,
+                                &_doc,
+                                validateForStorage,
+                                immutablePaths,
+                                isInsert,
+                                &logObj,
+                                &docWasModified);
     }
 
     if (!status.isOK()) {
@@ -251,7 +267,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
 
     // Skip adding _id field if the collection is capped (since capped collection documents can
     // neither grow nor shrink).
-    const auto createIdField = !_collection->isCapped();
+    const auto createIdField = !collection()->isCapped();
 
     // Ensure if _id exists it is first
     status = ensureIdFieldIsFirst(&_doc);
@@ -286,11 +302,10 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
         RecordId newRecordId;
         CollectionUpdateArgs args;
         if (!request->isExplain()) {
-            invariant(_collection);
-            auto* css = CollectionShardingState::get(getOpCtx(), _collection->ns());
             args.stmtId = request->getStmtId();
             args.update = logObj;
-            auto metadata = css->getMetadata(getOpCtx());
+            auto* const css = CollectionShardingState::get(getOpCtx(), collection()->ns());
+            auto metadata = css->getMetadataForOperation(getOpCtx());
             args.criteria = metadata->extractDocumentKey(newObj);
             uassert(16980,
                     "Multi-update operations require all documents to have an '_id' field",
@@ -309,7 +324,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
 
                 Snapshotted<RecordData> snap(oldObj.snapshotId(), oldRec);
 
-                StatusWith<RecordData> newRecStatus = _collection->updateDocumentWithDamages(
+                StatusWith<RecordData> newRecStatus = collection()->updateDocumentWithDamages(
                     getOpCtx(), recordId, std::move(snap), source, _damages, &args);
 
                 newObj = uassertStatusOK(std::move(newRecStatus)).releaseToBson();
@@ -326,13 +341,13 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                     newObj.objsize() <= BSONObjMaxUserSize);
 
             if (!request->isExplain()) {
-                newRecordId = _collection->updateDocument(getOpCtx(),
-                                                          recordId,
-                                                          oldObj,
-                                                          newObj,
-                                                          driver->modsAffectIndices(),
-                                                          _params.opDebug,
-                                                          &args);
+                newRecordId = collection()->updateDocument(getOpCtx(),
+                                                           recordId,
+                                                           oldObj,
+                                                           newObj,
+                                                           driver->modsAffectIndices(),
+                                                           _params.opDebug,
+                                                           &args);
             }
         }
 
@@ -375,7 +390,6 @@ BSONObj UpdateStage::applyUpdateOpsForInsert(OperationContext* opCtx,
     // oplog record, then. We also set the context of the update driver to the INSERT_CONTEXT.
     // Some mods may only work in that context (e.g. $setOnInsert).
     driver->setLogOp(false);
-    driver->setInsert(true);
 
     FieldRefSet immutablePaths;
     if (!isInternalRequest) {
@@ -400,10 +414,12 @@ BSONObj UpdateStage::applyUpdateOpsForInsert(OperationContext* opCtx,
     // Apply the update modifications here. Do not validate for storage, since we will validate the
     // entire document after the update. However, we ensure that no immutable fields are updated.
     const bool validateForStorage = false;
+    const bool isInsert = true;
     if (isInternalRequest) {
         immutablePaths.clear();
     }
-    Status updateStatus = driver->update(StringData(), doc, validateForStorage, immutablePaths);
+    Status updateStatus =
+        driver->update(StringData(), doc, validateForStorage, immutablePaths, isInsert);
     if (!updateStatus.isOK()) {
         uasserted(16836, updateStatus.reason());
     }
@@ -435,6 +451,82 @@ BSONObj UpdateStage::applyUpdateOpsForInsert(OperationContext* opCtx,
     return newObj;
 }
 
+bool UpdateStage::matchContainsOnlyAndedEqualityNodes(const MatchExpression& root) {
+    if (root.matchType() == MatchExpression::EQ) {
+        return true;
+    }
+
+    if (root.matchType() == MatchExpression::AND) {
+        for (size_t i = 0; i < root.numChildren(); ++i) {
+            if (root.getChild(i)->matchType() != MatchExpression::EQ) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+bool UpdateStage::shouldRetryDuplicateKeyException(const ParsedUpdate& parsedUpdate,
+                                                   const DuplicateKeyErrorInfo& errorInfo) {
+    invariant(parsedUpdate.hasParsedQuery());
+
+    const auto updateRequest = parsedUpdate.getRequest();
+
+    // In order to be retryable, the update must be an upsert with multi:false.
+    if (!updateRequest->isUpsert() || updateRequest->isMulti()) {
+        return false;
+    }
+
+    auto matchExpr = parsedUpdate.getParsedQuery()->root();
+    invariant(matchExpr);
+
+    // In order to be retryable, the update query must contain no expressions other than AND and EQ.
+    if (!matchContainsOnlyAndedEqualityNodes(*matchExpr)) {
+        return false;
+    }
+
+    // In order to be retryable, the update equality field paths must be identical to the unique
+    // index key field paths. Also, the values that triggered the DuplicateKey error must match the
+    // values used in the upsert query predicate.
+    pathsupport::EqualityMatches equalities;
+    auto status = pathsupport::extractEqualityMatches(*matchExpr, &equalities);
+    if (!status.isOK()) {
+        return false;
+    }
+
+    auto keyPattern = errorInfo.getKeyPattern();
+    if (equalities.size() != static_cast<size_t>(keyPattern.nFields())) {
+        return false;
+    }
+
+    auto keyValue = errorInfo.getDuplicatedKeyValue();
+
+    BSONObjIterator keyPatternIter(keyPattern);
+    BSONObjIterator keyValueIter(keyValue);
+    while (keyPatternIter.more() && keyValueIter.more()) {
+        auto keyPatternElem = keyPatternIter.next();
+        auto keyValueElem = keyValueIter.next();
+
+        auto keyName = keyPatternElem.fieldNameStringData();
+        if (!equalities.count(keyName)) {
+            return false;
+        }
+
+        // Comparison which obeys field ordering but ignores field name.
+        BSONElementComparator cmp{BSONElementComparator::FieldNamesMode::kIgnore, nullptr};
+        if (cmp.evaluate(equalities[keyName]->getData() != keyValueElem)) {
+            return false;
+        }
+    }
+    invariant(!keyPatternIter.more());
+    invariant(!keyValueIter.more());
+
+    return true;
+}
+
 void UpdateStage::doInsert() {
     _specificStats.inserted = true;
 
@@ -461,13 +553,17 @@ void UpdateStage::doInsert() {
         return;
     }
 
-    writeConflictRetry(getOpCtx(), "upsert", _collection->ns().ns(), [&] {
+    if (MONGO_FAIL_POINT(hangBeforeUpsertPerformsInsert)) {
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &hangBeforeUpsertPerformsInsert, getOpCtx(), "hangBeforeUpsertPerformsInsert");
+    }
+
+    writeConflictRetry(getOpCtx(), "upsert", collection()->ns().ns(), [&] {
         WriteUnitOfWork wunit(getOpCtx());
-        invariant(_collection);
-        uassertStatusOK(_collection->insertDocument(getOpCtx(),
-                                                    InsertStatement(request->getStmtId(), newObj),
-                                                    _params.opDebug,
-                                                    request->isFromMigration()));
+        uassertStatusOK(collection()->insertDocument(getOpCtx(),
+                                                     InsertStatement(request->getStmtId(), newObj),
+                                                     _params.opDebug,
+                                                     request->isFromMigration()));
 
         // Technically, we should save/restore state here, but since we are going to return
         // immediately after, it would just be wasted work.
@@ -502,11 +598,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
     if (doneUpdating()) {
         // Even if we're done updating, we may have some inserting left to do.
         if (needInsert()) {
-            // TODO we may want to handle WriteConflictException here. Currently we bounce it
-            // out to a higher level since if this WCEs it is likely that we raced with another
-            // upsert that may have matched our query, and therefore this may need to perform an
-            // update rather than an insert. Bouncing to the higher level allows restarting the
-            // query in this case.
+
             doInsert();
 
             invariant(isEOF());
@@ -528,10 +620,6 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
         invariant(isEOF());
         return PlanStage::IS_EOF;
     }
-
-    // If we're here, then we still have to ask for results from the child and apply
-    // updates to them. We should only get here if the collection exists.
-    invariant(_collection);
 
     // It is possible that after an update was applied, a WriteConflictException
     // occurred and prevented us from returning ADVANCED with the requested version
@@ -567,7 +655,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
 
         // We want to free this member when we return, unless we need to retry updating or returning
         // it.
-        ScopeGuard memberFreer = MakeGuard(&WorkingSet::free, _ws, id);
+        auto memberFreer = makeGuard([&] { _ws->free(id); });
 
         invariant(member->hasRecordId());
         recordId = member->recordId;
@@ -587,10 +675,10 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
         bool docStillMatches;
         try {
             docStillMatches = write_stage_common::ensureStillMatches(
-                _collection, getOpCtx(), _ws, id, _params.canonicalQuery);
+                collection(), getOpCtx(), _ws, id, _params.canonicalQuery);
         } catch (const WriteConflictException&) {
             // There was a problem trying to detect if the document still exists, so retry.
-            memberFreer.Dismiss();
+            memberFreer.dismiss();
             return prepareToRetryWSM(id, out);
         }
 
@@ -626,7 +714,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
             // Do the update, get us the new version of the doc.
             newObj = transformAndUpdate(member->obj, recordId);
         } catch (const WriteConflictException&) {
-            memberFreer.Dismiss();  // Keep this member around so we can retry updating it.
+            memberFreer.dismiss();  // Keep this member around so we can retry updating it.
             return prepareToRetryWSM(id, out);
         }
 
@@ -662,7 +750,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
 
                 _idReturning = id;
                 // Keep this member around so that we can return it on the next work() call.
-                memberFreer.Dismiss();
+                memberFreer.dismiss();
             }
             *out = WorkingSet::INVALID_ID;
             return NEED_YIELD;
@@ -672,7 +760,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
             // member->obj should refer to the document we want to return.
             invariant(member->getState() == WorkingSetMember::OWNED_OBJ);
 
-            memberFreer.Dismiss();  // Keep this member around so we can return it.
+            memberFreer.dismiss();  // Keep this member around so we can return it.
             *out = id;
             return PlanStage::ADVANCED;
         }
@@ -700,7 +788,7 @@ PlanStage::StageState UpdateStage::doWork(WorkingSetID* out) {
     return status;
 }
 
-void UpdateStage::doRestoreState() {
+void UpdateStage::doRestoreStateRequiresCollection() {
     const UpdateRequest& request = *_params.request;
     const NamespaceString& nsString(request.getNamespaceString());
 
@@ -714,16 +802,10 @@ void UpdateStage::doRestoreState() {
                                 << nsString.ns());
     }
 
-    if (request.getLifecycle()) {
-        UpdateLifecycle* lifecycle = request.getLifecycle();
-        lifecycle->setCollection(_collection);
-
-        if (!lifecycle->canContinue()) {
-            uasserted(17270, "Update aborted due to invalid state transitions after yield.");
-        }
-
-        _params.driver->refreshIndexKeys(lifecycle->getIndexKeys(getOpCtx()));
-    }
+    // The set of indices may have changed during yield. Make sure that the update driver has up to
+    // date index information.
+    const auto& updateIndexData = collection()->infoCache()->getIndexKeys(getOpCtx());
+    _params.driver->refreshIndexKeys(&updateIndexData);
 }
 
 unique_ptr<PlanStageStats> UpdateStage::getStats() {
@@ -740,9 +822,28 @@ const SpecificStats* UpdateStage::getSpecificStats() const {
 
 const UpdateStats* UpdateStage::getUpdateStats(const PlanExecutor* exec) {
     invariant(exec->getRootStage()->isEOF());
-    invariant(exec->getRootStage()->stageType() == STAGE_UPDATE);
-    UpdateStage* updateStage = static_cast<UpdateStage*>(exec->getRootStage());
-    return static_cast<const UpdateStats*>(updateStage->getSpecificStats());
+
+    // If we're updating a non-existent collection, then the delete plan may have an EOF as the root
+    // stage.
+    if (exec->getRootStage()->stageType() == STAGE_EOF) {
+        return &kEmptyUpdateStats;
+    }
+
+    // If the collection exists, then we expect the root of the plan tree to either be an update
+    // stage, or (for findAndModify) a projection stage wrapping an update stage.
+    switch (exec->getRootStage()->stageType()) {
+        case StageType::STAGE_PROJECTION_DEFAULT:
+        case StageType::STAGE_PROJECTION_COVERED:
+        case StageType::STAGE_PROJECTION_SIMPLE: {
+            invariant(exec->getRootStage()->getChildren().size() == 1U);
+            invariant(StageType::STAGE_UPDATE == exec->getRootStage()->child()->stageType());
+            const SpecificStats* stats = exec->getRootStage()->child()->getSpecificStats();
+            return static_cast<const UpdateStats*>(stats);
+        }
+        default:
+            invariant(StageType::STAGE_UPDATE == exec->getRootStage()->stageType());
+            return static_cast<const UpdateStats*>(exec->getRootStage()->getSpecificStats());
+    }
 }
 
 void UpdateStage::recordUpdateStatsInOpDebug(const UpdateStats* updateStats, OpDebug* opDebug) {

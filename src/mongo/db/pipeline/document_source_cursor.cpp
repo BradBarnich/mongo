@@ -1,29 +1,31 @@
+
 /**
- * Copyright 2011 (c) 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
@@ -91,7 +93,7 @@ void DocumentSourceCursor::loadBatch() {
         uassertStatusOK(repl::ReplicationCoordinator::get(pExpCtx->opCtx)
                             ->checkCanServeReadsFor(pExpCtx->opCtx, _exec->nss(), true));
 
-        uassertStatusOK(_exec->restoreState());
+        _exec->restoreState();
 
         int memUsageBytes = 0;
         {
@@ -116,9 +118,9 @@ void DocumentSourceCursor::loadBatch() {
                 // As long as we're waiting for inserts, we shouldn't do any batching at this level
                 // we need the whole pipeline to see each document to see if we should stop waiting.
                 // Furthermore, if we need to return the latest oplog time (in the tailable and
-                // needs-merge case), batching will result in a wrong time.
-                if (awaitDataState(pExpCtx->opCtx).shouldWaitForInserts ||
-                    (pExpCtx->isTailableAwaitData() && pExpCtx->needsMerge) ||
+                // awaitData case), batching will result in a wrong time.
+                if (pExpCtx->isTailableAwaitData() ||
+                    awaitDataState(pExpCtx->opCtx).shouldWaitForInserts ||
                     memUsageBytes > internalDocumentSourceCursorBatchSizeBytes.load()) {
                     // End this batch and prepare PlanExecutor for yielding.
                     _exec->saveState();
@@ -137,8 +139,8 @@ void DocumentSourceCursor::loadBatch() {
         // must hold a collection lock to destroy '_exec', but we can only assume that our locks are
         // still held if '_exec' did not end in an error. If '_exec' encountered an error during a
         // yield, the locks might be yielded.
-        if (state != PlanExecutor::DEAD && state != PlanExecutor::FAILURE) {
-            cleanupExecutor(autoColl);
+        if (state != PlanExecutor::FAILURE) {
+            cleanupExecutor();
         }
     }
 
@@ -146,7 +148,6 @@ void DocumentSourceCursor::loadBatch() {
         case PlanExecutor::ADVANCED:
         case PlanExecutor::IS_EOF:
             return;  // We've reached our limit or exhausted the cursor.
-        case PlanExecutor::DEAD:
         case PlanExecutor::FAILURE: {
             _execStatus = WorkingSetCommon::getMemberObjectStatus(resultObj).withContext(
                 "Error in $cursor stage");
@@ -264,33 +265,7 @@ void DocumentSourceCursor::doDispose() {
 
 void DocumentSourceCursor::cleanupExecutor() {
     invariant(_exec);
-    auto* opCtx = pExpCtx->opCtx;
-    // We need to be careful to not use AutoGetCollection here, since we only need the lock to
-    // protect potential access to the Collection's CursorManager, and AutoGetCollection may throw
-    // if this namespace has since turned into a view. Using Database::getCollection() will simply
-    // return nullptr if the collection has since turned into a view. In this case, '_exec' will
-    // already have been marked as killed when the collection was dropped, and we won't need to
-    // access the CursorManager to properly dispose of it.
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-    auto lockMode = getLockModeForQuery(opCtx);
-    AutoGetDb dbLock(opCtx, _exec->nss().db(), lockMode);
-    Lock::CollectionLock collLock(opCtx->lockState(), _exec->nss().ns(), lockMode);
-    auto collection = dbLock.getDb() ? dbLock.getDb()->getCollection(opCtx, _exec->nss()) : nullptr;
-    auto cursorManager = collection ? collection->getCursorManager() : nullptr;
-    _exec->dispose(opCtx, cursorManager);
-
-    // Not freeing _exec if we're in explain mode since it will be used in serialize() to gather
-    // execution stats.
-    if (!pExpCtx->explain) {
-        _exec.reset();
-    }
-}
-
-void DocumentSourceCursor::cleanupExecutor(const AutoGetCollectionForRead& readLock) {
-    invariant(_exec);
-    auto cursorManager =
-        readLock.getCollection() ? readLock.getCollection()->getCursorManager() : nullptr;
-    _exec->dispose(pExpCtx->opCtx, cursorManager);
+    _exec->dispose(pExpCtx->opCtx);
 
     // Not freeing _exec if we're in explain mode since it will be used in serialize() to gather
     // execution stats.

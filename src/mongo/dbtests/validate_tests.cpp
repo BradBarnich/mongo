@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2015 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -32,10 +34,10 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/index_create.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/service_context.h"
 #include "mongo/dbtests/dbtests.h"
@@ -857,23 +859,24 @@ public:
 
         // Replace a correct index entry with a bad one and check it's invalid.
         IndexCatalog* indexCatalog = coll->getIndexCatalog();
-        IndexDescriptor* descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
-        IndexAccessMethod* iam = indexCatalog->getIndex(descriptor);
+        auto descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
+        auto iam =
+            const_cast<IndexAccessMethod*>(indexCatalog->getEntry(descriptor)->accessMethod());
 
         {
             WriteUnitOfWork wunit(&_opCtx);
             int64_t numDeleted;
-            int64_t numInserted;
+            InsertResult insertResult;
             const BSONObj actualKey = BSON("a" << 1);
             const BSONObj badKey = BSON("a" << -1);
             InsertDeleteOptions options;
             options.dupsAllowed = true;
             options.logIfError = true;
             auto removeStatus = iam->remove(&_opCtx, actualKey, id1, options, &numDeleted);
-            auto insertStatus = iam->insert(&_opCtx, badKey, id1, options, &numInserted);
+            auto insertStatus = iam->insert(&_opCtx, badKey, id1, options, &insertResult);
 
             ASSERT_EQUALS(numDeleted, 1);
-            ASSERT_EQUALS(numInserted, 1);
+            ASSERT_EQUALS(insertResult.numInserted, 1);
             ASSERT_OK(removeStatus);
             ASSERT_OK(insertStatus);
             wunit.commit();
@@ -933,7 +936,8 @@ public:
         // Change the IndexDescriptor's keyPattern to descending so the index ordering
         // appears wrong.
         IndexCatalog* indexCatalog = coll->getIndexCatalog();
-        IndexDescriptor* descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
+        IndexDescriptor* descriptor =
+            const_cast<IndexDescriptor*>(indexCatalog->findIndexByName(&_opCtx, indexName));
         descriptor->setKeyPatternForTest(BSON("a" << -1));
 
         ASSERT_FALSE(checkValid());
@@ -1015,9 +1019,10 @@ public:
         lockDb(MODE_X);
         const RecordId recordId(RecordId::ReservedId::kWildcardMultikeyMetadataId);
         IndexCatalog* indexCatalog = coll->getIndexCatalog();
-        IndexDescriptor* descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
-        auto sortedDataInterface =
-            indexCatalog->getIndex(descriptor)->getSortedDataInterface_forTest();
+        auto descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
+        auto accessMethod =
+            const_cast<IndexAccessMethod*>(indexCatalog->getEntry(descriptor)->accessMethod());
+        auto sortedDataInterface = accessMethod->getSortedDataInterface();
         {
             WriteUnitOfWork wunit(&_opCtx);
             const BSONObj indexKey = BSON("" << 1 << ""
@@ -1122,9 +1127,10 @@ public:
 
         lockDb(MODE_X);
         IndexCatalog* indexCatalog = coll->getIndexCatalog();
-        IndexDescriptor* descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
-        auto sortedDataInterface =
-            indexCatalog->getIndex(descriptor)->getSortedDataInterface_forTest();
+        auto descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
+        auto accessMethod =
+            const_cast<IndexAccessMethod*>(indexCatalog->getEntry(descriptor)->accessMethod());
+        auto sortedDataInterface = accessMethod->getSortedDataInterface();
 
         // Removing a multikey metadata path for a path included in the projection causes validate
         // to fail.

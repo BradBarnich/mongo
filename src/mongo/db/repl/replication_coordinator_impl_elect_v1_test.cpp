@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,6 +32,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/is_master_response.h"
@@ -637,7 +640,6 @@ TEST_F(ReplCoordTest, TransitionToRollbackFailsWhenElectionInProgress) {
     assertStartSuccess(configObj, HostAndPort("node1", 12345));
     ReplSetConfig config = assertMakeRSConfig(configObj);
 
-    OperationContextNoop opCtx;
     OpTime time1(Timestamp(100, 1), 0);
     getReplCoord()->setMyLastAppliedOpTime(time1);
     getReplCoord()->setMyLastDurableOpTime(time1);
@@ -646,8 +648,12 @@ TEST_F(ReplCoordTest, TransitionToRollbackFailsWhenElectionInProgress) {
     simulateEnoughHeartbeatsForAllNodesUp();
     simulateSuccessfulDryRun();
 
+    // We must take the RSTL in mode X before transitioning to RS_ROLLBACK.
+    const auto opCtx = makeOperationContext();
+    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get());
+
     ASSERT_EQUALS(ErrorCodes::ElectionInProgress,
-                  getReplCoord()->setFollowerMode(MemberState::RS_ROLLBACK));
+                  getReplCoord()->setFollowerModeStrict(opCtx.get(), MemberState::RS_ROLLBACK));
 
     ASSERT_FALSE(getReplCoord()->getMemberState().rollback());
 
@@ -1367,7 +1373,6 @@ TEST_F(TakeoverTest, CatchupTakeoverCanceledIfTransitionToRollback) {
     auto replCoord = getReplCoord();
     auto now = getNet()->now();
 
-    OperationContextNoop opCtx;
     OpTime currentOptime(Timestamp(200, 1), 0);
     // Update the current term to simulate a scenario where an election has occured
     // and some other node became the new primary. Once you hear about a primary election
@@ -1395,8 +1400,12 @@ TEST_F(TakeoverTest, CatchupTakeoverCanceledIfTransitionToRollback) {
     Milliseconds catchupTakeoverDelay = catchupTakeoverTime - now;
     ASSERT_EQUALS(config.getCatchUpTakeoverDelay(), catchupTakeoverDelay);
 
+    // We must take the RSTL in mode X before transitioning to RS_ROLLBACK.
+    const auto opCtx = makeOperationContext();
+    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get());
+
     // Transitioning to rollback state should cancel the takeover
-    ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_ROLLBACK));
+    ASSERT_OK(replCoord->setFollowerModeStrict(opCtx.get(), MemberState::RS_ROLLBACK));
     ASSERT_TRUE(replCoord->getMemberState().rollback());
 
     stopCapturingLogMessages();

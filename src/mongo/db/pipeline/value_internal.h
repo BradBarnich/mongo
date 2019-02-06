@@ -1,29 +1,31 @@
+
 /**
- * Copyright (c) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -81,10 +83,7 @@ public:
     // constructor. Much code relies on every byte being predictably initialized to zero.
 
     // This is a "missing" Value
-    ValueStorage() {
-        zero();
-        type = EOO;
-    }
+    ValueStorage() : ValueStorage(EOO) {}
 
     explicit ValueStorage(BSONType t) {
         zero();
@@ -125,10 +124,10 @@ public:
         type = t;
         putDocument(d);
     }
-    ValueStorage(BSONType t, const RCVector* a) {
+    ValueStorage(BSONType t, boost::intrusive_ptr<RCVector>&& a) {
         zero();
         type = t;
-        putVector(a);
+        putVector(std::move(a));
     }
     ValueStorage(BSONType t, StringData s) {
         zero();
@@ -163,12 +162,12 @@ public:
     }
 
     ValueStorage(const ValueStorage& rhs) {
-        memcpy(this, &rhs, sizeof(*this));
+        memcpy(bytes, rhs.bytes, sizeof(bytes));
         memcpyed();
     }
 
     ValueStorage(ValueStorage&& rhs) noexcept {
-        memcpy(this, &rhs, sizeof(*this));
+        memcpy(bytes, rhs.bytes, sizeof(bytes));
         rhs.zero();  // Reset rhs to the missing state. TODO consider only doing this if refCounter.
     }
 
@@ -176,7 +175,7 @@ public:
         DEV verifyRefCountingIfShould();
         if (refCounter)
             intrusive_ptr_release(genericRCPtr);
-        DEV memset(this, 0xee, sizeof(*this));
+        DEV memset(bytes, 0xee, sizeof(bytes));
     }
 
     ValueStorage& operator=(const ValueStorage& rhs) {
@@ -191,7 +190,7 @@ public:
         if (refCounter)
             intrusive_ptr_release(genericRCPtr);
 
-        memmove(this, &rhs, sizeof(*this));
+        memmove(bytes, rhs.bytes, sizeof(bytes));
         return *this;
     }
 
@@ -200,17 +199,17 @@ public:
         if (refCounter)
             intrusive_ptr_release(genericRCPtr);
 
-        memmove(this, &rhs, sizeof(*this));
+        memmove(bytes, rhs.bytes, sizeof(bytes));
         rhs.zero();  // Reset rhs to the missing state. TODO consider only doing this if refCounter.
         return *this;
     }
 
     void swap(ValueStorage& rhs) {
         // Don't need to update ref-counts because they will be the same in the end
-        char temp[sizeof(ValueStorage)];
-        memcpy(temp, this, sizeof(*this));
-        memcpy(this, &rhs, sizeof(*this));
-        memcpy(&rhs, temp, sizeof(*this));
+        char temp[sizeof(bytes)];
+        memcpy(temp, bytes, sizeof(bytes));
+        memcpy(bytes, rhs.bytes, sizeof(bytes));
+        memcpy(rhs.bytes, temp, sizeof(bytes));
     }
 
     /// Call this after memcpying to update ref counts if needed
@@ -222,7 +221,7 @@ public:
 
     /// These are only to be called during Value construction on an empty Value
     void putString(StringData s);
-    void putVector(const RCVector* v);
+    void putVector(boost::intrusive_ptr<RCVector>&& v);
     void putDocument(const Document& d);
     void putRegEx(const BSONRegEx& re);
     void putBinData(const BSONBinData& bd) {
@@ -231,22 +230,21 @@ public:
     }
 
     void putDBRef(const BSONDBRef& dbref) {
-        putRefCountable(new RCDBRef(dbref.ns.toString(), dbref.oid));
+        putRefCountable(make_intrusive<RCDBRef>(dbref.ns.toString(), dbref.oid));
     }
 
     void putCodeWScope(const BSONCodeWScope& cws) {
-        putRefCountable(new RCCodeWScope(cws.code.toString(), cws.scope));
+        putRefCountable(make_intrusive<RCCodeWScope>(cws.code.toString(), cws.scope));
     }
 
     void putDecimal(const Decimal128& d) {
-        putRefCountable(new RCDecimal(d));
+        putRefCountable(make_intrusive<RCDecimal>(d));
     }
 
-    void putRefCountable(boost::intrusive_ptr<const RefCountable> ptr) {
-        genericRCPtr = ptr.get();
+    void putRefCountable(boost::intrusive_ptr<const RefCountable>&& ptr) {
+        genericRCPtr = ptr.detach();
 
         if (genericRCPtr) {
-            intrusive_ptr_add_ref(genericRCPtr);
             refCounter = true;
         }
         DEV verifyRefCountingIfShould();
@@ -297,37 +295,34 @@ public:
     }
 
     void zero() {
-        memset(this, 0, sizeof(*this));
-    }
-
-    // Byte-for-byte identical
-    bool identical(const ValueStorage& other) const {
-        return (i64[0] == other.i64[0] && i64[1] == other.i64[1]);
+        memset(bytes, 0, sizeof(bytes));
     }
 
     void verifyRefCountingIfShould() const;
 
     // This data is public because this should only be used by Value which would be a friend
     union {
+        // cover the whole ValueStorage
+        uint8_t bytes[16];
 #pragma pack(1)
         struct {
-            // byte 1
+            // bytes[0]
             signed char type;
 
-            // byte 2
+            // bytes[1]
             struct {
-                bool refCounter : 1;  // true if we need to refCount
-                bool shortStr : 1;    // true if we are using short strings
-                // reservedFlags: 6;
+                uint8_t refCounter : 1;  // bit 0: true if we need to refCount
+                uint8_t shortStr : 1;    // bit 1: true if we are using short strings
+                uint8_t reservedFlags : 6;
             };
 
-            // bytes 3-16;
+            // bytes[2:15]
             union {
                 unsigned char oid[12];
 
                 struct {
                     char shortStrSize;  // TODO Consider moving into flags union (4 bits)
-                    char shortStrStorage[16 /*total bytes*/ - 3 /*offset*/ - 1 /*NUL byte*/];
+                    char shortStrStorage[sizeof(bytes) - 3 /*offset*/ - 1 /*NUL byte*/];
                     union {
                         char nulTerminator;
                     };
@@ -355,14 +350,17 @@ public:
         };
 #pragma pack()
 
-        // covers the whole ValueStorage
-        long long i64[2];
-
-        // Forces the ValueStorage type to have at least pointer alignment. Can't use alignas on the
-        // type since that causes issues on MSVC.
-        void* forcePointerAlignment;
+        // Select void* alignment without interfering with any active pack directives. Can't use
+        // alignas(void*) on this union because that would prohibit ValueStorage from being tightly
+        // packed into a packed struct (though GCC does the tight packing anyway).
+        //
+        // Note that MSVC's behavior is GCC-incompatible. It obeys alignas even when a pack pragma
+        // is active. That causes padding on MSVC when ValueStorage is used as a member of class
+        // Value, which in turn is used as a member of packed class ValueElement.
+        // http://lists.llvm.org/pipermail/cfe-dev/2014-July/thread.html#38174
+        void* pointerAlignment;
     };
 };
 MONGO_STATIC_ASSERT(sizeof(ValueStorage) == 16);
 MONGO_STATIC_ASSERT(alignof(ValueStorage) >= alignof(void*));
-}
+}  // namespace mongo

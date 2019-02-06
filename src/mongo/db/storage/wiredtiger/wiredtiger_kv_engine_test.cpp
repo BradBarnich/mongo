@@ -1,24 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,6 +40,7 @@
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
@@ -50,22 +52,16 @@
 namespace mongo {
 namespace {
 
-class WiredTigerKVHarnessHelper : public KVHarnessHelper {
+class WiredTigerKVHarnessHelper : public KVHarnessHelper, public ScopedGlobalServiceContextForTest {
 public:
     WiredTigerKVHarnessHelper(bool forRepair = false)
         : _dbpath("wt-kv-harness"), _forRepair(forRepair) {
-        if (!hasGlobalServiceContext())
-            setGlobalServiceContext(ServiceContext::make());
+        invariant(hasGlobalServiceContext());
         _engine.reset(makeEngine());
         repl::ReplicationCoordinator::set(
             getGlobalServiceContext(),
             std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
                 getGlobalServiceContext(), repl::ReplSettings())));
-    }
-
-    virtual ~WiredTigerKVHarnessHelper() {
-        _engine.reset(nullptr);
-        // Cannot cleanup the global service context here, the test still have clients remaining.
     }
 
     virtual KVEngine* restartEngine() override {
@@ -101,39 +97,23 @@ private:
     bool _forRepair;
 };
 
-class WiredTigerKVEngineTest : public unittest::Test {
+class WiredTigerKVEngineTest : public unittest::Test, public ScopedGlobalServiceContextForTest {
 public:
-    void setUp() override {
-        setGlobalServiceContext(ServiceContext::make());
-        Client::initThread(getThreadName());
-
-        _helper = makeHelper();
-        _engine = _helper->getWiredTigerKVEngine();
-    }
-
-    void tearDown() override {
-        _helper.reset(nullptr);
-        Client::destroy();
-        setGlobalServiceContext({});
-    }
+    WiredTigerKVEngineTest(bool repair = false)
+        : _helper(repair), _engine(_helper.getWiredTigerKVEngine()) {}
 
     std::unique_ptr<OperationContext> makeOperationContext() {
         return std::make_unique<OperationContextNoop>(_engine->newRecoveryUnit());
     }
 
 protected:
-    virtual std::unique_ptr<WiredTigerKVHarnessHelper> makeHelper() {
-        return std::make_unique<WiredTigerKVHarnessHelper>();
-    }
-
-    std::unique_ptr<WiredTigerKVHarnessHelper> _helper;
+    WiredTigerKVHarnessHelper _helper;
     WiredTigerKVEngine* _engine;
 };
 
 class WiredTigerKVEngineRepairTest : public WiredTigerKVEngineTest {
-    virtual std::unique_ptr<WiredTigerKVHarnessHelper> makeHelper() override {
-        return std::make_unique<WiredTigerKVHarnessHelper>(true /* repair */);
-    }
+public:
+    WiredTigerKVEngineRepairTest() : WiredTigerKVEngineTest(true /* repair */) {}
 };
 
 TEST_F(WiredTigerKVEngineRepairTest, OrphanedDataFilesCanBeRecovered) {
@@ -285,16 +265,16 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
         FAIL("");
     };
 
-    _engine->setStableTimestamp(Timestamp(10, 1), boost::none);
+    _engine->setStableTimestamp(Timestamp(10, 1), boost::none, false);
     assertPinnedMovesSoon(Timestamp(10, 1));
 
-    _engine->setStableTimestamp(Timestamp(20, 1), Timestamp(15, 1));
+    _engine->setStableTimestamp(Timestamp(20, 1), Timestamp(15, 1), false);
     assertPinnedMovesSoon(Timestamp(15, 1));
 
-    _engine->setStableTimestamp(Timestamp(30, 1), Timestamp(19, 1));
+    _engine->setStableTimestamp(Timestamp(30, 1), Timestamp(19, 1), false);
     assertPinnedMovesSoon(Timestamp(19, 1));
 
-    _engine->setStableTimestamp(Timestamp(30, 1), boost::none);
+    _engine->setStableTimestamp(Timestamp(30, 1), boost::none, false);
     assertPinnedMovesSoon(Timestamp(30, 1));
 }
 

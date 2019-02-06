@@ -1,25 +1,27 @@
 // index_descriptor.cpp
 
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,8 +40,6 @@
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/server_options.h"
-#include "mongo/util/assert_util.h"
-#include "mongo/util/stacktrace.h"
 
 namespace mongo {
 
@@ -86,31 +86,15 @@ public:
     static constexpr StringData kWeightsFieldName = "weights"_sd;
 
     /**
-     * OnDiskIndexData is a pointer to the memory mapped per-index data.
-     * infoObj is a copy of the index-describing BSONObj contained in the OnDiskIndexData.
+     * Given a BSONObj representing an index spec, returns a new owned BSONObj which is identical to
+     * 'spec' after replacing the 'ns' field with the value of 'newNs'.
      */
-    IndexDescriptor(Collection* collection, const std::string& accessMethodName, BSONObj infoObj)
-        : _collection(collection),
-          _accessMethodName(accessMethodName),
-          _indexType(IndexNames::nameToType(accessMethodName)),
-          _infoObj(infoObj.getOwned()),
-          _numFields(infoObj.getObjectField(IndexDescriptor::kKeyPatternFieldName).nFields()),
-          _keyPattern(infoObj.getObjectField(IndexDescriptor::kKeyPatternFieldName).getOwned()),
-          _projection(infoObj.getObjectField(IndexDescriptor::kPathProjectionFieldName).getOwned()),
-          _indexName(infoObj.getStringField(IndexDescriptor::kIndexNameFieldName)),
-          _parentNS(infoObj.getStringField(IndexDescriptor::kNamespaceFieldName)),
-          _isIdIndex(isIdIndexPattern(_keyPattern)),
-          _sparse(infoObj[IndexDescriptor::kSparseFieldName].trueValue()),
-          _unique(_isIdIndex || infoObj[kUniqueFieldName].trueValue()),
-          _partial(!infoObj[kPartialFilterExprFieldName].eoo()),
-          _cachedEntry(NULL) {
-        _indexNamespace = makeIndexNamespace(_parentNS, _indexName);
+    static BSONObj renameNsInIndexSpec(BSONObj spec, const NamespaceString& newNs);
 
-        BSONElement e = _infoObj[IndexDescriptor::kIndexVersionFieldName];
-        fassert(50942, e.isNumber());
-        _version = static_cast<IndexVersion>(e.numberInt());
-    }
-
+    /**
+     * infoObj is a copy of the index-describing BSONObj contained in the catalog.
+     */
+    IndexDescriptor(Collection* collection, const std::string& accessMethodName, BSONObj infoObj);
 
     /**
      * Returns true if the specified index version is supported, and returns false otherwise.
@@ -231,20 +215,6 @@ public:
         return _isIdIndex;
     }
 
-    //
-    // Properties that are Index-specific.
-    //
-
-    // Allow access to arbitrary fields in the per-index info object.  Some indices stash
-    // index-specific data there.
-    BSONElement getInfoElement(const std::string& name) const {
-        return _infoObj[name];
-    }
-
-    //
-    // "Internals" of accessing the index, used by IndexAccessMethod(s).
-    //
-
     // Return a (rather compact) std::string representation.
     std::string toString() const {
         return _infoObj.toString();
@@ -263,6 +233,16 @@ public:
 
     bool areIndexOptionsEquivalent(const IndexDescriptor* other) const;
 
+    void setNs(NamespaceString ns);
+
+    const BSONObj& collation() const {
+        return _collation;
+    }
+
+    const BSONObj& partialFilterExpression() const {
+        return _partialFilterExpression;
+    }
+
     static bool isIdIndexPattern(const BSONObj& pattern) {
         BSONObjIterator i(pattern);
         BSONElement e = i.next();
@@ -272,10 +252,6 @@ public:
         if (!(strcmp(e.fieldName(), "_id") == 0 && (e.numberInt() == 1 || e.numberInt() == -1)))
             return false;
         return i.next().eoo();
-    }
-
-    static std::string makeIndexNamespace(StringData ns, StringData name) {
-        return ns.toString() + ".$" + name.toString();
     }
 
 private:
@@ -288,7 +264,7 @@ private:
     IndexType _indexType;
 
     // The BSONObj describing the index.  Accessed through the various members above.
-    const BSONObj _infoObj;
+    BSONObj _infoObj;
 
     // --- cached data from _infoObj
 
@@ -303,6 +279,8 @@ private:
     bool _unique;
     bool _partial;
     IndexVersion _version;
+    BSONObj _collation;
+    BSONObj _partialFilterExpression;
 
     // only used by IndexCatalogEntryContainer to do caching for perf
     // users not allowed to touch, and not part of API

@@ -1,28 +1,31 @@
-/* Copyright 2013 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
@@ -66,7 +69,7 @@ StatusWith<std::vector<uint8_t>> hexToVector(StringData hex) {
     int idx = -2;
     std::generate(ret.begin(), ret.end(), [&hex, &idx] {
         idx += 2;
-        return (fromHex(hex[idx]) << 4) | fromHex(hex[idx + 1]);
+        return (uassertStatusOK(fromHex(hex[idx])) << 4) | uassertStatusOK(fromHex(hex[idx + 1]));
     });
     return ret;
 }
@@ -158,5 +161,77 @@ Status parseCertificateSelector(SSLParams::CertificateSelector* selector,
 
     return Status::OK();
 }
+
+StatusWith<SSLParams::SSLModes> SSLParams::sslModeParse(StringData strMode) {
+    if (strMode == "disabled") {
+        return SSLParams::SSLMode_disabled;
+    } else if (strMode == "allowSSL") {
+        return SSLParams::SSLMode_allowSSL;
+    } else if (strMode == "preferSSL") {
+        return SSLParams::SSLMode_preferSSL;
+    } else if (strMode == "requireSSL") {
+        return SSLParams::SSLMode_requireSSL;
+    } else {
+        return Status(
+            ErrorCodes::BadValue,
+            str::stream()
+                << "Invalid sslMode setting '"
+                << strMode
+                << "', expected one of: 'disabled', 'allowSSL', 'preferSSL', or 'requireSSL'");
+    }
+}
+
+StatusWith<SSLParams::SSLModes> SSLParams::tlsModeParse(StringData strMode) {
+    if (strMode == "disabled") {
+        return SSLParams::SSLMode_disabled;
+    } else if (strMode == "allowTLS") {
+        return SSLParams::SSLMode_allowSSL;
+    } else if (strMode == "preferTLS") {
+        return SSLParams::SSLMode_preferSSL;
+    } else if (strMode == "requireTLS") {
+        return SSLParams::SSLMode_requireSSL;
+    } else {
+        return Status(
+            ErrorCodes::BadValue,
+            str::stream()
+                << "Invalid tlsMode setting '"
+                << strMode
+                << "', expected one of: 'disabled', 'allowTLS', 'preferTLS', or 'requireTLS'");
+    }
+}
+
+
+std::string SSLParams::sslModeFormat(int mode) {
+    switch (mode) {
+        case SSLParams::SSLMode_disabled:
+            return "disabled";
+        case SSLParams::SSLMode_allowSSL:
+            return "allowSSL";
+        case SSLParams::SSLMode_preferSSL:
+            return "preferSSL";
+        case SSLParams::SSLMode_requireSSL:
+            return "requireSSL";
+        default:
+            // Default case because sslMode is an AtomicWord<int> and not bound by enum rules.
+            return "unknown";
+    }
+}
+
+std::string SSLParams::tlsModeFormat(int mode) {
+    switch (mode) {
+        case SSLParams::SSLMode_disabled:
+            return "disabled";
+        case SSLParams::SSLMode_allowSSL:
+            return "allowTLS";
+        case SSLParams::SSLMode_preferSSL:
+            return "preferTLS";
+        case SSLParams::SSLMode_requireSSL:
+            return "requireTLS";
+        default:
+            // Default case because sslMode is an AtomicWord<int> and not bound by enum rules.
+            return "unknown";
+    }
+}
+
 
 }  // namespace mongo

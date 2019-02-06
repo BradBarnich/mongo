@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -47,8 +49,6 @@
 
 namespace mongo {
 
-MONGO_EXPORT_SERVER_PARAMETER(AsyncRequestsSenderUseBaton, bool, true);
-
 namespace {
 
 // Maximum number of retries for network and replication notMaster errors (per host).
@@ -64,7 +64,6 @@ AsyncRequestsSender::AsyncRequestsSender(OperationContext* opCtx,
                                          Shard::RetryPolicy retryPolicy)
     : _opCtx(opCtx),
       _executor(executor),
-      _baton(opCtx),
       _db(dbName.toString()),
       _readPreference(readPreference),
       _retryPolicy(retryPolicy) {
@@ -180,6 +179,10 @@ void AsyncRequestsSender::_scheduleRequests() {
                 status = getStatusFromCommandResult(remote.swResponse->getValue().data);
             }
 
+            if (status.isOK()) {
+                status = getWriteConcernStatusFromCommandResult(remote.swResponse->getValue().data);
+            }
+
             if (!status.isOK()) {
                 // There was an error with either the response or the command.
                 auto shard = remote.getShard();
@@ -212,7 +215,7 @@ void AsyncRequestsSender::_scheduleRequests() {
 
                 // Push a noop response to the queue to indicate that a remote is ready for
                 // re-processing due to failure.
-                _responseQueue.push(boost::none);
+                _responseQueue.producer.push(boost::none);
             }
         }
     }
@@ -234,10 +237,11 @@ Status AsyncRequestsSender::_scheduleRequest(size_t remoteIndex) {
 
     auto callbackStatus = _executor->scheduleRemoteCommand(
         request,
-        [remoteIndex, this](const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {
-            _responseQueue.push(Job{cbData, remoteIndex});
+        [ remoteIndex, producer = _responseQueue.producer ](
+            const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {
+            producer.push(Job{cbData, remoteIndex});
         },
-        _baton);
+        _opCtx->getBaton());
     if (!callbackStatus.isOK()) {
         return callbackStatus.getStatus();
     }
@@ -248,7 +252,7 @@ Status AsyncRequestsSender::_scheduleRequest(size_t remoteIndex) {
 
 // Passing opCtx means you'd like to opt into opCtx interruption.  During cleanup we actually don't.
 void AsyncRequestsSender::_makeProgress() {
-    auto job = _responseQueue.pop(_opCtx);
+    auto job = _responseQueue.consumer.pop(_opCtx);
 
     if (!job) {
         return;
@@ -296,15 +300,7 @@ Status AsyncRequestsSender::RemoteData::resolveShardIdToHostAndPort(
                       str::stream() << "Could not find shard " << shardId);
     }
 
-    // It shouldn't be necessary to run without interruption here, but there's a subtle race around
-    // exiting early while callbacks hold a reference to this type.  The easiest way to work around
-    // it is to unconditionally block in targeting (for now).
-    auto findHostStatus = ars->_opCtx->runWithoutInterruption([&] {
-        return shard->getTargeter()
-            ->findHostWithMaxWait(readPref, Seconds{20})
-            .getNoThrow(ars->_opCtx);
-    });
-
+    auto findHostStatus = shard->getTargeter()->findHost(ars->_opCtx, readPref);
     if (findHostStatus.isOK())
         shardHostAndPort = std::move(findHostStatus.getValue());
 
@@ -314,19 +310,6 @@ Status AsyncRequestsSender::RemoteData::resolveShardIdToHostAndPort(
 std::shared_ptr<Shard> AsyncRequestsSender::RemoteData::getShard() {
     // TODO: Pass down an OperationContext* to use here.
     return Grid::get(getGlobalServiceContext())->shardRegistry()->getShardNoReload(shardId);
-}
-
-AsyncRequestsSender::BatonDetacher::BatonDetacher(OperationContext* opCtx)
-    : _baton(AsyncRequestsSenderUseBaton.load()
-                 ? (opCtx->getServiceContext()->getTransportLayer()
-                        ? opCtx->getServiceContext()->getTransportLayer()->makeBaton(opCtx)
-                        : nullptr)
-                 : nullptr) {}
-
-AsyncRequestsSender::BatonDetacher::~BatonDetacher() {
-    if (_baton) {
-        _baton->detach();
-    }
 }
 
 }  // namespace mongo

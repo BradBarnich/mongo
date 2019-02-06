@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,6 +41,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/repl/data_replicator_external_state_impl.h"
@@ -67,7 +70,6 @@ using std::string;
 namespace repl {
 
 namespace {
-const char kHashFieldName[] = "h";
 const int kSleepToAllowBatchingMillis = 2;
 const int kSmallBatchLimitBytes = 40000;
 const Milliseconds kRollbackOplogSocketTimeout(10 * 60 * 1000);
@@ -337,9 +339,9 @@ void BackgroundSync::_produce() {
         // Mark yourself as too stale.
         _tooStale = true;
 
-        // Need to take global X lock to transition out of SECONDARY.
+        // Need to take the RSTL in mode X to transition out of SECONDARY.
         auto opCtx = cc().makeOperationContext();
-        Lock::GlobalWrite globalWriteLock(opCtx.get());
+        ReplicationStateTransitionLockGuard transitionGuard(opCtx.get());
 
         error() << "too stale to catch up -- entering maintenance mode";
         log() << "Our newest OpTime : " << lastOpTimeFetched;
@@ -400,14 +402,12 @@ void BackgroundSync::_produce() {
         }
     }
 
-    long long lastHashFetched;
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
         if (_state != ProducerState::Running) {
             return;
         }
         lastOpTimeFetched = _lastOpTimeFetched;
-        lastHashFetched = _lastFetchedHash;
     }
 
     if (!_replCoord->getMemberState().primary()) {
@@ -438,7 +438,7 @@ void BackgroundSync::_produce() {
         // replication coordinator.
         auto oplogFetcherPtr = stdx::make_unique<OplogFetcher>(
             _replicationCoordinatorExternalState->getTaskExecutor(),
-            OpTimeWithHash(lastHashFetched, lastOpTimeFetched),
+            lastOpTimeFetched,
             source,
             NamespaceString::kRsOplogNamespace,
             _replCoord->getConfig(),
@@ -536,8 +536,7 @@ Status BackgroundSync::_enqueueDocuments(Fetcher::Documents::const_iterator begi
         _oplogApplier->enqueue(opCtx.get(), begin, end);
 
         // Update last fetched info.
-        _lastFetchedHash = info.lastDocument.value;
-        _lastOpTimeFetched = info.lastDocument.opTime;
+        _lastOpTimeFetched = info.lastDocument;
         LOG(3) << "batch resetting _lastOpTimeFetched: " << _lastOpTimeFetched;
     }
 
@@ -710,7 +709,6 @@ void BackgroundSync::stop(bool resetLastFetchedOptime) {
     if (resetLastFetchedOptime) {
         invariant(_oplogApplier->getBuffer()->isEmpty());
         _lastOpTimeFetched = OpTime();
-        _lastFetchedHash = 0;
         log() << "Resetting last fetched optimes in bgsync";
     }
 
@@ -724,14 +722,14 @@ void BackgroundSync::stop(bool resetLastFetchedOptime) {
 }
 
 void BackgroundSync::start(OperationContext* opCtx) {
-    OpTimeWithHash lastAppliedOpTimeWithHash;
+    OpTime lastAppliedOpTime;
     ShouldNotConflictWithSecondaryBatchApplicationBlock noConflict(opCtx->lockState());
 
     // Explicitly start future read transactions without a timestamp.
     opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
 
     do {
-        lastAppliedOpTimeWithHash = _readLastAppliedOpTimeWithHash(opCtx);
+        lastAppliedOpTime = _readLastAppliedOpTime(opCtx);
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         // Double check the state after acquiring the mutex.
         if (_state != ProducerState::Starting) {
@@ -746,52 +744,42 @@ void BackgroundSync::start(OperationContext* opCtx) {
 
         // When a node steps down during drain mode, the last fetched optime would be newer than
         // the last applied.
-        if (_lastOpTimeFetched <= lastAppliedOpTimeWithHash.opTime) {
-            LOG(1) << "Setting bgsync _lastOpTimeFetched=" << lastAppliedOpTimeWithHash.opTime
-                   << " and _lastFetchedHash=" << lastAppliedOpTimeWithHash.value
+        if (_lastOpTimeFetched <= lastAppliedOpTime) {
+            LOG(1) << "Setting bgsync _lastOpTimeFetched=" << lastAppliedOpTime
                    << ". Previous _lastOpTimeFetched: " << _lastOpTimeFetched;
-            _lastOpTimeFetched = lastAppliedOpTimeWithHash.opTime;
-            _lastFetchedHash = lastAppliedOpTimeWithHash.value;
+            _lastOpTimeFetched = lastAppliedOpTime;
         }
         // Reload the last applied optime from disk if it has been changed.
-    } while (lastAppliedOpTimeWithHash.opTime != _replCoord->getMyLastAppliedOpTime());
+    } while (lastAppliedOpTime != _replCoord->getMyLastAppliedOpTime());
 
-    LOG(1) << "bgsync fetch queue set to: " << _lastOpTimeFetched << " " << _lastFetchedHash;
+    LOG(1) << "bgsync fetch queue set to: " << _lastOpTimeFetched;
 }
 
-OpTimeWithHash BackgroundSync::_readLastAppliedOpTimeWithHash(OperationContext* opCtx) {
+OpTime BackgroundSync::_readLastAppliedOpTime(OperationContext* opCtx) {
     BSONObj oplogEntry;
     try {
         bool success = writeConflictRetry(
-            opCtx, "readLastAppliedHash", NamespaceString::kRsOplogNamespace.ns(), [&] {
+            opCtx, "readLastAppliedOpTime", NamespaceString::kRsOplogNamespace.ns(), [&] {
                 Lock::DBLock lk(opCtx, "local", MODE_X);
                 return Helpers::getLast(
                     opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry);
             });
 
         if (!success) {
-            // This can happen when we are to do an initial sync.  lastHash will be set
-            // after the initial sync is complete.
-            return OpTimeWithHash(0);
+            // This can happen when we are to do an initial sync.
+            return OpTime();
         }
+    } catch (const ExceptionForCat<ErrorCategory::ShutdownError>&) {
+        throw;
     } catch (const DBException& ex) {
         severe() << "Problem reading " << NamespaceString::kRsOplogNamespace.ns() << ": "
                  << redact(ex);
         fassertFailed(18904);
     }
-    long long hash;
-    auto status = bsonExtractIntegerField(oplogEntry, kHashFieldName, &hash);
-    if (!status.isOK()) {
-        severe() << "Most recent entry in " << NamespaceString::kRsOplogNamespace.ns()
-                 << " is missing or has invalid \"" << kHashFieldName
-                 << "\" field. Oplog entry: " << redact(oplogEntry) << ": " << redact(status);
-        fassertFailed(18902);
-    }
 
     OplogEntry parsedEntry(oplogEntry);
-    auto lastOptime = OpTimeWithHash(hash, parsedEntry.getOpTime());
     LOG(1) << "Successfully read last entry of oplog while starting bgsync: " << redact(oplogEntry);
-    return lastOptime;
+    return parsedEntry.getOpTime();
 }
 
 bool BackgroundSync::shouldStopFetching() const {

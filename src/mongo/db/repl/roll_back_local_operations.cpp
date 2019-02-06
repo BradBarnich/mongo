@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -58,6 +60,10 @@ OpTime getOpTime(const OplogInterface::Iterator::Value& oplogValue) {
     return fassert(40298, OpTime::parseFromOplogEntry(oplogValue.first));
 }
 
+long long getTerm(const BSONObj& operation) {
+    return operation["t"].numberLong();
+}
+
 Timestamp getTimestamp(const BSONObj& operation) {
     return operation["ts"].timestamp();
 }
@@ -66,14 +72,9 @@ Timestamp getTimestamp(const OplogInterface::Iterator::Value& oplogValue) {
     return getTimestamp(oplogValue.first);
 }
 
-long long getHash(const BSONObj& operation) {
-    return operation["h"].Long();
+long long getTerm(const OplogInterface::Iterator::Value& oplogValue) {
+    return getTerm(oplogValue.first);
 }
-
-long long getHash(const OplogInterface::Iterator::Value& oplogValue) {
-    return getHash(oplogValue.first);
-}
-
 }  // namespace
 
 RollBackLocalOperations::RollBackLocalOperations(const OplogInterface& localOplog,
@@ -129,31 +130,17 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> RollBackLocalOperations
 
     if (getTimestamp(_localOplogValue) == getTimestamp(operation)) {
         _scanned++;
-        if (getHash(_localOplogValue) == getHash(operation)) {
+        if (getTerm(_localOplogValue) == getTerm(operation)) {
             return RollbackCommonPoint(_localOplogValue.first, _localOplogValue.second);
         }
 
-        LOG(2) << "Local oplog entry to roll back: " << redact(_localOplogValue.first);
-        auto status = _rollbackOperation(_localOplogValue.first);
-        if (!status.isOK()) {
-            invariant(ErrorCodes::NoSuchKey != status.code());
-            return status;
-        }
-        auto result = _localOplogIterator->next();
-        if (!result.isOK()) {
-            return Status(ErrorCodes::NoMatchingDocument,
-                          str::stream() << "reached beginning of local oplog: {"
-                                        << "scanned: "
-                                        << _scanned
-                                        << ", theirTime: "
-                                        << getTimestamp(operation).toString()
-                                        << ", ourTime: "
-                                        << getTimestamp(_localOplogValue).toString()
-                                        << "}");
-        }
-        _localOplogValue = result.getValue();
+        // We don't need to advance the localOplogIterator here because it is guaranteed to advance
+        // during the next call to onRemoteOperation. This is because before the next call to
+        // onRemoteOperation, the remote oplog iterator will advance and the new remote operation is
+        // guaranteed to have a timestamp less than the current local operation, which will trigger
+        // a call to get the next local operation.
         return Status(ErrorCodes::NoSuchKey,
-                      "Unable to determine common point - same timestamp but different hash. "
+                      "Unable to determine common point - same timestamp but different terms. "
                       "Need to process additional remote operations.");
     }
 

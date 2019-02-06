@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -43,6 +45,7 @@
 #include "mongo/db/exec/text.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/db/query/canonical_query_encoder.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -126,7 +129,8 @@ MultiPlanStage* getMultiPlanStage(PlanStage* root) {
  * there is no PPS that is root.
  */
 PipelineProxyStage* getPipelineProxyStage(PlanStage* root) {
-    if (root->stageType() == STAGE_PIPELINE_PROXY) {
+    if (root->stageType() == STAGE_PIPELINE_PROXY ||
+        root->stageType() == STAGE_CHANGE_STREAM_PROXY) {
         return static_cast<PipelineProxyStage*>(root);
     }
 
@@ -462,11 +466,6 @@ void Explain::statsToBSON(const PlanStageStats& stats,
             }
             intervalsBob.doneFast();
         }
-    } else if (STAGE_GROUP == stats.stageType) {
-        GroupStats* spec = static_cast<GroupStats*>(stats.specific.get());
-        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
-            bob->appendNumber("nGroups", spec->nGroups);
-        }
     } else if (STAGE_IDHACK == stats.stageType) {
         IDHackStats* spec = static_cast<IDHackStats*>(stats.specific.get());
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
@@ -513,9 +512,18 @@ void Explain::statsToBSON(const PlanStageStats& stats,
     } else if (STAGE_LIMIT == stats.stageType) {
         LimitStats* spec = static_cast<LimitStats*>(stats.specific.get());
         bob->appendNumber("limitAmount", spec->limit);
-    } else if (STAGE_PROJECTION == stats.stageType) {
+    } else if (STAGE_PROJECTION_DEFAULT == stats.stageType ||
+               STAGE_PROJECTION_COVERED == stats.stageType ||
+               STAGE_PROJECTION_SIMPLE == stats.stageType) {
         ProjectionStats* spec = static_cast<ProjectionStats*>(stats.specific.get());
         bob->append("transformBy", spec->projObj);
+    } else if (STAGE_RECORD_STORE_FAST_COUNT == stats.stageType) {
+        CountStats* spec = static_cast<CountStats*>(stats.specific.get());
+
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+            bob->appendNumber("nCounted", spec->nCounted);
+            bob->appendNumber("nSkipped", spec->nSkipped);
+        }
     } else if (STAGE_SHARDING_FILTER == stats.stageType) {
         ShardingFilterStats* spec = static_cast<ShardingFilterStats*>(stats.specific.get());
 
@@ -643,13 +651,17 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
     // field will always be false in the case of EOF or idhack plans.
     bool indexFilterSet = false;
     boost::optional<uint32_t> queryHash;
+    boost::optional<uint32_t> planCacheKeyHash;
     if (collection && exec->getCanonicalQuery()) {
         const CollectionInfoCache* infoCache = collection->infoCache();
         const QuerySettings* querySettings = infoCache->getQuerySettings();
         PlanCacheKey planCacheKey =
             infoCache->getPlanCache()->computeKey(*exec->getCanonicalQuery());
-        queryHash = PlanCache::computeQueryHash(planCacheKey);
-        if (auto allowedIndicesFilter = querySettings->getAllowedIndicesFilter(planCacheKey)) {
+        planCacheKeyHash = canonical_query_encoder::computeHash(planCacheKey.toString());
+        queryHash = canonical_query_encoder::computeHash(planCacheKey.getStableKeyStringData());
+
+        if (auto allowedIndicesFilter =
+                querySettings->getAllowedIndicesFilter(planCacheKey.getStableKey())) {
             // Found an index filter set on the query shape.
             indexFilterSet = true;
         }
@@ -671,6 +683,10 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
 
     if (queryHash) {
         plannerBob.append("queryHash", unsignedIntToFixedLengthHex(*queryHash));
+    }
+
+    if (planCacheKeyHash) {
+        plannerBob.append("planCacheKey", unsignedIntToFixedLengthHex(*planCacheKeyHash));
     }
 
     BSONObjBuilder winningPlanBob(plannerBob.subobjStart("winningPlan"));
@@ -881,7 +897,8 @@ std::string Explain::getPlanSummary(const PlanExecutor* exec) {
 
 // static
 std::string Explain::getPlanSummary(const PlanStage* root) {
-    if (root->stageType() == STAGE_PIPELINE_PROXY) {
+    if (root->stageType() == STAGE_PIPELINE_PROXY ||
+        root->stageType() == STAGE_CHANGE_STREAM_PROXY) {
         auto pipelineProxy = static_cast<const PipelineProxyStage*>(root);
         return pipelineProxy->getPlanSummaryStr();
     }
@@ -915,7 +932,8 @@ void Explain::getSummaryStats(const PlanExecutor& exec, PlanSummaryStats* statsO
 
     PlanStage* root = exec.getRootStage();
 
-    if (root->stageType() == STAGE_PIPELINE_PROXY) {
+    if (root->stageType() == STAGE_PIPELINE_PROXY ||
+        root->stageType() == STAGE_CHANGE_STREAM_PROXY) {
         auto pipelineProxy = static_cast<PipelineProxyStage*>(root);
         pipelineProxy->getPlanSummaryStats(statsOut);
         return;
@@ -997,6 +1015,7 @@ void Explain::planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* 
     }
     shapeBuilder.doneFast();
     out->append("queryHash", unsignedIntToFixedLengthHex(entry.queryHash));
+    out->append("planCacheKey", unsignedIntToFixedLengthHex(entry.planCacheKey));
 
     // Append whether or not the entry is active.
     out->append("isActive", entry.isActive);

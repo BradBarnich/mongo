@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2018 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -44,7 +46,7 @@
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
-#include "mongo/s/shard_server_test_fixture.h"
+#include "mongo/s/sharding_mongod_test_fixture.h"
 
 namespace mongo {
 namespace {
@@ -53,13 +55,13 @@ const std::string kShardName("TestShard");
 
 /**
  * This test suite validates that when the default OpObserver chain is set up (which happens to
- * include the ShardServerOpObserver), writes to the 'admin.system.version' collection (and the
+ * include the ShardingMongodOpObserver), writes to the 'admin.system.version' collection (and the
  * shardIdentity document specifically) will invoke the sharding initialization code.
  */
-class ShardingInitializationOpObserverTest : public ShardServerTestFixture {
+class ShardingInitializationOpObserverTest : public ShardingMongodTestFixture {
 public:
     void setUp() override {
-        ShardServerTestFixture::setUp();
+        ShardingMongodTestFixture::setUp();
 
         // NOTE: this assumes that globalInit will always be called on the same thread as the main
         // test thread
@@ -75,7 +77,7 @@ public:
     void tearDown() override {
         ShardingState::get(getServiceContext())->clearForTests();
 
-        ShardServerTestFixture::tearDown();
+        ShardingMongodTestFixture::tearDown();
     }
 
     int getInitCallCount() const {
@@ -116,8 +118,8 @@ TEST_F(ShardingInitializationOpObserverTest, GlobalInitDoesntGetCalledIfWriteAbo
             operationContext(), NamespaceString("admin.system.version"), MODE_IX);
 
         WriteUnitOfWork wuow(operationContext());
-        ASSERT_OK(autoColl.getCollection()->insertDocument(
-            operationContext(), shardIdentity.toShardIdentityDocument(), {}));
+        InsertStatement stmt(shardIdentity.toShardIdentityDocument());
+        ASSERT_OK(autoColl.getCollection()->insertDocument(operationContext(), stmt, nullptr));
         ASSERT_EQ(0, getInitCallCount());
     }
 

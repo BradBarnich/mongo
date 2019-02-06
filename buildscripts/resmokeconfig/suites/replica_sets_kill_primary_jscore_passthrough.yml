@@ -40,7 +40,7 @@ selector:
   - jstests/core/fsync.js
   - jstests/core/killop_drop_collection.js
 
-  # Expect drops/creates to fail or have certain a response:
+  # Expect drops/creates to fail or have a certain response:
   - jstests/core/drop.js
   - jstests/core/dropdb.js
   - jstests/core/explain_upsert.js
@@ -83,6 +83,9 @@ selector:
   - jstests/core/find_and_modify_concurrent_update.js
   - jstests/core/shellstartparallel.js
 
+  # Inserts enough data that recovery takes more than 8 seconds, so we never get a working primary.
+  - jstests/core/geo_s2ordering.js
+
   exclude_with_any_tags:
   ##
   # The next four tags correspond to the special errors thrown by the auto_retry_on_network_error.js
@@ -102,8 +105,8 @@ selector:
   # "Refusing to run a test that issues commands that may return different values after a failover"
   # "Refusing to run a test that issues an aggregation command with explain because it may return
   #   incomplete results"
-  # "Refusing to run a test that issues an aggregation command with $listLocalCursors or
-  #   $listLocalSessions because they rely on in-memory state that may not survive failovers"
+  # "Refusing to run a test that issues an aggregation command with 
+  #   $listLocalSessions because it relies on in-memory state that may not survive failovers"
   # "Refusing to run a test that issues a mapReduce command, because it calls std::terminate() if
   #   interrupted by a stepdown"
   - does_not_support_stepdowns
@@ -118,9 +121,10 @@ selector:
   # "Cowardly refusing to override write concern of command: ..."
   - assumes_write_concern_unchanged
   ##
-  # The next three tags corresponds to the special errors thrown by the error_on_fast_count.js
-  # override when it refuses to run commands that are innacurate after an unclean shutdown. Above
-  # each tag is the message that causes the tag to be warranted.
+  # The next three tags corresponds to the special errors thrown by the
+  # fail_unclean_shutdown_incompatible_commands.js override when it refuses to run commands that are
+  # inaccurate after an unclean shutdown. Above each tag is the message that causes the tag to be
+  # warranted.
   ##
   # "Cowardly fail if fastcount is run with a mongod that had an unclean shutdown: ..."
   - requires_fastcount
@@ -184,7 +188,6 @@ executor:
       syncdelay: 5
       set_parameters:
         enableTestCommands: 1
-        numInitialSyncAttempts: 1
         enableElectionHandoff: 0
         logComponentVerbosity:
           replication:

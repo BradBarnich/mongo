@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -109,7 +111,7 @@ using NetworkGuard = executor::NetworkInterfaceMock::InNetworkGuard;
 using UniqueLock = stdx::unique_lock<stdx::mutex>;
 
 struct CollectionCloneInfo {
-    CollectionMockStats stats;
+    std::shared_ptr<CollectionMockStats> stats = std::make_shared<CollectionMockStats>();
     CollectionBulkLoaderMock* loader = nullptr;
     Status status{ErrorCodes::NotYetInitialized, ""};
 };
@@ -118,7 +120,7 @@ class InitialSyncerTest : public executor::ThreadPoolExecutorTest,
                           public SyncSourceSelector,
                           public ScopedGlobalServiceContextForTest {
 public:
-    InitialSyncerTest() {}
+    InitialSyncerTest() : _threadClient(getGlobalServiceContext()) {}
 
     executor::ThreadPoolMock::Options makeThreadPoolMockOptions() const override;
 
@@ -213,7 +215,7 @@ public:
         getNet()->runReadyNetworkOperations();
         if (getNet()->hasReadyRequests()) {
             log() << "The network has unexpected requests to process, next req:";
-            NetworkInterfaceMock::NetworkOperation req = *getNet()->getNextReadyRequest();
+            const NetworkInterfaceMock::NetworkOperation& req = *getNet()->getNextReadyRequest();
             log() << req.getDiagnosticString();
         }
         ASSERT_FALSE(getNet()->hasReadyRequests());
@@ -295,18 +297,20 @@ protected:
             [this](const NamespaceString& nss,
                    const CollectionOptions& options,
                    const BSONObj idIndexSpec,
-                   const std::vector<BSONObj>& secondaryIndexSpecs) {
+                   const std::vector<BSONObj>& secondaryIndexSpecs)
+            -> StatusWith<std::unique_ptr<CollectionBulkLoaderMock>> {
                 // Get collection info from map.
                 const auto collInfo = &_collections[nss];
-                if (collInfo->stats.initCalled) {
+                if (collInfo->stats->initCalled) {
                     log() << "reusing collection during test which may cause problems, ns:" << nss;
                 }
-                (collInfo->loader = new CollectionBulkLoaderMock(&collInfo->stats))
-                    ->init(secondaryIndexSpecs)
-                    .transitional_ignore();
+                auto localLoader = std::make_unique<CollectionBulkLoaderMock>(collInfo->stats);
+                auto status = localLoader->init(secondaryIndexSpecs);
+                if (!status.isOK())
+                    return status;
+                collInfo->loader = localLoader.get();
 
-                return StatusWith<std::unique_ptr<CollectionBulkLoader>>(
-                    std::unique_ptr<CollectionBulkLoader>(collInfo->loader));
+                return std::move(localLoader);
             };
         _storageInterface->upgradeNonReplicatedUniqueIndexesFn = [this](OperationContext* opCtx) {
             LockGuard lock(_storageInterfaceWorkDoneMutex);
@@ -329,7 +333,6 @@ protected:
         _mockServer = stdx::make_unique<MockRemoteDBServer>(_target.toString());
         _options1.uuid = UUID::gen();
 
-        Client::initThreadIfNotAlready();
         reset();
 
         launchExecutorThread();
@@ -385,7 +388,7 @@ protected:
         _externalState = dataReplicatorExternalState.get();
 
         _lastApplied = getDetectableErrorStatus();
-        _onCompletion = [this](const StatusWith<OpTimeWithHash>& lastApplied) {
+        _onCompletion = [this](const StatusWith<OpTime>& lastApplied) {
             _lastApplied = lastApplied;
         };
 
@@ -399,12 +402,10 @@ protected:
                 _dbWorkThreadPool.get(),
                 _storageInterface.get(),
                 _replicationProcess.get(),
-                [this](const StatusWith<OpTimeWithHash>& lastApplied) {
-                    _onCompletion(lastApplied);
-                });
+                [this](const StatusWith<OpTime>& lastApplied) { _onCompletion(lastApplied); });
             _initialSyncer->setScheduleDbWorkFn_forTest(
-                [this](const executor::TaskExecutor::CallbackFn& work) {
-                    return getExecutor().scheduleWork(work);
+                [this](executor::TaskExecutor::CallbackFn work) {
+                    return getExecutor().scheduleWork(std::move(work));
                 });
             _initialSyncer->setStartCollectionClonerFn([this](CollectionCloner& cloner) {
                 cloner.setCreateClientFn_forTest([&cloner, this]() {
@@ -433,7 +434,6 @@ protected:
         _dbWorkThreadPool.reset();
         _replicationProcess.reset();
         _storageInterface.reset();
-        Client::destroy();
     }
 
     /**
@@ -473,12 +473,13 @@ protected:
     std::map<NamespaceString, CollectionMockStats> _collectionStats;
     std::map<NamespaceString, CollectionCloneInfo> _collections;
 
-    StatusWith<OpTimeWithHash> _lastApplied = Status(ErrorCodes::NotYetInitialized, "");
+    StatusWith<OpTime> _lastApplied = Status(ErrorCodes::NotYetInitialized, "");
     InitialSyncer::OnCompletionFn _onCompletion;
 
 private:
     DataReplicatorExternalStateMock* _externalState;
     std::unique_ptr<InitialSyncer> _initialSyncer;
+    ThreadClient _threadClient;
     bool _executorThreadShutdownComplete = false;
 };
 
@@ -563,7 +564,7 @@ OplogEntry makeOplogEntry(int t,
                       << "a_1");
     }
     return OplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
-                      static_cast<long long>(t),   // hash
+                      boost::none,                 // hash
                       opType,                      // op type
                       NamespaceString("a.a"),      // namespace
                       boost::none,                 // uuid
@@ -630,7 +631,7 @@ TEST_F(InitialSyncerTest, InvalidConstruction) {
                                  ReplicationCoordinator::DataConsistency consistency) {};
     options.resetOptimes = []() {};
     options.syncSourceSelector = this;
-    auto callback = [](const StatusWith<OpTimeWithHash>&) {};
+    auto callback = [](const StatusWith<OpTime>&) {};
 
     // Null task executor in external state.
     {
@@ -952,7 +953,7 @@ TEST_F(InitialSyncerTest, InitialSyncerTransitionsToCompleteWhenFinishCallbackTh
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
-    _onCompletion = [this](const StatusWith<OpTimeWithHash>& lastApplied) {
+    _onCompletion = [this](const StatusWith<OpTime>& lastApplied) {
         _lastApplied = lastApplied;
         uassert(ErrorCodes::InternalError, "", false);
     };
@@ -993,7 +994,7 @@ TEST_F(InitialSyncerTest, InitialSyncerResetsOnCompletionCallbackFunctionPointer
         _dbWorkThreadPool.get(),
         _storageInterface.get(),
         _replicationProcess.get(),
-        [&lastApplied, sharedCallbackData](const StatusWith<OpTimeWithHash>& result) {
+        [&lastApplied, sharedCallbackData](const StatusWith<OpTime>& result) {
             lastApplied = result;
         });
     ON_BLOCK_EXIT([this]() { getExecutor().shutdown(); });
@@ -1294,30 +1295,6 @@ TEST_F(InitialSyncerTest,
 }
 
 TEST_F(InitialSyncerTest,
-       InitialSyncerReturnsNoSuchKeyIfLastOplogEntryFetcherReturnsEntryWithMissingHash) {
-    auto initialSyncer = &getInitialSyncer();
-    auto opCtx = makeOpCtx();
-
-    _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
-    ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
-
-    auto net = getNet();
-    {
-        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
-
-        // Base rollback ID.
-        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(1));
-        net->runReadyNetworkOperations();
-
-        // Last oplog entry.
-        processSuccessfulLastOplogEntryFetcherResponse({BSONObj()});
-    }
-
-    initialSyncer->join();
-    ASSERT_EQUALS(ErrorCodes::NoSuchKey, _lastApplied);
-}
-
-TEST_F(InitialSyncerTest,
        InitialSyncerReturnsNoSuchKeyIfLastOplogEntryFetcherReturnsEntryWithMissingTimestamp) {
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
@@ -1334,7 +1311,7 @@ TEST_F(InitialSyncerTest,
         net->runReadyNetworkOperations();
 
         // Last oplog entry.
-        processSuccessfulLastOplogEntryFetcherResponse({BSON("h" << 1LL)});
+        processSuccessfulLastOplogEntryFetcherResponse({BSONObj()});
     }
 
     initialSyncer->join();
@@ -1735,7 +1712,7 @@ TEST_F(InitialSyncerTest,
     }
 
     initialSyncer->join();
-    ASSERT_EQUALS(makeOplogEntry(1).getOpTime(), unittest::assertGet(_lastApplied).opTime);
+    ASSERT_EQUALS(makeOplogEntry(1).getOpTime(), unittest::assertGet(_lastApplied));
 }
 
 TEST_F(
@@ -1788,7 +1765,7 @@ TEST_F(
     }
 
     initialSyncer->join();
-    ASSERT_EQUALS(makeOplogEntry(3).getOpTime(), unittest::assertGet(_lastApplied).opTime);
+    ASSERT_EQUALS(makeOplogEntry(3).getOpTime(), unittest::assertGet(_lastApplied));
 }
 
 TEST_F(
@@ -2353,8 +2330,10 @@ TEST_F(
         net->blackHole(noi);
 
         // Second last oplog entry fetcher.
-        processSuccessfulLastOplogEntryFetcherResponse({BSON("ts" << Timestamp(1) << "t" << 1 << "h"
-                                                                  << "not a hash")});
+        processSuccessfulLastOplogEntryFetcherResponse({BSON("ts"
+                                                             << "not a timestamp"
+                                                             << "t"
+                                                             << 1)});
 
         // _lastOplogEntryFetcherCallbackAfterCloningData() will shut down the OplogFetcher after
         // setting the completion status.
@@ -2931,8 +2910,7 @@ TEST_F(InitialSyncerTest, LastOpTimeShouldBeSetEvenIfNoOperationsAreAppliedAfter
     }
 
     initialSyncer->join();
-    ASSERT_EQUALS(oplogEntry.getOpTime(), unittest::assertGet(_lastApplied).opTime);
-    ASSERT_EQUALS(oplogEntry.getHash(), unittest::assertGet(_lastApplied).value);
+    ASSERT_EQUALS(oplogEntry.getOpTime(), unittest::assertGet(_lastApplied));
     ASSERT_FALSE(_replicationProcess->getConsistencyMarkers()->getInitialSyncFlag(opCtx.get()));
 }
 
@@ -3483,8 +3461,7 @@ OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch(bool shouldSetFCV) {
 void InitialSyncerTest::doSuccessfulInitialSyncWithOneBatch(bool shouldSetFCV) {
     auto lastOp = doInitialSyncWithOneBatch(shouldSetFCV);
     serverGlobalParams.featureCompatibility.reset();
-    ASSERT_EQUALS(lastOp.getOpTime(), unittest::assertGet(_lastApplied).opTime);
-    ASSERT_EQUALS(lastOp.getHash(), unittest::assertGet(_lastApplied).value);
+    ASSERT_EQUALS(lastOp.getOpTime(), unittest::assertGet(_lastApplied));
 
     ASSERT_EQUALS(lastOp.getOpTime().getTimestamp(), _storageInterface->getInitialDataTimestamp());
 }
@@ -3597,8 +3574,7 @@ TEST_F(InitialSyncerTest,
     }
 
     initialSyncer->join();
-    ASSERT_EQUALS(lastOp.getOpTime(), unittest::assertGet(_lastApplied).opTime);
-    ASSERT_EQUALS(lastOp.getHash(), unittest::assertGet(_lastApplied).value);
+    ASSERT_EQUALS(lastOp.getOpTime(), unittest::assertGet(_lastApplied));
 }
 
 TEST_F(
@@ -3687,8 +3663,7 @@ TEST_F(
     }
 
     initialSyncer->join();
-    ASSERT_EQUALS(lastOp.getOpTime(), unittest::assertGet(_lastApplied).opTime);
-    ASSERT_EQUALS(lastOp.getHash(), unittest::assertGet(_lastApplied).value);
+    ASSERT_EQUALS(lastOp.getOpTime(), unittest::assertGet(_lastApplied));
 
     ASSERT_TRUE(fetchCountIncremented);
 
@@ -3992,7 +3967,7 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
 
     log() << "waiting for initial sync to verify it completed OK";
     initialSyncer->join();
-    ASSERT_EQUALS(makeOplogEntry(7).getOpTime(), unittest::assertGet(_lastApplied).opTime);
+    ASSERT_EQUALS(makeOplogEntry(7).getOpTime(), unittest::assertGet(_lastApplied));
 
     progress = initialSyncer->getInitialSyncProgress();
     log() << "Progress at end: " << progress;

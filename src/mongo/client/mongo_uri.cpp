@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,6 +40,7 @@
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/find_iterator.hpp>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/range/algorithm/count.hpp>
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobjbuilder.h"
@@ -54,8 +57,6 @@ using namespace std::literals::string_literals;
 namespace {
 constexpr std::array<char, 16> hexits{
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
-const mongo::StringData kURIPrefix{"mongodb://"};
-const mongo::StringData kURISRVPrefix{"mongodb+srv://"};
 
 // This vector must remain sorted.  It is over pairs to facilitate a call to `std::includes` using
 // a `std::map<std::string, std::string>` as the other parameter.
@@ -84,13 +85,20 @@ void mongo::uriEncode(std::ostream& ss, StringData toEncode, StringData passthro
 mongo::StatusWith<std::string> mongo::uriDecode(StringData toDecode) {
     StringBuilder out;
     for (size_t i = 0; i < toDecode.size(); ++i) {
-        const auto c = toDecode[i];
+        const char c = toDecode[i];
         if (c == '%') {
             if (i + 2 > toDecode.size()) {
                 return Status(ErrorCodes::FailedToParse,
                               "Encountered partial escape sequence at end of string");
             }
-            out << fromHex(toDecode.substr(i + 1, 2));
+            auto swHex = fromHex(toDecode.substr(i + 1, 2));
+            if (swHex.isOK()) {
+                out << swHex.getValue();
+            } else {
+                return Status(ErrorCodes::Error(51040),
+                              "The characters after the % do not form a hex value. Please escape "
+                              "the % or pass a valid hex value. ");
+            }
             i += 2;
         } else {
             out << c;
@@ -103,9 +111,13 @@ namespace mongo {
 
 namespace {
 
+constexpr StringData kURIPrefix = "mongodb://"_sd;
+constexpr StringData kURISRVPrefix = "mongodb+srv://"_sd;
+constexpr StringData kDefaultMongoHost = "127.0.0.1:27017"_sd;
+
 /**
  * Helper Method for MongoURI::parse() to split a string into exactly 2 pieces by a char
- * delimeter.
+ * delimiter.
  */
 std::pair<StringData, StringData> partitionForward(StringData str, const char c) {
     const auto delim = str.find(c);
@@ -136,8 +148,8 @@ std::pair<StringData, StringData> partitionBackward(StringData str, const char c
  * on multiple parsed option sources.  STL setwise operations require sorted lists.  A map is used
  * instead of a vector of pairs to permit insertion-is-not-overwrite behavior.
  */
-std::map<std::string, std::string> parseOptions(StringData options, StringData url) {
-    std::map<std::string, std::string> ret;
+MongoURI::OptionsMap parseOptions(StringData options, StringData url) {
+    MongoURI::OptionsMap ret;
     if (options.empty()) {
         return ret;
     }
@@ -170,14 +182,11 @@ std::map<std::string, std::string> parseOptions(StringData options, StringData u
                           << "Missing a key for key/value pair in the options for mongodb:// URL: "
                           << url);
         }
-        const auto key = uriDecode(keyRaw);
-        if (!key.isOK()) {
-            uasserted(
-                ErrorCodes::FailedToParse,
-                str::stream() << "Key '" << keyRaw
-                              << "' in options cannot properly be URL decoded for mongodb:// URL: "
-                              << url);
-        }
+        const auto key = uassertStatusOKWithContext(
+            uriDecode(keyRaw),
+            str::stream() << "Key '" << keyRaw
+                          << "' in options cannot properly be URL decoded for mongodb:// URL: "
+                          << url);
         const auto valRaw = kvPair.second;
         if (valRaw.empty()) {
             uasserted(ErrorCodes::FailedToParse,
@@ -185,22 +194,19 @@ std::map<std::string, std::string> parseOptions(StringData options, StringData u
                                     << "' in the options for mongodb:// URL: "
                                     << url);
         }
-        const auto val = uriDecode(valRaw);
-        if (!val.isOK()) {
-            uasserted(
-                ErrorCodes::FailedToParse,
-                str::stream() << "Value '" << valRaw << "' for key '" << keyRaw
-                              << "' in options cannot properly be URL decoded for mongodb:// URL: "
-                              << url);
-        }
+        const auto val = uassertStatusOKWithContext(
+            uriDecode(valRaw),
+            str::stream() << "Value '" << valRaw << "' for key '" << keyRaw
+                          << "' in options cannot properly be URL decoded for mongodb:// URL: "
+                          << url);
 
-        ret[key.getValue()] = val.getValue();
+        ret[key] = val;
     }
 
     return ret;
 }
 
-MongoURI::OptionsMap addTXTOptions(std::map<std::string, std::string> options,
+MongoURI::OptionsMap addTXTOptions(MongoURI::OptionsMap options,
                                    const std::string& host,
                                    const StringData url,
                                    const bool isSeedlist) {
@@ -267,12 +273,12 @@ URIParts::URIParts(StringData uri) {
     const auto userAndHostInfo = userAndDb.first;
 
     // 2.b Make sure that there are no question marks in the left side of the /
-    //     as any options after the ? must still have the / delimeter
+    //     as any options after the ? must still have the / delimiter
     if (userAndDb.second.empty() && userAndHostInfo.find('?') != std::string::npos) {
         uasserted(
             ErrorCodes::FailedToParse,
             str::stream()
-                << "URI must contain slash delimeter between hosts and options for mongodb:// URL: "
+                << "URI must contain slash delimiter between hosts and options for mongodb:// URL: "
                 << uri);
     }
 
@@ -347,21 +353,14 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
     }
 
     // Get the username and make sure it did not fail to decode
-    const auto usernameWithStatus = uriDecode(usernameSD);
-    if (!usernameWithStatus.isOK()) {
-        uasserted(ErrorCodes::FailedToParse,
-                  str::stream() << "Username cannot properly be URL decoded for mongodb:// URL: "
-                                << url);
-    }
-    const auto username = usernameWithStatus.getValue();
+    const auto username = uassertStatusOKWithContext(
+        uriDecode(usernameSD),
+        str::stream() << "Username cannot properly be URL decoded for mongodb:// URL: " << url);
 
     // Get the password and make sure it did not fail to decode
-    const auto passwordWithStatus = uriDecode(passwordSD);
-    if (!passwordWithStatus.isOK())
-        uasserted(ErrorCodes::FailedToParse,
-                  str::stream() << "Password cannot properly be URL decoded for mongodb:// URL: "
-                                << url);
-    const auto password = passwordWithStatus.getValue();
+    const auto password = uassertStatusOKWithContext(
+        uriDecode(passwordSD),
+        str::stream() << "Password cannot properly be URL decoded for mongodb:// URL: " << url);
 
     // 4. Validate, split, and URL decode the host identifiers.
     const auto hostIdentifiersStr = hostIdentifiers.toString();
@@ -370,14 +369,10 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
                                              boost::first_finder(",", boost::is_iequal()));
          i != std::remove_reference<decltype((i))>::type{};
          ++i) {
-        const auto hostWithStatus = uriDecode(boost::copy_range<std::string>(*i));
-        if (!hostWithStatus.isOK()) {
-            uasserted(ErrorCodes::FailedToParse,
-                      str::stream() << "Host cannot properly be URL decoded for mongodb:// URL: "
-                                    << url);
-        }
+        const auto host = uassertStatusOKWithContext(
+            uriDecode(boost::copy_range<std::string>(*i)),
+            str::stream() << "Host cannot properly be URL decoded for mongodb:// URL: " << url);
 
-        const auto host = hostWithStatus.getValue();
         if (host.empty()) {
             continue;
         }
@@ -440,14 +435,11 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
     }
 
     // 5. Decode the database name
-    const auto databaseWithStatus = uriDecode(databaseSD);
-    if (!databaseWithStatus.isOK()) {
-        uasserted(ErrorCodes::FailedToParse,
-                  str::stream() << "Database name cannot properly be URL "
-                                   "decoded for mongodb:// URL: "
-                                << url);
-    }
-    const auto database = databaseWithStatus.getValue();
+    const auto database =
+        uassertStatusOKWithContext(uriDecode(databaseSD),
+                                   str::stream() << "Database name cannot properly be URL "
+                                                    "decoded for mongodb:// URL: "
+                                                 << url);
 
     // 6. Validate the database contains no prohibited characters
     // Prohibited characters:
@@ -494,10 +486,31 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
         }
     }
 
+    transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode;
+    auto sslModeIter = std::find_if(options.begin(), options.end(), [](auto pred) {
+        return pred.first == CaseInsensitiveString("ssl") ||
+            pred.first == CaseInsensitiveString("tls");
+    });
+    if (sslModeIter != options.end()) {
+        const auto& val = sslModeIter->second;
+        if (val == "true") {
+            sslMode = transport::kEnableSSL;
+        } else if (val == "false") {
+            sslMode = transport::kDisableSSL;
+        } else {
+            uasserted(51041, str::stream() << "tls must be either 'true' or 'false', not" << val);
+        }
+    }
+
     ConnectionString cs(
         setName.empty() ? ConnectionString::MASTER : ConnectionString::SET, servers, setName);
-    return MongoURI(
-        std::move(cs), username, password, database, std::move(retryWrites), std::move(options));
+    return MongoURI(std::move(cs),
+                    username,
+                    password,
+                    database,
+                    std::move(retryWrites),
+                    sslMode,
+                    std::move(options));
 }
 
 StatusWith<MongoURI> MongoURI::parse(const std::string& url) try {
@@ -510,8 +523,53 @@ const boost::optional<std::string> MongoURI::getAppName() const {
     const auto optIter = _options.find("appName");
     if (optIter != end(_options)) {
         return optIter->second;
-    } else {
-        return boost::none;
     }
+    return boost::none;
+}
+
+std::string MongoURI::canonicalizeURIAsString() const {
+    StringBuilder uri;
+    uri << kURIPrefix;
+    if (!_user.empty()) {
+        uri << uriEncode(_user);
+        if (!_password.empty()) {
+            uri << ":" << uriEncode(_password);
+        }
+        uri << "@";
+    }
+
+    const auto& servers = _connectString.getServers();
+    if (!servers.empty()) {
+        auto delimeter = "";
+        for (auto& hostAndPort : servers) {
+            if (boost::count(hostAndPort.host(), ':') > 1) {
+                uri << delimeter << "[" << uriEncode(hostAndPort.host()) << "]"
+                    << ":" << uriEncode(std::to_string(hostAndPort.port()));
+            } else if (StringData(hostAndPort.host()).endsWith(".sock")) {
+                uri << delimeter << uriEncode(hostAndPort.host());
+            } else {
+                uri << delimeter << uriEncode(hostAndPort.host()) << ":"
+                    << uriEncode(std::to_string(hostAndPort.port()));
+            }
+            delimeter = ",";
+        }
+    } else {
+        uri << kDefaultMongoHost;
+    }
+
+    uri << "/";
+    if (!_database.empty()) {
+        uri << uriEncode(_database);
+    }
+
+    if (!_options.empty()) {
+        auto delimeter = "";
+        uri << "?";
+        for (const auto& pair : _options) {
+            uri << delimeter << uriEncode(pair.first.original()) << "=" << uriEncode(pair.second);
+            delimeter = "&";
+        }
+    }
+    return uri.str();
 }
 }  // namespace mongo

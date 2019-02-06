@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
@@ -35,6 +37,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
+#include "mongo/db/commands/feature_compatibility_version_gen.h"
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/kill_sessions_local.h"
@@ -178,7 +181,7 @@ void FeatureCompatibilityVersion::onInsertOrUpdate(OperationContext* opCtx, cons
             // Abort all open transactions when downgrading the featureCompatibilityVersion.
             SessionKiller::Matcher matcherAllSessions(
                 KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
-            killSessionsLocalKillTransactions(opCtx, matcherAllSessions);
+            killSessionsAbortUnpreparedTransactions(opCtx, matcherAllSessions);
         }
     });
 }
@@ -254,73 +257,58 @@ void FeatureCompatibilityVersion::_runUpdateCommand(OperationContext* opCtx,
 /**
  * Read-only server parameter for featureCompatibilityVersion.
  */
-class FeatureCompatibilityVersionParameter : public ServerParameter {
-public:
-    FeatureCompatibilityVersionParameter()
-        : ServerParameter(ServerParameterSet::getGlobal(),
-                          FeatureCompatibilityVersionParser::kParameterName.toString(),
-                          false,  // allowedToChangeAtStartup
-                          false   // allowedToChangeAtRuntime
-                          ) {}
+// No ability to specify 'none' as set_at type,
+// so use 'startup' in the IDL file, then override to none here.
+FeatureCompatibilityVersionParameter::FeatureCompatibilityVersionParameter(StringData name,
+                                                                           ServerParameterType)
+    : ServerParameter(ServerParameterSet::getGlobal(), name, false, false) {}
 
-    virtual void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name) {
-        BSONObjBuilder featureCompatibilityVersionBuilder(b.subobjStart(name));
-        uassert(ErrorCodes::UnknownFeatureCompatibilityVersion,
-                str::stream() << FeatureCompatibilityVersionParser::kParameterName
-                              << " is not yet known.",
-                serverGlobalParams.featureCompatibility.isVersionInitialized());
-        switch (serverGlobalParams.featureCompatibility.getVersion()) {
-            case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42:
-                featureCompatibilityVersionBuilder.append(
-                    FeatureCompatibilityVersionParser::kVersionField,
-                    FeatureCompatibilityVersionParser::kVersion42);
-                return;
-            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo42:
-                featureCompatibilityVersionBuilder.append(
-                    FeatureCompatibilityVersionParser::kVersionField,
-                    FeatureCompatibilityVersionParser::kVersion40);
-                featureCompatibilityVersionBuilder.append(
-                    FeatureCompatibilityVersionParser::kTargetVersionField,
-                    FeatureCompatibilityVersionParser::kVersion42);
-                return;
-            case ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo40:
-                featureCompatibilityVersionBuilder.append(
-                    FeatureCompatibilityVersionParser::kVersionField,
-                    FeatureCompatibilityVersionParser::kVersion40);
-                featureCompatibilityVersionBuilder.append(
-                    FeatureCompatibilityVersionParser::kTargetVersionField,
-                    FeatureCompatibilityVersionParser::kVersion40);
-                return;
-            case ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo40:
-                featureCompatibilityVersionBuilder.append(
-                    FeatureCompatibilityVersionParser::kVersionField,
-                    FeatureCompatibilityVersionParser::kVersion40);
-                return;
-            case ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault40Behavior:
-                // getVersion() does not return this value.
-                MONGO_UNREACHABLE;
-        }
+void FeatureCompatibilityVersionParameter::append(OperationContext* opCtx,
+                                                  BSONObjBuilder& b,
+                                                  const std::string& name) {
+    uassert(ErrorCodes::UnknownFeatureCompatibilityVersion,
+            str::stream() << name << " is not yet known.",
+            serverGlobalParams.featureCompatibility.isVersionInitialized());
+
+    BSONObjBuilder featureCompatibilityVersionBuilder(b.subobjStart(name));
+    switch (serverGlobalParams.featureCompatibility.getVersion()) {
+        case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42:
+            featureCompatibilityVersionBuilder.append(
+                FeatureCompatibilityVersionParser::kVersionField,
+                FeatureCompatibilityVersionParser::kVersion42);
+            return;
+        case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo42:
+            featureCompatibilityVersionBuilder.append(
+                FeatureCompatibilityVersionParser::kVersionField,
+                FeatureCompatibilityVersionParser::kVersion40);
+            featureCompatibilityVersionBuilder.append(
+                FeatureCompatibilityVersionParser::kTargetVersionField,
+                FeatureCompatibilityVersionParser::kVersion42);
+            return;
+        case ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo40:
+            featureCompatibilityVersionBuilder.append(
+                FeatureCompatibilityVersionParser::kVersionField,
+                FeatureCompatibilityVersionParser::kVersion40);
+            featureCompatibilityVersionBuilder.append(
+                FeatureCompatibilityVersionParser::kTargetVersionField,
+                FeatureCompatibilityVersionParser::kVersion40);
+            return;
+        case ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo40:
+            featureCompatibilityVersionBuilder.append(
+                FeatureCompatibilityVersionParser::kVersionField,
+                FeatureCompatibilityVersionParser::kVersion40);
+            return;
+        case ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault40Behavior:
+            // getVersion() does not return this value.
+            MONGO_UNREACHABLE;
     }
+}
 
-    virtual Status set(const BSONElement& newValueElement) {
-        return Status(ErrorCodes::IllegalOperation,
-                      str::stream()
-                          << FeatureCompatibilityVersionParser::kParameterName
-                          << " cannot be set via setParameter. See "
+Status FeatureCompatibilityVersionParameter::setFromString(const std::string&) {
+    return {ErrorCodes::IllegalOperation,
+            str::stream() << name() << " cannot be set via setParameter. See "
                           << feature_compatibility_version_documentation::kCompatibilityLink
-                          << ".");
-    }
-
-    virtual Status setFromString(const std::string& str) {
-        return Status(ErrorCodes::IllegalOperation,
-                      str::stream()
-                          << FeatureCompatibilityVersionParser::kParameterName
-                          << " cannot be set via setParameter. See "
-                          << feature_compatibility_version_documentation::kCompatibilityLink
-                          << ".");
-    }
-} featureCompatibilityVersionParameter;
-
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(internalValidateFeaturesAsMaster, bool, true);
+                          << "."};
+}
 
 }  // namespace mongo

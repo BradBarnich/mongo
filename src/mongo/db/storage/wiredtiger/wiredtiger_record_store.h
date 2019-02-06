@@ -1,26 +1,27 @@
 // wiredtiger_record_store.h
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -87,6 +88,7 @@ public:
 
     /**
      * Creates a configuration string suitable for 'config' parameter in WT_SESSION::create().
+     * It is possible for 'ns' to be an empty string, in the case of internal-only temporary tables.
      * Configuration string is constructed from:
      *     built-in defaults
      *     storageEngine.wiredTiger.configString in 'options'
@@ -104,7 +106,7 @@ public:
 
     struct Params {
         StringData ns;
-        std::string uri;
+        std::string ident;
         std::string engineName;
         bool isCapped;
         bool isEphemeral;
@@ -136,20 +138,13 @@ public:
 
     // CRUD related
 
-    virtual RecordData dataFor(OperationContext* opCtx, const RecordId& id) const;
-
     virtual bool findRecord(OperationContext* opCtx, const RecordId& id, RecordData* out) const;
 
     virtual void deleteRecord(OperationContext* opCtx, const RecordId& id);
 
     virtual Status insertRecords(OperationContext* opCtx,
                                  std::vector<Record>* records,
-                                 std::vector<Timestamp>* timestamps);
-
-    virtual StatusWith<RecordId> insertRecord(OperationContext* opCtx,
-                                              const char* data,
-                                              int len,
-                                              Timestamp timestamp);
+                                 const std::vector<Timestamp>& timestamps);
 
     virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
                                               const DocWriter* const* docs,
@@ -189,10 +184,7 @@ public:
 
     virtual Timestamp getPinnedOplog() const final;
 
-    virtual Status compact(OperationContext* opCtx,
-                           RecordStoreCompactAdaptor* adaptor,
-                           const CompactOptions* options,
-                           CompactStats* stats);
+    virtual Status compact(OperationContext* opCtx) final;
 
     virtual bool isInRecordIdOrder() const override {
         return true;
@@ -241,7 +233,7 @@ public:
     }
 
     const std::string& getIdent() const override {
-        return _uri;
+        return _ident;
     }
 
     uint64_t tableId() const {
@@ -342,6 +334,7 @@ private:
     int64_t _cappedDeleteAsNeeded_inlock(OperationContext* opCtx, const RecordId& justInserted);
 
     const std::string _uri;
+    const std::string _ident;
     const uint64_t _tableId;  // not persisted
 
     // Canonical engine name to use for retrieving options
@@ -356,8 +349,8 @@ private:
     const int64_t _cappedMaxSizeSlack;  // when to start applying backpressure
     const int64_t _cappedMaxDocs;
     RecordId _cappedFirstRecord;
-    AtomicInt64 _cappedSleep;
-    AtomicInt64 _cappedSleepMS;
+    AtomicWord<long long> _cappedSleep;
+    AtomicWord<long long> _cappedSleepMS;
     CappedCallback* _cappedCallback;
     bool _shuttingDown;
     mutable stdx::mutex _cappedCallbackMutex;  // guards _cappedCallback and _shuttingDown
@@ -366,7 +359,7 @@ private:
     int _cappedDeleteCheckCount;
     mutable stdx::timed_mutex _cappedDeleterMutex;
 
-    AtomicInt64 _nextIdNum;
+    AtomicWord<long long> _nextIdNum;
 
     WiredTigerSizeStorer* _sizeStorer;  // not owned, can be NULL
     std::shared_ptr<WiredTigerSizeStorer::SizeInfo> _sizeInfo;
@@ -470,6 +463,13 @@ protected:
 
 private:
     bool isVisible(const RecordId& id);
+
+    /**
+     * This value is used for visibility calculations on what oplog entries can be returned to a
+     * client. This value *must* be initialized/updated *before* a WiredTiger snapshot is
+     * established.
+     */
+    boost::optional<std::int64_t> _oplogVisibleTs = boost::none;
 };
 
 class WiredTigerRecordStoreStandardCursor final : public WiredTigerRecordStoreCursorBase {

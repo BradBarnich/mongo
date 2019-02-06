@@ -4,8 +4,11 @@
 //   # This test attempts to perform queries and introspect the server's plan cache entries. The
 //   # former operation may be routed to a secondary in the replica set, whereas the latter must be
 //   # routed to the primary.
+//   # If the balancer is on and chunks are moved, the plan cache can have entries with isActive:
+//   # false when the test assumes they are true because the query has already been run many times.
 //   assumes_read_preference_unchanged,
 //   does_not_support_stepdowns,
+//   assumes_balancer_off,
 // ]
 
 (function() {
@@ -74,12 +77,16 @@
         print('plan ' + i + ': ' + tojson(plans[i]));
     }
 
-    // Test the queryHash property by comparing entries for two different query shapes.
+    // Test the queryHash and planCacheKey property by comparing entries for two different
+    // query shapes.
     assert.eq(0, t.find({a: 132}).sort({b: -1, a: 1}).itcount(), 'unexpected document count');
     let entryNewShape = getPlansForCacheEntry({a: 123}, {b: -1, a: 1}, {});
     assert.eq(entry.hasOwnProperty("queryHash"), true);
     assert.eq(entryNewShape.hasOwnProperty("queryHash"), true);
     assert.neq(entry["queryHash"], entryNewShape["queryHash"]);
+    assert.eq(entry.hasOwnProperty("planCacheKey"), true);
+    assert.eq(entryNewShape.hasOwnProperty("planCacheKey"), true);
+    assert.neq(entry["planCacheKey"], entryNewShape["planCacheKey"]);
 
     //
     // Tests for plan reason and feedback in planCacheListPlans

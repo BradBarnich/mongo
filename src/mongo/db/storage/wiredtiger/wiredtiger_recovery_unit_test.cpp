@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,6 +39,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
@@ -72,7 +75,8 @@ public:
 
     virtual std::unique_ptr<RecordStore> createRecordStore(OperationContext* opCtx,
                                                            const std::string& ns) final {
-        std::string uri = "table:" + ns;
+        std::string ident = ns;
+        std::string uri = WiredTigerKVEngine::kTableUriPrefix + ns;
         const bool prefixed = false;
         StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
             kWiredTigerEngineName, ns, CollectionOptions(), "", prefixed);
@@ -90,7 +94,7 @@ public:
 
         WiredTigerRecordStore::Params params;
         params.ns = ns;
-        params.uri = uri;
+        params.ident = ident;
         params.engineName = kWiredTigerEngineName;
         params.isCapped = false;
         params.isEphemeral = false;
@@ -534,13 +538,13 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, ReadOnceCursorsAreNotCached) {
     auto ru = WiredTigerRecoveryUnit::get(opCtx);
 
     std::unique_ptr<RecordStore> rs(harnessHelper->createRecordStore(opCtx, "test.read_once"));
-    auto uri = rs->getIdent();
+    auto uri = dynamic_cast<WiredTigerRecordStore*>(rs.get())->getURI();
 
     // Insert a record.
     ru->beginUnitOfWork(opCtx);
     StatusWith<RecordId> s = rs->insertRecord(opCtx, "data", 4, Timestamp());
     ASSERT_TRUE(s.isOK());
-    ASSERT_EQUALS(1, rs->numRecords(NULL));
+    ASSERT_EQUALS(1, rs->numRecords(opCtx));
     ru->commitUnitOfWork();
 
     // Test 1: A normal read should create a new cursor and release it into the session cache.
@@ -578,5 +582,56 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, ReadOnceCursorsAreNotCached) {
 
     ASSERT(ru->getReadOnce());
 }
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitWithDurableTimestamp) {
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(3, 3);
+    Timestamp ts2(5, 5);
+
+    opCtx->recoveryUnit()->setCommitTimestamp(ts1);
+    opCtx->recoveryUnit()->setDurableTimestamp(ts2);
+    auto durableTs = opCtx->recoveryUnit()->getDurableTimestamp();
+    ASSERT_EQ(ts2, durableTs);
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        wuow.commit();
+    }
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitWithoutDurableTimestamp) {
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(5, 5);
+    opCtx->recoveryUnit()->setCommitTimestamp(ts1);
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        wuow.commit();
+    }
+}
+
+DEATH_TEST_F(WiredTigerRecoveryUnitTestFixture,
+             SetDurableTimestampTwice,
+             "Trying to reset durable timestamp when it was already set.") {
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(3, 3);
+    Timestamp ts2(5, 5);
+    opCtx->recoveryUnit()->setDurableTimestamp(ts1);
+    opCtx->recoveryUnit()->setDurableTimestamp(ts2);
+}
+
+DEATH_TEST_F(WiredTigerRecoveryUnitTestFixture,
+             RollbackHandlerAbortsOnTxnOpen,
+             "rollback handler reopened transaction") {
+    auto opCtx = clientAndCtx1.second.get();
+    auto ru = WiredTigerRecoveryUnit::get(opCtx);
+    ASSERT(ru->getSession());
+    {
+        WriteUnitOfWork wuow(opCtx);
+        ru->assertInActiveTxn();
+        ru->onRollback([ru] { ru->getSession(); });
+    }
+}
+
 }  // namespace
 }  // namespace mongo

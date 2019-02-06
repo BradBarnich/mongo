@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,8 +37,8 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/platform/hash_namespace.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/uuid.h"
 
@@ -90,6 +92,12 @@ public:
 
     // Namespace of the the oplog collection.
     static const NamespaceString kRsOplogNamespace;
+
+    // Namespace for storing the persisted state of transaction coordinators.
+    static const NamespaceString kTransactionCoordinatorsNamespace;
+
+    // Namespace for replica set configuration settings.
+    static const NamespaceString kSystemReplSetNamespace;
 
     /**
      * Constructs an empty NamespaceString.
@@ -147,12 +155,6 @@ public:
     static NamespaceString makeListCollectionsNSS(StringData dbName);
 
     /**
-     * Constructs a NamespaceString representing a listIndexes namespace. The format for this
-     * namespace is "<dbName>.$cmd.listIndexes.<collectionName>".
-     */
-    static NamespaceString makeListIndexesNSS(StringData dbName, StringData collectionName);
-
-    /**
      * Note that these values are derived from the mmap_v1 implementation and that is the only
      * reason they are constrained as such.
      */
@@ -205,12 +207,6 @@ public:
     bool isEmpty() const {
         return _ns.empty();
     }
-
-    struct Hasher {
-        size_t operator()(const NamespaceString& nss) const {
-            return std::hash<std::string>()(nss._ns);
-        }
-    };
 
     //
     // The following methods assume isValid() is true for this NamespaceString.
@@ -281,28 +277,22 @@ public:
     bool isReplicated() const;
 
     /**
-     * Returns true if cursors for this namespace are registered with the global cursor manager.
+     * The namespace associated with some ClientCursors does not correspond to a particular
+     * namespace. For example, this is true for listCollections cursors and $currentOp agg cursors.
+     * Returns true if the namespace string is for a "collectionless" cursor.
      */
-    bool isGloballyManagedNamespace() const {
+    bool isCollectionlessCursorNamespace() const {
         return coll().startsWith("$cmd."_sd);
     }
 
     bool isCollectionlessAggregateNS() const;
     bool isListCollectionsCursorNS() const;
-    bool isListIndexesCursorNS() const;
 
     /**
      * Returns true if a client can modify this namespace even though it is under ".system."
      * For example <dbname>.system.users is ok for regular clients to update.
      */
     bool isLegalClientSystemNS() const;
-
-    /**
-     * Given a NamespaceString for which isGloballyManagedNamespace() returns true, returns the
-     * namespace the command targets, or boost::none for commands like 'listCollections' which
-     * do not target a collection.
-     */
-    boost::optional<NamespaceString> getTargetNSForGloballyManagedNamespace() const;
 
     /**
      * Returns true if this namespace refers to a drop-pending collection.
@@ -333,12 +323,6 @@ public:
     Status checkLengthForRename(const std::string::size_type longestIndexNameLength) const;
 
     /**
-     * Given a NamespaceString for which isListIndexesCursorNS() returns true, returns the
-     * NamespaceString for the collection that the "listIndexes" targets.
-     */
-    NamespaceString getTargetNSForListIndexes() const;
-
-    /**
      * Returns true if the namespace is valid. Special namespaces for internal use are considered as
      * valid.
      */
@@ -354,6 +338,11 @@ public:
     NamespaceString getCommandNS() const {
         return {db(), "$cmd"};
     }
+
+    /**
+     * Returns index namespace for an index in this collection namespace.
+     */
+    NamespaceString makeIndexNamespace(StringData indexName) const;
 
     /**
      * @return true if ns is 'normal'.  A "$" is used for namespaces holding index data,
@@ -447,6 +436,11 @@ public:
         return a.ns() >= b.ns();
     }
 
+    template <typename H>
+    friend H AbslHashValue(H h, const NamespaceString& nss) {
+        return H::combine(std::move(h), nss._ns);
+    }
+
 private:
     std::string _ns;
     size_t _dotIndex;
@@ -489,6 +483,8 @@ private:
 
 std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss);
 std::ostream& operator<<(std::ostream& stream, const NamespaceStringOrUUID& nsOrUUID);
+StringBuilder& operator<<(StringBuilder& builder, const NamespaceString& nss);
+StringBuilder& operator<<(StringBuilder& builder, const NamespaceStringOrUUID& nsOrUUID);
 
 /**
  * "database.a.b.c" -> "database"
@@ -610,13 +606,3 @@ inline bool NamespaceString::validCollectionName(StringData coll) {
 }
 
 }  // namespace mongo
-
-MONGO_HASH_NAMESPACE_START
-template <>
-struct hash<mongo::NamespaceString> {
-    size_t operator()(const mongo::NamespaceString& nss) const {
-        mongo::NamespaceString::Hasher hasher;
-        return hasher(nss);
-    }
-};
-MONGO_HASH_NAMESPACE_END

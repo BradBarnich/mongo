@@ -1,29 +1,31 @@
+
 /**
- * Copyright (c) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -82,7 +84,8 @@ public:
 
     /** Construct a Value
      *
-     *  All types not listed will be rejected rather than converted (see private for why)
+     *  All types not listed will be rejected rather than converted, to prevent unexpected implicit
+     *  conversions to the accepted argument types (e.g. bool accepts any pointer).
      *
      *  Note: Currently these are all explicit conversions.
      *        I'm not sure if we want implicit or not.
@@ -104,7 +107,8 @@ public:
     explicit Value(const BSONArray& arr);
     explicit Value(const std::vector<BSONObj>& vec);
     explicit Value(const std::vector<Document>& vec);
-    explicit Value(std::vector<Value> vec) : _storage(Array, new RCVector(std::move(vec))) {}
+    explicit Value(std::vector<Value> vec)
+        : _storage(Array, make_intrusive<RCVector>(std::move(vec))) {}
     explicit Value(const BSONBinData& bd) : _storage(BinData, bd) {}
     explicit Value(const BSONRegEx& re) : _storage(RegEx, re) {}
     explicit Value(const BSONCodeWScope& cws) : _storage(CodeWScope, cws) {}
@@ -120,8 +124,17 @@ public:
         : _storage(BinData,
                    BSONBinData(uuid.toCDR().data(), uuid.toCDR().length(), BinDataType::newUUID)) {}
 
-    explicit Value(const char*) = delete;  // Use StringData instead to prevent accidentally
-                                           // terminating the string at the first null byte.
+    /**
+     *  Force the use of StringData to prevent accidental NUL-termination.
+     */
+    explicit Value(const char*) = delete;
+
+    /**
+     *  Prevent implicit conversions to the accepted argument types.
+     */
+    template <typename InvalidArgumentType>
+    explicit Value(const InvalidArgumentType&) = delete;
+
 
     // TODO: add an unsafe version that can share storage with the BSONElement
     /// Deep-convert from BSONElement to Value
@@ -350,25 +363,7 @@ public:
     void serializeForIDL(BSONArrayBuilder* builder) const;
     static Value deserializeForIDL(const BSONElement& element);
 
-    /**
-     * Constant double representation of 2^63, the smallest value that will overflow a long long.
-     *
-     * It is not safe to obtain this value by casting std::numeric_limits<long long>::max() to
-     * double, because the conversion loses precision, and the C++ standard leaves it up to the
-     * implentation to decide whether to round up to 2^63 or round down to the next representable
-     * value (2^63 - 2^10).
-     */
-    static const double kLongLongMaxPlusOneAsDouble;
-
 private:
-    /** This is a "honeypot" to prevent unexpected implicit conversions to the accepted argument
-     *  types. bool is especially bad since without this it will accept any pointer.
-     *
-     *  Template argument name was chosen to make produced error easier to read.
-     */
-    template <typename InvalidArgumentType>
-    explicit Value(const InvalidArgumentType& invalidArgument);
-
     explicit Value(const ValueStorage& storage) : _storage(storage) {}
 
     // May contain embedded NUL bytes, does not check the type.

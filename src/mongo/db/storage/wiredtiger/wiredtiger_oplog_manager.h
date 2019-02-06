@@ -1,24 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -52,12 +53,10 @@ public:
     ~WiredTigerOplogManager() {}
 
     // This method will initialize the oplog read timestamp and start the background thread that
-    // refreshes the value. If `updateOldestTimestamp` is true, the background thread will also take
-    // responsibility for updating the oldest timestamp.
+    // refreshes the value.
     void start(OperationContext* opCtx,
                const std::string& uri,
-               WiredTigerRecordStore* oplogRecordStore,
-               bool updateOldestTimestamp);
+               WiredTigerRecordStore* oplogRecordStore);
 
     void halt();
 
@@ -86,8 +85,7 @@ public:
 
 private:
     void _oplogJournalThreadLoop(WiredTigerSessionCache* sessionCache,
-                                 WiredTigerRecordStore* oplogRecordStore,
-                                 const bool updateOldestTimestamp) noexcept;
+                                 WiredTigerRecordStore* oplogRecordStore);
 
     void _setOplogReadTimestamp(WithLock, uint64_t newTimestamp);
 
@@ -98,18 +96,14 @@ private:
     mutable stdx::condition_variable
         _opsBecameVisibleCV;  // Signaled when a journal flush is complete.
 
-    bool _isRunning = false;     // Guarded by the oplogVisibilityStateMutex.
-    bool _shuttingDown = false;  // Guarded by oplogVisibilityStateMutex.
-
-    // This is the RecordId of the newest oplog document in the oplog on startup.  It is used as a
-    // floor in waitForAllEarlierOplogWritesToBeVisible().
-    RecordId _oplogMaxAtStartup = RecordId(0);  // Guarded by oplogVisibilityStateMutex.
-    bool _opsWaitingForJournal = false;         // Guarded by oplogVisibilityStateMutex.
+    bool _isRunning = false;             // Guarded by oplogVisibilityStateMutex.
+    bool _shuttingDown = false;          // Guarded by oplogVisibilityStateMutex.
+    bool _opsWaitingForJournal = false;  // Guarded by oplogVisibilityStateMutex.
 
     // When greater than 0, indicates that there are operations waiting for oplog visibility, and
     // journal flushing should not be delayed.
     std::int64_t _opsWaitingForVisibility = 0;  // Guarded by oplogVisibilityStateMutex.
 
-    AtomicUInt64 _oplogReadTimestamp;
+    AtomicWord<unsigned long long> _oplogReadTimestamp;
 };
 }  // namespace mongo

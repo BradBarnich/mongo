@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2016 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
@@ -32,10 +34,12 @@
 #include "mongo/base/status.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -47,6 +51,8 @@
 namespace mongo {
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeLinearizableReadConcern);
 
 /**
 *  Synchronize writeRequests
@@ -201,22 +207,14 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
     // illegal to wait for read concern. This is fine, since the outer operation should have handled
     // waiting for read concern. We don't want to ignore prepare conflicts because snapshot reads
     // should block on prepared transactions.
-    auto txnParticipant = TransactionParticipant::get(opCtx);
-    if (opCtx->getClient()->isInDirectClient() && txnParticipant &&
-        txnParticipant->inMultiDocumentTransaction()) {
+    if (opCtx->getClient()->isInDirectClient() &&
+        readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
         opCtx->recoveryUnit()->setIgnorePrepared(false);
         return Status::OK();
     }
 
     repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
     invariant(replCoord);
-
-    // Currently speculative read concern is used only for transactions. However, speculative read
-    // concern is not yet supported with atClusterTime.
-    //
-    // TODO SERVER-34620: Re-enable speculative behavior when "atClusterTime" is specified.
-    const bool speculative = txnParticipant && txnParticipant->inMultiDocumentTransaction() &&
-        !readConcernArgs.getArgsAtClusterTime();
 
     if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kLinearizableReadConcern) {
         if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
@@ -289,29 +287,28 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
             return {ErrorCodes::NotAReplicaSet,
                     "node needs to be a replica set member to use readConcern: snapshot"};
         }
-        if (speculative) {
-            txnParticipant->setSpeculativeTransactionOpTime(
-                opCtx,
-                readConcernArgs.getOriginalLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
-                    ? SpeculativeTransactionOpTime::kAllCommitted
-                    : SpeculativeTransactionOpTime::kLastApplied);
-        }
     }
 
     if (atClusterTime) {
-        opCtx->recoveryUnit()->setIgnorePrepared(false);
-
-        // TODO(SERVER-34620): We should be using Session::setSpeculativeTransactionReadOpTime when
-        // doing speculative execution with atClusterTime.
         opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
                                                       atClusterTime->asTimestamp());
-        return Status::OK();
-    }
+    } else if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern &&
+               replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet) {
+        // This block is not used for kSnapshotReadConcern because snapshots are always speculative;
+        // we wait for majority when the transaction commits.
+        // It is not used for atClusterTime because waitUntilOpTimeForRead handles waiting for
+        // the majority snapshot in that case.
 
-    if ((readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern ||
-         readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) &&
-        !speculative &&
-        replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet) {
+        // Handle speculative majority reads.
+        if (readConcernArgs.getMajorityReadMechanism() ==
+            repl::ReadConcernArgs::MajorityReadMechanism::kSpeculative) {
+            // We read from a local snapshot, so there is no need to set an explicit read source.
+            // Mark down that we need to block after the command is done to satisfy majority read
+            // concern, though.
+            auto& speculativeReadInfo = repl::SpeculativeMajorityReadInfo::get(opCtx);
+            speculativeReadInfo.setIsSpeculativeRead();
+            return Status::OK();
+        }
 
         const int debugLevel = serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 1 : 2;
 
@@ -332,7 +329,8 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
             return status;
         }
 
-        LOG(debugLevel) << "Using 'committed' snapshot: " << CurOp::get(opCtx)->opDescription();
+        LOG(debugLevel) << "Using 'committed' snapshot: " << CurOp::get(opCtx)->opDescription()
+                        << " with readTs: " << opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
     }
 
     // Only snapshot, linearizable and afterClusterTime reads should block on prepared transactions.
@@ -348,6 +346,12 @@ MONGO_REGISTER_SHIM(waitForReadConcern)
 }
 
 MONGO_REGISTER_SHIM(waitForLinearizableReadConcern)(OperationContext* opCtx)->Status {
+
+    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+        &hangBeforeLinearizableReadConcern, opCtx, "hangBeforeLinearizableReadConcern", [opCtx]() {
+            log() << "batch update - hangBeforeLinearizableReadConcern fail point enabled. "
+                     "Blocking until fail point is disabled.";
+        });
 
     repl::ReplicationCoordinator* replCoord =
         repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
@@ -375,11 +379,54 @@ MONGO_REGISTER_SHIM(waitForLinearizableReadConcern)(OperationContext* opCtx)->St
 
     repl::OpTime lastOpApplied = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
     auto awaitReplResult = replCoord->awaitReplication(opCtx, lastOpApplied, wc);
+
     if (awaitReplResult.status == ErrorCodes::WriteConcernFailed) {
         return Status(ErrorCodes::LinearizableReadConcernError,
                       "Failed to confirm that read was linearizable.");
     }
     return awaitReplResult.status;
 }
+
+MONGO_REGISTER_SHIM(waitForSpeculativeMajorityReadConcern)
+(OperationContext* opCtx, repl::SpeculativeMajorityReadInfo speculativeReadInfo)->Status {
+    invariant(speculativeReadInfo.isSpeculativeRead());
+
+    // Select the optime to wait on. A command may have selected a specific optime to wait on. If
+    // not, then we just wait on the most recent optime written on this node i.e. lastApplied.
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    repl::OpTime waitOpTime;
+    auto lastApplied = replCoord->getMyLastAppliedOpTime();
+    auto speculativeReadOpTime = speculativeReadInfo.getSpeculativeReadOpTime();
+    if (speculativeReadOpTime) {
+        // The optime provided must not be greater than the current lastApplied.
+        invariant(*speculativeReadOpTime <= lastApplied);
+        waitOpTime = *speculativeReadOpTime;
+    } else {
+        waitOpTime = lastApplied;
+    }
+
+    // Block to make sure returned data is majority committed.
+    LOG(1) << "Servicing speculative majority read, waiting for optime " << waitOpTime
+           << " to become committed, current commit point: " << replCoord->getLastCommittedOpTime();
+
+    if (!opCtx->hasDeadline()) {
+        // This hard-coded value represents the maximum time we are willing to wait for an optime to
+        // majority commit when doing a speculative majority read if no maxTimeMS value has been set
+        // for the command. We make this value rather conservative. This exists primarily to address
+        // the fact that getMore commands do not respect maxTimeMS properly. In this case, we still
+        // want speculative majority reads to time out after some period if an optime cannot
+        // majority commit.
+        auto timeout = Seconds(15);
+        opCtx->setDeadlineAfterNowBy(timeout, ErrorCodes::MaxTimeMSExpired);
+    }
+    Timer t;
+    auto waitStatus = replCoord->awaitOpTimeCommitted(opCtx, waitOpTime);
+    if (waitStatus.isOK()) {
+        LOG(1) << "Optime " << waitOpTime << " became majority committed, waited " << t.millis()
+               << "ms for speculative majority read to be satisfied.";
+    }
+    return waitStatus;
+}
+
 
 }  // namespace mongo

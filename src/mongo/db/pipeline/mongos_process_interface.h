@@ -1,35 +1,41 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include "mongo/db/pipeline/mongo_process_common.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/s/async_requests_sender.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/query/cluster_aggregation_planner.h"
+#include "mongo/s/query/owned_remote_cursor.h"
 
 namespace mongo {
 
@@ -39,6 +45,34 @@ namespace mongo {
  */
 class MongoSInterface final : public MongoProcessCommon {
 public:
+    static BSONObj createPassthroughCommandForShard(OperationContext* opCtx,
+                                                    const AggregationRequest& request,
+                                                    const boost::optional<ShardId>& shardId,
+                                                    Pipeline* pipeline,
+                                                    BSONObj collationObj);
+
+    /**
+     * Appends information to the command sent to the shards which should be appended both if this
+     * is a passthrough sent to a single shard and if this is a split pipeline.
+     */
+    static BSONObj genericTransformForShards(MutableDocument&& cmdForShards,
+                                             OperationContext* opCtx,
+                                             const boost::optional<ShardId>& shardId,
+                                             const AggregationRequest& request,
+                                             BSONObj collationObj);
+
+    static BSONObj createCommandForTargetedShards(
+        OperationContext* opCtx,
+        const AggregationRequest& request,
+        const LiteParsedPipeline& litePipe,
+        const cluster_aggregation_planner::SplitPipeline& splitPipeline,
+        const BSONObj collationObj,
+        const boost::optional<cluster_aggregation_planner::ShardedExchangePolicy> exchangeSpec,
+        bool needsMerge);
+
+    static StatusWith<CachedCollectionRoutingInfo> getExecutionNsRoutingInfo(
+        OperationContext* opCtx, const NamespaceString& execNss);
+
     MongoSInterface() = default;
 
     virtual ~MongoSInterface() = default;
@@ -50,7 +84,8 @@ public:
         const NamespaceString& nss,
         UUID collectionUUID,
         const Document& documentKey,
-        boost::optional<BSONObj> readConcern) final;
+        boost::optional<BSONObj> readConcern,
+        bool allowSpeculativeMajorityRead = false) final;
 
     std::vector<GenericCursor> getIdleCursors(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                               CurrentOpUserMode userMode) const final;
@@ -63,7 +98,9 @@ public:
 
     void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                 const NamespaceString& ns,
-                std::vector<BSONObj>&& objs) final {
+                std::vector<BSONObj>&& objs,
+                const WriteConcernOptions& wc,
+                boost::optional<OID>) final {
         MONGO_UNREACHABLE;
     }
 
@@ -71,8 +108,10 @@ public:
                 const NamespaceString& ns,
                 std::vector<BSONObj>&& queries,
                 std::vector<BSONObj>&& updates,
+                const WriteConcernOptions& wc,
                 bool upsert,
-                bool multi) final {
+                bool multi,
+                boost::optional<OID>) final {
         MONGO_UNREACHABLE;
     }
 
@@ -113,24 +152,22 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    Status attachCursorSourceToPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                        Pipeline* pipeline) final {
-        MONGO_UNREACHABLE;
-    }
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) final;
 
     std::string getShardName(OperationContext* opCtx) const final {
         MONGO_UNREACHABLE;
     }
 
-    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(
-        OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const final;
-
-    StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> makePipeline(
-        const std::vector<BSONObj>& rawPipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const MakePipelineOptions pipelineOptions) final {
+    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFieldsForHostedCollection(
+        OperationContext* opCtx, const NamespaceString&, UUID) const final {
         MONGO_UNREACHABLE;
     }
+
+    std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
+        const std::vector<BSONObj>& rawPipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const MakePipelineOptions pipelineOptions) final;
 
     /**
      * The following methods only make sense for data-bearing nodes and should never be called on
@@ -140,7 +177,13 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    void closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) final {
+    void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) final {
+        MONGO_UNREACHABLE;
+    }
+
+    BackupCursorExtendState extendBackupCursor(OperationContext* opCtx,
+                                               const UUID& backupId,
+                                               const Timestamp& extendTo) final {
         MONGO_UNREACHABLE;
     }
 
@@ -158,6 +201,16 @@ public:
     bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>&,
                                      const NamespaceString&,
                                      const std::set<FieldPath>& uniqueKeyPaths) const final;
+
+    void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>&,
+                                      const NamespaceString&,
+                                      ChunkVersion) const final {
+        MONGO_UNREACHABLE;
+    }
+
+    std::unique_ptr<ResourceYielder> getResourceYielder() const override {
+        return nullptr;
+    }
 
 protected:
     BSONObj _reportCurrentOpForClient(OperationContext* opCtx,

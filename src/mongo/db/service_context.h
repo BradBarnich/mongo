@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -45,6 +47,7 @@
 #include "mongo/transport/service_executor.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/clock_source.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/periodic_runner.h"
 #include "mongo/util/tick_source.h"
@@ -353,17 +356,11 @@ public:
     /**
      * Kills the operation "opCtx" with the code "killCode", if opCtx has not already been killed.
      * Caller must own the lock on opCtx->getClient, and opCtx->getServiceContext() must be the same
-     *as
-     * this service context.
+     * as this service context. WithLock expects that the client lock be passed in.
      **/
-    void killOperation(OperationContext* opCtx,
+    void killOperation(WithLock,
+                       OperationContext* opCtx,
                        ErrorCodes::Error killCode = ErrorCodes::Interrupted);
-
-    /**
-     * Kills all operations that have a Client that is associated with an incoming user
-     * connection, except for the one associated with opCtx.
-     */
-    void killAllUserOperations(const OperationContext* opCtx, ErrorCodes::Error killCode);
 
     /**
      * Registers a listener to be notified each time an op is killed.
@@ -425,10 +422,23 @@ public:
      */
     void waitForStartupComplete();
 
+    /**
+     * Wait for all clients to complete and unregister themselves. Shutting-down, unmanaged threads
+     * may potentially be unable to acquire the service context mutex before the service context
+     * itself does on destruction.
+     * Used for testing.
+     */
+    void waitForClientsToFinish();
+
     /*
      * Marks initialization as complete and all transport layers as started.
      */
     void notifyStartupComplete();
+
+    /*
+     * Returns the number of active client operations
+     */
+    int getActiveClientOperations();
 
     /**
      * Set the OpObserver.
@@ -501,6 +511,11 @@ public:
      */
     void setServiceExecutor(std::unique_ptr<transport::ServiceExecutor> exec);
 
+    /**
+     * Creates a delayed execution baton with basic functionality
+     */
+    BatonHandle makeBaton(OperationContext* opCtx) const;
+
 private:
     class ClientObserverHolder {
     public:
@@ -555,6 +570,7 @@ private:
      */
     std::vector<ClientObserverHolder> _clientObservers;
     ClientSet _clients;
+    stdx::condition_variable _clientsEmptyCondVar;
 
     /**
      * The registered OpObserver.
@@ -581,7 +597,7 @@ private:
     std::vector<KillOpListenerInterface*> _killOpListeners;
 
     // Counter for assigning operation ids.
-    AtomicUInt32 _nextOpId{1};
+    AtomicWord<unsigned> _nextOpId{1};
 
     bool _startupComplete = false;
     stdx::condition_variable _startupCompleteCondVar;

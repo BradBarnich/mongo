@@ -56,16 +56,99 @@ Mongo.prototype.getDB = function(name) {
     return new DB(this, name);
 };
 
-Mongo.prototype.getDBs = function(driverSession = this._getDefaultSession()) {
-    var cmdObj = {listDatabases: 1};
-    if (driverSession._isExplicit || !jsTest.options().disableImplicitSessions) {
-        cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
+Mongo.prototype._getDatabaseNamesFromPrivileges = function() {
+    'use strict';
+
+    const ret = this.adminCommand({connectionStatus: 1, showPrivileges: 1});
+    if (!ret.ok) {
+        throw _getErrorWithCode(ret, "Failed to acquire database information from privileges");
     }
 
-    var res = this.adminCommand(cmdObj);
-    if (!res.ok)
-        throw _getErrorWithCode(res, "listDatabases failed:" + tojson(res));
-    return res;
+    const privileges = (ret.authInfo || {}).authenticatedUserPrivileges;
+    if (privileges === undefined) {
+        return [];
+    }
+
+    return privileges
+        .filter(function(priv) {
+            // Find all named databases in priv list.
+            return ((priv.resource || {}).db || '').length > 0;
+        })
+        .map(function(priv) {
+            // Return just the names.
+            return priv.resource.db;
+        })
+        .filter(function(db, idx, arr) {
+            // Make sure the list is unique
+            return arr.indexOf(db) === idx;
+        })
+        .sort();
+};
+
+Mongo.prototype.getDBs = function(driverSession = this._getDefaultSession(),
+                                  filter = undefined,
+                                  nameOnly = undefined,
+                                  authorizedDatabases = undefined) {
+
+    return function(driverSession, filter, nameOnly, authorizedDatabases) {
+        'use strict';
+
+        let cmdObj = {listDatabases: 1};
+        if (filter !== undefined) {
+            cmdObj.filter = filter;
+        }
+        if (nameOnly !== undefined) {
+            cmdObj.nameOnly = nameOnly;
+        }
+        if (authorizedDatabases !== undefined) {
+            cmdObj.authorizedDatabases = authorizedDatabases;
+        }
+
+        if (driverSession._isExplicit || !jsTest.options().disableImplicitSessions) {
+            cmdObj = driverSession._serverSession.injectSessionId(cmdObj);
+        }
+
+        const res = this.adminCommand(cmdObj);
+        if (!res.ok) {
+            // If "Unauthorized" was returned by the back end and we haven't explicitly
+            // asked for anything difficult to provide from userspace, then we can
+            // fallback on inspecting the user's permissions.
+            // This means that:
+            //   * filter must be undefined, as reimplementing that logic is out of scope.
+            //   * nameOnly must not be false as we can't infer size information.
+            //   * authorizedDatabases must not be false as those are the only DBs we can infer.
+            // Note that if the above are valid and we get Unauthorized, that also means
+            // that we MUST be talking to a pre-4.0 mongod.
+            //
+            // Like the server response mode, this path will return a simple list of
+            // names if nameOnly is specified as true.
+            // If nameOnly is undefined, we come as close as we can to what the
+            // server would return by supplying the databases key of the returned
+            // object.  Other information is unavailable.
+            if ((res.code === ErrorCodes.Unauthorized) && (filter === undefined) &&
+                (nameOnly !== false) && (authorizedDatabases !== false)) {
+                const names = this._getDatabaseNamesFromPrivileges();
+                if (nameOnly === true) {
+                    return names;
+                } else {
+                    return {
+                        databases: names.map(function(x) {
+                            return {name: x};
+                        }),
+                    };
+                }
+            }
+            throw _getErrorWithCode(res, "listDatabases failed:" + tojson(res));
+        }
+
+        if (nameOnly) {
+            return res.databases.map(function(db) {
+                return db.name;
+            });
+        }
+
+        return res;
+    }.call(this, driverSession, filter, nameOnly, authorizedDatabases);
 };
 
 Mongo.prototype.adminCommand = function(cmd) {
@@ -253,7 +336,13 @@ connect = function(url, user, pass) {
         }
     }
 
-    chatty("connecting to: " + url);
+    var atPos = url.indexOf("@");
+    var protocolPos = url.indexOf("://");
+    var safeURL = url;
+    if (atPos != -1 && protocolPos != -1) {
+        safeURL = url.substring(0, protocolPos + 3) + url.substring(atPos + 1);
+    }
+    chatty("connecting to: " + safeURL);
     var m = new Mongo(url);
     var db = m.getDB(m.defaultDB);
 

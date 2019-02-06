@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -32,7 +34,6 @@
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/catalog_raii.h"
@@ -230,11 +231,12 @@ public:
             boost::optional<Lock::CollectionLock> collLock;
             collLock.emplace(opCtx->lockState(), nss.ns(), MODE_IS);
 
-            auto const css = CollectionShardingState::get(opCtx, nss);
+            auto* const css = CollectionShardingState::get(opCtx, nss);
             const ChunkVersion collectionShardVersion = [&] {
-                auto metadata = css->getMetadata(opCtx);
-                return metadata->isSharded() ? metadata->getShardVersion()
-                                             : ChunkVersion::UNSHARDED();
+                auto optMetadata = css->getCurrentMetadataIfKnown();
+                return (optMetadata && (*optMetadata)->isSharded())
+                    ? (*optMetadata)->getShardVersion()
+                    : ChunkVersion::UNSHARDED();
             }();
 
             if (requestedVersion.isWriteCompatibleWith(collectionShardVersion)) {
@@ -348,11 +350,13 @@ public:
         {
             AutoGetCollection autoColl(opCtx, nss, MODE_IS);
 
-            ChunkVersion currVersion = ChunkVersion::UNSHARDED();
-            auto metadata = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
-            if (metadata->isSharded()) {
-                currVersion = metadata->getShardVersion();
-            }
+            const ChunkVersion currVersion = [&] {
+                auto* const css = CollectionShardingState::get(opCtx, nss);
+                auto optMetadata = css->getCurrentMetadataIfKnown();
+                return (optMetadata && (*optMetadata)->isSharded())
+                    ? (*optMetadata)->getShardVersion()
+                    : ChunkVersion::UNSHARDED();
+            }();
 
             if (!status.isOK()) {
                 // The reload itself was interrupted or confused here
@@ -379,7 +383,10 @@ public:
                                        << ", requested version is " << requestedVersion.toString()
                                        << " but found version " << currVersion.toString();
 
-                OCCASIONALLY warning() << errmsg;
+                static Occasionally sampler;
+                if (sampler.tick()) {
+                    warning() << errmsg;
+                }
 
                 // WARNING: the exact fields below are important for compatibility with mongos
                 // version reload.

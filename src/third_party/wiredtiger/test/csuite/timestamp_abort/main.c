@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-2019 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -58,16 +58,17 @@ static char home[1024];			/* Program working dir */
  */
 #define	INVALID_KEY	UINT64_MAX
 #define	MAX_CKPT_INVL	5	/* Maximum interval between checkpoints */
-#define	MAX_DEFAULT_TH	12
 #define	MAX_TH		200	/* Maximum configurable threads */
 #define	MAX_TIME	40
 #define	MAX_VAL		1024
 #define	MIN_TH		5
 #define	MIN_TIME	10
 #define	PREPARE_FREQ	5
+#define	PREPARE_PCT	10
 #define	PREPARE_YIELD	(PREPARE_FREQ * 10)
 #define	RECORDS_FILE	"records-%" PRIu32
-#define	SESSION_MAX	MAX_TH + 3	/* Include program worker threads */
+/* Include worker threads and prepare extra sessions */
+#define	SESSION_MAX	(MAX_TH + 3 + MAX_TH * PREPARE_PCT)
 
 static const char * table_pfx = "table";
 static const char * const uri_local = "local";
@@ -126,7 +127,7 @@ thread_ts_run(void *arg)
 	WT_DECL_RET;
 	WT_SESSION *session;
 	THREAD_DATA *td;
-	char tscfg[64], ts_buf[WT_TIMESTAMP_SIZE];
+	char tscfg[64], ts_string[WT_TS_HEX_STRING_SIZE];
 
 	td = (THREAD_DATA *)arg;
 
@@ -140,7 +141,7 @@ thread_ts_run(void *arg)
 		 */
 		testutil_check(pthread_rwlock_wrlock(&ts_lock));
 		ret = td->conn->query_timestamp(
-		    td->conn, ts_buf, "get=all_committed");
+		    td->conn, ts_string, "get=all_committed");
 		testutil_check(pthread_rwlock_unlock(&ts_lock));
 		testutil_assert(ret == 0 || ret == WT_NOTFOUND);
 		if (ret == 0) {
@@ -152,7 +153,7 @@ thread_ts_run(void *arg)
 			testutil_check(__wt_snprintf(
 			    tscfg, sizeof(tscfg),
 			    "oldest_timestamp=%s,stable_timestamp=%s",
-			    ts_buf, ts_buf));
+			    ts_string, ts_string));
 			testutil_check(
 			    td->conn->set_timestamp(td->conn, tscfg));
 		}
@@ -176,7 +177,7 @@ thread_ckpt_run(void *arg)
 	uint32_t sleep_time;
 	int i;
 	bool first_ckpt;
-	char buf[128];
+	char ts_string[WT_TS_HEX_STRING_SIZE];
 
 	__wt_random_init(&rnd);
 
@@ -197,8 +198,8 @@ thread_ckpt_run(void *arg)
 		testutil_check(session->checkpoint(
 		    session, "use_timestamp=true"));
 		testutil_check(td->conn->query_timestamp(
-		    td->conn, buf, "get=last_checkpoint"));
-		testutil_assert(sscanf(buf, "%" SCNx64, &stable) == 1);
+		    td->conn, ts_string, "get=last_checkpoint"));
+		testutil_assert(sscanf(ts_string, "%" SCNx64, &stable) == 1);
 		printf("Checkpoint %d complete at stable %"
 		    PRIu64 ".\n", i, stable);
 		fflush(stdout);
@@ -260,7 +261,7 @@ thread_run(void *arg)
 	 * are in use. Thread numbers start at 0 so we're always guaranteed
 	 * that at least one thread is using prepared transactions.
 	 */
-	use_prep = (use_ts && td->info % 10 == 0) ? true : false;
+	use_prep = (use_ts && td->info % PREPARE_PCT == 0) ? true : false;
 
 	/*
 	 * For the prepared case we have two sessions so that the oplog session
@@ -489,19 +490,6 @@ run_workload(uint32_t nth)
 	exit(EXIT_SUCCESS);
 }
 
-/*
- * Determines whether this is a timestamp build or not
- */
-static bool
-timestamp_build(void)
-{
-#ifdef HAVE_TIMESTAMPS
-	return (true);
-#else
-	return (false);
-#endif
-}
-
 extern int __wt_optind;
 extern char *__wt_optarg;
 
@@ -570,11 +558,8 @@ main(int argc, char *argv[])
 	int ch, status, ret;
 	const char *working_dir;
 	char buf[512], fname[64], kname[64], statname[1024];
+	char ts_string[WT_TS_HEX_STRING_SIZE];
 	bool fatal, rand_th, rand_time, verify_only;
-
-	/* We have nothing to do if this is not a timestamp build */
-	if (!timestamp_build())
-		return (EXIT_SUCCESS);
 
 	(void)testutil_set_progname(argv);
 
@@ -649,7 +634,7 @@ main(int argc, char *argv[])
 				timeout = MIN_TIME;
 		}
 		if (rand_th) {
-			nth = __wt_random(&rnd) % MAX_DEFAULT_TH;
+			nth = __wt_random(&rnd) % MAX_TH;
 			if (nth < MIN_TH)
 				nth = MIN_TH;
 		}
@@ -692,7 +677,7 @@ main(int argc, char *argv[])
 		testutil_check(__wt_snprintf(
 		    statname, sizeof(statname), "%s/%s", home, ckpt_file));
 		while (stat(statname, &sb) != 0)
-			sleep(1);
+			testutil_sleep_wait(1, pid);
 		sleep(timeout);
 		sa.sa_handler = SIG_DFL;
 		testutil_checksys(sigaction(SIGCHLD, &sa, NULL));
@@ -755,8 +740,9 @@ main(int argc, char *argv[])
 	stable_val = 0;
 	if (use_ts) {
 		testutil_check(
-		    conn->query_timestamp(conn, buf, "get=recovery"));
-		testutil_assert(sscanf(buf, "%" SCNx64, &stable_val) == 1);
+		    conn->query_timestamp(conn, ts_string, "get=recovery"));
+		testutil_assert(
+		    sscanf(ts_string, "%" SCNx64, &stable_val) == 1);
 		printf("Got stable_val %" PRIu64 "\n", stable_val);
 	}
 

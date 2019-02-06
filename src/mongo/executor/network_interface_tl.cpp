@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -170,8 +172,8 @@ Date_t NetworkInterfaceTL::now() {
 
 Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHandle,
                                         RemoteCommandRequest& request,
-                                        const RemoteCommandCompletionFn& onFinish,
-                                        const transport::BatonHandle& baton) {
+                                        RemoteCommandCompletionFn&& onFinish,
+                                        const BatonHandle& baton) {
     if (inShutdown()) {
         return {ErrorCodes::ShutdownInProgress, "NetworkInterface shutdown in progress"};
     }
@@ -203,7 +205,8 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
 
     if (MONGO_FAIL_POINT(networkInterfaceDiscardCommandsBeforeAcquireConn)) {
         log() << "Discarding command due to failpoint before acquireConn";
-        std::move(pf.future).getAsync([onFinish](StatusWith<RemoteCommandResponse> response) {
+        std::move(pf.future).getAsync([onFinish = std::move(onFinish)](
+            StatusWith<RemoteCommandResponse> response) mutable {
             onFinish(RemoteCommandResponse(response.getStatus(), Milliseconds{0}));
         });
         return Status::OK();
@@ -219,24 +222,35 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
     // return on the reactor thread.
     //
     // TODO: get rid of this cruft once we have a connection pool that's executor aware.
-    auto connFuture = _reactor->execute([this, state, request, baton] {
-        return makeReadyFutureWith(
-                   [this, request] { return _pool->get(request.target, request.timeout); })
+
+    auto connFuture = [&] {
+        auto conn = _pool->tryGet(request.target, request.sslMode);
+
+        if (conn) {
+            return Future<ConnectionPool::ConnectionHandle>(std::move(*conn));
+        }
+
+        return _reactor
+            ->execute([this, state, request, baton] {
+                return makeReadyFutureWith([this, request] {
+                    return _pool->get(request.target, request.sslMode, request.timeout);
+                });
+            })
             .tapError([state](Status error) {
                 LOG(2) << "Failed to get connection from pool for request " << state->request.id
                        << ": " << error;
-            })
-            .then([this, baton](ConnectionPool::ConnectionHandle conn) {
-                auto deleter = conn.get_deleter();
-
-                // TODO: drop out this shared_ptr once we have a unique_function capable future
-                return std::make_shared<CommandState::ConnHandle>(
-                    conn.release(), CommandState::Deleter{deleter, _reactor});
             });
+    }().then([this, baton](ConnectionPool::ConnectionHandle conn) {
+        auto deleter = conn.get_deleter();
+
+        // TODO: drop out this shared_ptr once we have a unique_function capable future
+        return std::make_shared<CommandState::ConnHandle>(conn.release(),
+                                                          CommandState::Deleter{deleter, _reactor});
     });
 
-    auto remainingWork = [ this, state, future = std::move(pf.future), baton, onFinish ](
-        StatusWith<std::shared_ptr<CommandState::ConnHandle>> swConn) mutable {
+    auto remainingWork =
+        [ this, state, future = std::move(pf.future), baton, onFinish = std::move(onFinish) ](
+            StatusWith<std::shared_ptr<CommandState::ConnHandle>> swConn) mutable {
         makeReadyFutureWith([&] {
             return _onAcquireConn(
                 state, std::move(future), std::move(*uassertStatusOK(swConn)), baton);
@@ -249,7 +263,8 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
                 }
                 return error;
             })
-            .getAsync([this, state, onFinish](StatusWith<RemoteCommandResponse> response) {
+            .getAsync([ this, state, onFinish = std::move(onFinish) ](
+                StatusWith<RemoteCommandResponse> response) {
                 auto duration = now() - state->start;
                 if (!response.isOK()) {
                     onFinish(RemoteCommandResponse(response.getStatus(), duration));
@@ -265,14 +280,19 @@ Status NetworkInterfaceTL::startCommand(const TaskExecutor::CallbackHandle& cbHa
     if (baton) {
         // If we have a baton, we want to get back to the baton thread immediately after we get a
         // connection
-        std::move(connFuture).getAsync([
-            baton,
-            rw = std::move(remainingWork)
-        ](StatusWith<std::shared_ptr<CommandState::ConnHandle>> swConn) mutable {
-            baton->schedule([ rw = std::move(rw), swConn = std::move(swConn) ]() mutable {
-                std::move(rw)(std::move(swConn));
+        std::move(connFuture)
+            .getAsync([ baton, reactor = _reactor.get(), rw = std::move(remainingWork) ](
+                StatusWith<std::shared_ptr<CommandState::ConnHandle>> swConn) mutable {
+                baton->schedule([ rw = std::move(rw),
+                                  swConn = std::move(swConn) ](OperationContext * opCtx) mutable {
+                    if (opCtx) {
+                        std::move(rw)(std::move(swConn));
+                    } else {
+                        std::move(rw)(Status(ErrorCodes::ShutdownInProgress,
+                                             "baton is detached, failing operation"));
+                    }
+                });
             });
-        });
     } else {
         // otherwise we're happy to run inline
         std::move(connFuture)
@@ -291,7 +311,7 @@ Future<RemoteCommandResponse> NetworkInterfaceTL::_onAcquireConn(
     std::shared_ptr<CommandState> state,
     Future<RemoteCommandResponse> future,
     CommandState::ConnHandle conn,
-    const transport::BatonHandle& baton) {
+    const BatonHandle& baton) {
     if (MONGO_FAIL_POINT(networkInterfaceDiscardCommandsAfterAcquireConn)) {
         conn->indicateSuccess();
         return future;
@@ -335,11 +355,14 @@ Future<RemoteCommandResponse> NetworkInterfaceTL::_onAcquireConn(
                     _counters.timedOut++;
                 }
 
-                LOG(2) << "Request " << state->request.id << " timed out"
-                       << ", deadline was " << state->deadline << ", op was "
-                       << redact(state->request.toString());
+                const std::string message = str::stream()
+                    << "Request " << state->request.id << " timed out"
+                    << ", deadline was " << state->deadline.toString() << ", op was "
+                    << redact(state->request.toString());
+
+                LOG(2) << message;
                 state->promise.setError(
-                    Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, "timed out"));
+                    Status(ErrorCodes::NetworkInterfaceExceededTimeLimit, message));
 
                 client->cancel(baton);
             });
@@ -398,7 +421,7 @@ void NetworkInterfaceTL::_eraseInUseConn(const TaskExecutor::CallbackHandle& cbH
 }
 
 void NetworkInterfaceTL::cancelCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                                       const transport::BatonHandle& baton) {
+                                       const BatonHandle& baton) {
     stdx::unique_lock<stdx::mutex> lk(_inProgressMutex);
     auto it = _inProgress.find(cbHandle);
     if (it == _inProgress.end()) {
@@ -427,19 +450,13 @@ void NetworkInterfaceTL::cancelCommand(const TaskExecutor::CallbackHandle& cbHan
     }
 }
 
-Status NetworkInterfaceTL::setAlarm(Date_t when,
-                                    const stdx::function<void()>& action,
-                                    const transport::BatonHandle& baton) {
+Status NetworkInterfaceTL::setAlarm(Date_t when, unique_function<void()> action) {
     if (inShutdown()) {
         return {ErrorCodes::ShutdownInProgress, "NetworkInterface shutdown in progress"};
     }
 
     if (when <= now()) {
-        if (baton) {
-            baton->schedule(std::move(action));
-        } else {
-            _reactor->schedule(transport::Reactor::kPost, std::move(action));
-        }
+        _reactor->schedule(transport::Reactor::kPost, std::move(action));
         return Status::OK();
     }
 
@@ -451,8 +468,8 @@ Status NetworkInterfaceTL::setAlarm(Date_t when,
         _inProgressAlarms.insert(alarmTimer);
     }
 
-    alarmTimer->waitUntil(when, baton)
-        .getAsync([this, weakTimer, action, when, baton](Status status) {
+    alarmTimer->waitUntil(when, nullptr)
+        .getAsync([ this, weakTimer, action = std::move(action), when ](Status status) mutable {
             auto alarmTimer = weakTimer.lock();
             if (!alarmTimer) {
                 return;
@@ -465,7 +482,7 @@ Status NetworkInterfaceTL::setAlarm(Date_t when,
             if (nowVal < when) {
                 warning() << "Alarm returned early. Expected at: " << when
                           << ", fired at: " << nowVal;
-                const auto status = setAlarm(when, std::move(action), baton);
+                const auto status = setAlarm(when, std::move(action));
                 if ((!status.isOK()) && (status != ErrorCodes::ShutdownInProgress)) {
                     fassertFailedWithStatus(50785, status);
                 }
@@ -474,11 +491,7 @@ Status NetworkInterfaceTL::setAlarm(Date_t when,
             }
 
             if (status.isOK()) {
-                if (baton) {
-                    baton->schedule(std::move(action));
-                } else {
-                    _reactor->schedule(transport::Reactor::kPost, std::move(action));
-                }
+                _reactor->schedule(transport::Reactor::kPost, std::move(action));
             } else if (status != ErrorCodes::CallbackCanceled) {
                 warning() << "setAlarm() received an error: " << status;
             }

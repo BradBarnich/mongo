@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -100,6 +102,24 @@ public:
     virtual ~SaslServerCommonBase() = default;
     virtual StringData mechanismName() const = 0;
     virtual SecurityPropertySet properties() const = 0;
+
+    /**
+     * This returns a number that represents the "amount" of security provided by this mechanism
+     * to determine the order in which it is offered to clients in the isMaster
+     * saslSupportedMechs response.
+     *
+     * The value of securityLevel is arbitrary so long as the more secure mechanisms return a
+     * higher value than the less secure mechanisms.
+     *
+     * For example, SCRAM-SHA-256 > SCRAM-SHA-1 > PLAIN
+     */
+    virtual int securityLevel() const = 0;
+
+    /**
+     * Returns true if the mechanism can be used for internal cluster authentication.
+     * Currently only SCRAM-SHA-1/SCRAM-SHA-256 return true here.
+     */
+    virtual bool isInternalAuthMech() const = 0;
 };
 
 /**
@@ -142,23 +162,21 @@ public:
     StatusWith<std::string> step(OperationContext* opCtx, StringData input) {
         auto result = stepImpl(opCtx, input);
         if (result.isOK()) {
-            bool isDone;
+            bool isSuccess;
             std::string responseMessage;
-            std::tie(isDone, responseMessage) = result.getValue();
+            std::tie(isSuccess, responseMessage) = result.getValue();
 
-            _done = isDone;
+            _success = isSuccess;
             return responseMessage;
         }
         return result.getStatus();
     }
 
     /**
-     * Returns true if the conversation has completed.
-     * Note that this does not mean authentication succeeded!
-     * An error may have occurred.
+     * Returns true if the conversation has completed successfully.
      */
-    bool isDone() const {
-        return _done;
+    bool isSuccess() const {
+        return _success;
     }
 
     /** Returns which database contains the user which authentication is being performed against. */
@@ -184,7 +202,7 @@ protected:
     virtual StatusWith<std::tuple<bool, std::string>> stepImpl(OperationContext* opCtx,
                                                                StringData input) = 0;
 
-    bool _done = false;
+    bool _success = false;
     std::string _principalName;
     std::string _authenticationDatabase;
 };
@@ -227,6 +245,14 @@ public:
     SecurityPropertySet properties() const final {
         return policy_type::getProperties();
     }
+
+    int securityLevel() const final {
+        return policy_type::securityLevel();
+    }
+
+    bool isInternalAuthMech() const final {
+        return policy_type::isInternalAuthMech();
+    }
 };
 
 /** Instantiates a class which provides runtime access to Policy properties. */
@@ -252,6 +278,14 @@ public:
     SecurityPropertySet properties() const final {
         return policy_type::getProperties();
     }
+
+    int securityLevel() const final {
+        return policy_type::securityLevel();
+    }
+
+    bool isInternalAuthMech() const final {
+        return policy_type::isInternalAuthMech();
+    }
 };
 
 /**
@@ -264,6 +298,16 @@ class SASLServerMechanismRegistry {
 public:
     static SASLServerMechanismRegistry& get(ServiceContext* serviceContext);
     static void set(ServiceContext* service, std::unique_ptr<SASLServerMechanismRegistry> registry);
+
+    /**
+     * Intialize the registry with a list of enabled mechanisms.
+     */
+    explicit SASLServerMechanismRegistry(std::vector<std::string> enabledMechanisms);
+
+    /**
+     * Sets a new list of enabled mechanisms - used in testing.
+     */
+    void setEnabledMechanisms(std::vector<std::string> enabledMechanisms);
 
     /**
      * Produces a list of SASL mechanisms which can be used to authenticate as a user.
@@ -300,38 +344,42 @@ public:
         using policy_type = typename T::policy_type;
         auto mechName = policy_type::getName();
 
-        // Always allow SCRAM-SHA-1 to pass to the first sasl step since we need to
-        // handle internal user authentication, SERVER-16534
         if (validateGlobalConfig &&
-            (mechName != "SCRAM-SHA-1" && !_mechanismSupportedByConfig(mechName))) {
+            (!policy_type::isInternalAuthMech() && !_mechanismSupportedByConfig(mechName))) {
             return false;
         }
 
-        invariant(
-            _getMapRef(T::isInternal).emplace(mechName.toString(), std::make_unique<T>()).second);
+        auto& list = _getMapRef(T::isInternal);
+        list.emplace_back(std::make_unique<T>());
+        std::stable_sort(list.begin(), list.end(), [](const auto& a, const auto& b) {
+            return (a->securityLevel() > b->securityLevel());
+        });
+
         return true;
     }
 
 private:
-    stdx::unordered_map<std::string, std::unique_ptr<ServerFactoryBase>>& _getMapRef(
-        StringData dbName) {
+    using MechList = std::vector<std::unique_ptr<ServerFactoryBase>>;
+
+    MechList& _getMapRef(StringData dbName) {
         return _getMapRef(dbName != "$external"_sd);
     }
 
-    stdx::unordered_map<std::string, std::unique_ptr<ServerFactoryBase>>& _getMapRef(
-        bool internal) {
+    MechList& _getMapRef(bool internal) {
         if (internal) {
-            return _internalMap;
+            return _internalMechs;
         }
-        return _externalMap;
+        return _externalMechs;
     }
 
-    bool _mechanismSupportedByConfig(StringData mechName);
+    bool _mechanismSupportedByConfig(StringData mechName) const;
 
     // Stores factories which make mechanisms for all databases other than $external
-    stdx::unordered_map<std::string, std::unique_ptr<ServerFactoryBase>> _internalMap;
+    MechList _internalMechs;
     // Stores factories which make mechanisms exclusively for $external
-    stdx::unordered_map<std::string, std::unique_ptr<ServerFactoryBase>> _externalMap;
+    MechList _externalMechs;
+
+    std::vector<std::string> _enabledMechanisms;
 };
 
 template <typename Factory>

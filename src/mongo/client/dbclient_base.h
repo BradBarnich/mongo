@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2008-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -31,6 +33,7 @@
 #include <cstdint>
 
 #include "mongo/base/string_data.h"
+#include "mongo/client/authenticate.h"
 #include "mongo/client/connection_string.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/index_spec.h"
@@ -291,10 +294,9 @@ public:
 
     /**
     * Authenticates to another cluster member using appropriate authentication data.
-    * Uses getInternalUserAuthParams() to retrive authentication parameters.
-    * @return true if the authentication was succesful
+    * @return true if the authentication was successful
     */
-    bool authenticateInternalUser();
+    virtual Status authenticateInternalUser();
 
     /**
      * Authenticate a user.
@@ -422,14 +424,6 @@ public:
         If all you need is the string, just call getLastError() instead.
     */
     static std::string getLastErrorString(const BSONObj& res);
-
-    /** Return the last error which has occurred, even if not the very last operation.
-
-       @return { err : <error message>, nPrev : <how_many_ops_back_occurred>, ok : 1 }
-
-       result.err will be null if no error has occurred.
-    */
-    BSONObj getPrevError();
 
     /** Delete the specified collection.
      *  @param info An optional output parameter that receives the result object the database
@@ -708,10 +702,12 @@ protected:
     /** controls how chatty the client is about network errors & such.  See log.h */
     const logger::LogSeverity _logLevel;
 
-    static AtomicInt64 ConnectionIdSequence;
+    static AtomicWord<long long> ConnectionIdSequence;
     long long _connectionId;  // unique connection id for this connection
 
 private:
+    auth::RunCommandHook _makeAuthRunCommandHook();
+
     /**
      * The rpc protocols this client supports.
      *

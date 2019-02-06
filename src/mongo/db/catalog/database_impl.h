@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,103 +32,22 @@
 
 #include "mongo/db/catalog/database.h"
 
-#include <memory>
-#include <string>
-
-#include "mongo/base/string_data.h"
-#include "mongo/bson/bsonobj.h"
-#include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/storage/storage_options.h"
-#include "mongo/db/views/view.h"
-#include "mongo/db/views/view_catalog.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/string_map.h"
+#include "mongo/platform/random.h"
 
 namespace mongo {
 
-class Collection;
-class DatabaseCatalogEntry;
-class IndexCatalog;
-class NamespaceDetails;
-class OperationContext;
-class PseudoRandom;
-
-/**
- * Represents a logical database containing Collections.
- *
- * The semantics for a const Database are that you can mutate individual collections but not add or
- * remove them.
- */
-class DatabaseImpl : public Database::Impl {
+class DatabaseImpl : public Database {
 public:
-    typedef StringMap<Collection*> CollectionMap;
-
-    /**
-     * Iterating over a Database yields Collection* pointers.
-     */
-    class iterator {
-    public:
-        using iterator_category = std::forward_iterator_tag;
-        using value_type = Collection*;
-        using pointer = const value_type*;
-        using reference = const value_type&;
-        using difference_type = ptrdiff_t;
-
-        iterator() = default;
-        iterator(CollectionMap::const_iterator it) : _it(it) {}
-
-        reference operator*() const {
-            return _it->second;
-        }
-
-        pointer operator->() const {
-            return &_it->second;
-        }
-
-        bool operator==(const iterator& other) {
-            return _it == other._it;
-        }
-
-        bool operator!=(const iterator& other) {
-            return _it != other._it;
-        }
-
-        iterator& operator++() {
-            ++_it;
-            return *this;
-        }
-
-        iterator operator++(int) {
-            auto oldPosition = *this;
-            ++_it;
-            return oldPosition;
-        }
-
-    private:
-        CollectionMap::const_iterator _it;
-    };
-
-    explicit DatabaseImpl(Database* this_,
-                          OperationContext* opCtx,
-                          StringData name,
-                          DatabaseCatalogEntry* dbEntry);
+    explicit DatabaseImpl(StringData name, DatabaseCatalogEntry* dbEntry, uint64_t epoch);
 
     // must call close first
     ~DatabaseImpl();
 
     void init(OperationContext*) final;
 
-    iterator begin() const {
-        return iterator(_collections.begin());
-    }
-
-    iterator end() const {
-        return iterator(_collections.end());
-    }
 
     // closes files and other cleanup see below.
-    void close(OperationContext* opCtx, const std::string& reason) final;
+    void close(OperationContext* opCtx) final;
 
     const std::string& name() const final {
         return _name;
@@ -173,6 +94,12 @@ public:
 
     Status dropView(OperationContext* opCtx, StringData fullns) final;
 
+    Status userCreateNS(OperationContext* opCtx,
+                        const NamespaceString& fullns,
+                        CollectionOptions collectionOptions,
+                        bool createDefaultIndexes,
+                        const BSONObj& idIndex) final;
+
     Collection* createCollection(OperationContext* opCtx,
                                  StringData ns,
                                  const CollectionOptions& options = CollectionOptions(),
@@ -200,6 +127,11 @@ public:
 
     Collection* getOrCreateCollection(OperationContext* opCtx, const NamespaceString& nss) final;
 
+    /**
+     * Renames the fully qualified namespace 'fromNS' to the fully qualified namespace 'toNS'.
+     * Illegal to call unless both 'fromNS' and 'toNS' are within this database. Returns an error if
+     * 'toNS' already exists or 'fromNS' does not exist.
+     */
     Status renameCollection(OperationContext* opCtx,
                             StringData fromNS,
                             StringData toNS,
@@ -223,11 +155,18 @@ public:
     StatusWith<NamespaceString> makeUniqueCollectionNamespace(OperationContext* opCtx,
                                                               StringData collectionNameModel) final;
 
-    inline CollectionMap& collections() final {
-        return _collections;
+    void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) final;
+
+    iterator begin() const final {
+        return iterator(_collections.begin());
     }
-    inline const CollectionMap& collections() const final {
-        return _collections;
+
+    iterator end() const final {
+        return iterator(_collections.end());
+    }
+
+    uint64_t epoch() const {
+        return _epoch;
     }
 
 private:
@@ -248,16 +187,6 @@ private:
                                    const CollectionOptions& options);
 
     /**
-     * Deregisters and invalidates all cursors on collection 'fullns'.  Callers must specify
-     * 'reason' for why the cache is being cleared. If 'collectionGoingAway' is false,
-     * unpinned cursors will not be killed.
-     */
-    void _clearCollectionCache(OperationContext* opCtx,
-                               StringData fullns,
-                               const std::string& reason,
-                               bool collectionGoingAway);
-
-    /**
      * Completes a collection drop by removing all the indexes and removing the collection itself
      * from the storage engine.
      *
@@ -270,10 +199,13 @@ private:
 
     class AddCollectionChange;
     class RemoveCollectionChange;
+    class RenameCollectionChange;
 
     const std::string _name;  // "dbname"
 
     DatabaseCatalogEntry* _dbEntry;  // not owned here
+
+    const uint64_t _epoch;
 
     const std::string _profileName;  // "dbname.system.profile"
     const std::string _viewsName;    // "dbname.system.views"
@@ -295,13 +227,6 @@ private:
 
     DurableViewCatalogImpl _durableViews;  // interface for system.views operations
     ViewCatalog _views;                    // in-memory representation of _durableViews
-    Database* _this;                       // Pointer to wrapper, for external caller compatibility.
-
-    friend class Collection;
-    friend class NamespaceDetails;
-    friend class IndexCatalog;
 };
-
-void dropAllDatabasesExceptLocalImpl(OperationContext* opCtx);
 
 }  // namespace mongo

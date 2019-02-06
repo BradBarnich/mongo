@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,17 +41,14 @@
 
 namespace mongo {
 namespace biggie {
+
 class JournalListener;
 /**
  * The biggie storage engine is intended for unit and performance testing.
  */
-class KVEngine : public ::mongo::KVEngine {
-    std::shared_ptr<StringStore> _master = std::make_shared<StringStore>();
-    std::map<std::string, bool> _idents;  // TODO : replace with a query to _master.
-    mutable stdx::mutex _masterLock;
-
+class KVEngine : public mongo::KVEngine {
 public:
-    KVEngine() : ::mongo::KVEngine() {}
+    KVEngine() : mongo::KVEngine() {}
 
     virtual ~KVEngine() {}
 
@@ -60,10 +59,13 @@ public:
                                      StringData ident,
                                      const CollectionOptions& options);
 
-    virtual std::unique_ptr<::mongo::RecordStore> getRecordStore(OperationContext* opCtx,
-                                                                 StringData ns,
-                                                                 StringData ident,
-                                                                 const CollectionOptions& options);
+    virtual std::unique_ptr<mongo::RecordStore> getRecordStore(OperationContext* opCtx,
+                                                               StringData ns,
+                                                               StringData ident,
+                                                               const CollectionOptions& options);
+
+    virtual std::unique_ptr<mongo::RecordStore> makeTemporaryRecordStore(OperationContext* opCtx,
+                                                                         StringData ident) override;
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
                                              StringData ident,
@@ -72,6 +74,12 @@ public:
     virtual mongo::SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
                                                                StringData ident,
                                                                const IndexDescriptor* desc);
+
+    virtual Status beginBackup(OperationContext* opCtx) {
+        return Status::OK();
+    }
+
+    virtual void endBackup(OperationContext* opCtx) {}
 
     virtual Status dropIdent(OperationContext* opCtx, StringData ident);
 
@@ -84,7 +92,7 @@ public:
     }
 
     virtual bool supportsCappedCollections() const {
-        return false;  // TODO : do this later.
+        return true;
     }
 
     /**
@@ -130,29 +138,39 @@ public:
     void setJournalListener(mongo::JournalListener* jl) final {}
 
     virtual Timestamp getAllCommittedTimestamp() const override {
+        RecordId id = _visibilityManager->getAllCommittedRecord();
+        return Timestamp(id.repr());
+    }
+
+    virtual Timestamp getOldestOpenReadTimestamp() const override {
         return Timestamp();
     }
 
     // Biggie Specific
 
     /**
-     * Used to replace the master branch of the store with an updated copy.
-     * Appropriate lock must be taken externally.
+     * Returns a pair of the current version and copy of tree of the master.
      */
-    void setMaster_inlock(std::unique_ptr<StringStore> newMaster);
-
-    std::shared_ptr<StringStore> getMaster() const;
-    std::shared_ptr<StringStore> getMaster_inlock() const;
-    /**
-     * Get the lock around the master branch.
-     */
-    stdx::mutex& getMasterLock() {
-        return _masterLock;
+    std::pair<uint64_t, StringStore> getMasterInfo() {
+        stdx::lock_guard<stdx::mutex> lock(_masterLock);
+        return std::make_pair(_masterVersion, _master);
     }
+
+    /**
+     * Returns true and swaps _master to newMaster if the version passed in is the same as the
+     * masters current version.
+     */
+    bool trySwapMaster(StringStore& newMaster, uint64_t version);
 
 private:
     std::shared_ptr<void> _catalogInfo;
     int _cachePressureForTest = 0;
+    std::map<std::string, bool> _idents;  // TODO : replace with a query to _master.
+    std::unique_ptr<VisibilityManager> _visibilityManager;
+
+    mutable stdx::mutex _masterLock;
+    StringStore _master;
+    uint64_t _masterVersion = 0;
 };
 }  // namespace biggie
 }  // namespace mongo

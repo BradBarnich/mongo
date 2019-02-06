@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -255,19 +256,18 @@ public:
 
 
     /**
-     * Shards a collection. Assumes that the database is enabled for sharding.
+     * Shards collection with namespace 'nss' and implicitly assumes that the database is enabled
+     * for sharding (i.e., doesn't check whether enableSharding has been called previously).
      *
-     * @param ns: namespace of collection to shard
-     * @param uuid: the collection's UUID. Optional because new in 3.6.
-     * @param fieldsAndOrder: shardKey pattern
-     * @param defaultCollation: the default collation for the collection, to be written to
-     *     config.collections. If empty, the collection default collation is simple binary
-     *     comparison. Note the the shard key collation will always be simple binary comparison,
-     *     even if the collection default collation is non-simple.
-     * @param unique: if true, ensure underlying index enforces a unique constraint.
-     * @param initPoints: create chunks based on a set of specified split points.
-     * @param initShardIds: If non-empty, specifies the set of shards to assign chunks between.
-     *     Otherwise all chunks will be assigned to the primary shard for the database.
+     * uuid - the collection's UUID. Optional because new in 3.6.
+     * fieldsAndOrder - shard key pattern to use.
+     * defaultCollation - the default collation for the collection, excluding the shard key. If
+     *  empty, defaults to simple binary comparison. Note that the shard key collation will always
+     *  be simple binary comparison, even if the collection default collation is non-simple.
+     * unique - if true, ensure underlying index enforces a unique constraint.
+     * initPoints - create chunks based on a set of specified split points.
+     * isFromMapReduce - whether this request comes from map/reduce, in which case the generated
+     *  chunks can be spread across shards. Otherwise they will stay on the primary shard.
      */
     void shardCollection(OperationContext* opCtx,
                          const NamespaceString& nss,
@@ -276,7 +276,7 @@ public:
                          const BSONObj& defaultCollation,
                          bool unique,
                          const std::vector<BSONObj>& initPoints,
-                         const bool distributeInitialChunks,
+                         bool isFromMapReduce,
                          const ShardId& dbPrimaryShardId);
 
 

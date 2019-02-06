@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -55,27 +57,30 @@ MONGO_EXPORT_SERVER_PARAMETER(allowSecondaryReadsDuringBatchApplication, bool, t
 AutoStatsTracker::AutoStatsTracker(OperationContext* opCtx,
                                    const NamespaceString& nss,
                                    Top::LockType lockType,
+                                   LogMode logMode,
                                    boost::optional<int> dbProfilingLevel,
                                    Date_t deadline)
-    : _opCtx(opCtx), _lockType(lockType) {
-    if (!dbProfilingLevel) {
+    : _opCtx(opCtx), _lockType(lockType), _nss(nss) {
+    if (!dbProfilingLevel && logMode == LogMode::kUpdateTopAndCurop) {
         // No profiling level was determined, attempt to read the profiling level from the Database
         // object.
-        AutoGetDb autoDb(_opCtx, nss.db(), MODE_IS, deadline);
+        AutoGetDb autoDb(_opCtx, _nss.db(), MODE_IS, deadline);
         if (autoDb.getDb()) {
             dbProfilingLevel = autoDb.getDb()->getProfilingLevel();
         }
     }
 
     stdx::lock_guard<Client> clientLock(*_opCtx->getClient());
-    CurOp::get(_opCtx)->enter_inlock(nss.ns().c_str(), dbProfilingLevel);
+    if (logMode == LogMode::kUpdateTopAndCurop) {
+        CurOp::get(_opCtx)->enter_inlock(_nss.ns().c_str(), dbProfilingLevel);
+    }
 }
 
 AutoStatsTracker::~AutoStatsTracker() {
     auto curOp = CurOp::get(_opCtx);
     Top::get(_opCtx->getServiceContext())
         .record(_opCtx,
-                curOp->getNS(),
+                _nss.ns(),
                 curOp->getLogicalOp(),
                 _lockType,
                 durationCount<Microseconds>(curOp->elapsedTimeExcludingPauses()),
@@ -159,7 +164,7 @@ AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
         // the PBWM lock and retry.
         if (lastAppliedTimestamp) {
             LOG(2) << "Tried reading at last-applied time: " << *lastAppliedTimestamp
-                   << " on nss: " << nss.ns() << ", but future catalog changes are pending at time "
+                   << " on ns: " << nss.ns() << ", but future catalog changes are pending at time "
                    << *minSnapshot << ". Trying again without reading at last-applied time.";
             // Destructing the block sets _shouldConflictWithSecondaryBatchApplication back to the
             // previous value. If the previous value is false (because there is another
@@ -167,6 +172,10 @@ AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
             // does not take the PBWM lock.
             _shouldNotConflictWithSecondaryBatchApplicationBlock = boost::none;
             invariant(opCtx->lockState()->shouldConflictWithSecondaryBatchApplication());
+
+            // Cannot change ReadSource while a RecoveryUnit is active, which may result from
+            // calling getPointInTimeReadTimestamp().
+            opCtx->recoveryUnit()->abandonSnapshot();
             opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kUnset);
         }
 
@@ -255,11 +264,13 @@ AutoGetCollectionForReadCommand::AutoGetCollectionForReadCommand(
     OperationContext* opCtx,
     const NamespaceStringOrUUID& nsOrUUID,
     AutoGetCollection::ViewMode viewMode,
-    Date_t deadline)
+    Date_t deadline,
+    AutoStatsTracker::LogMode logMode)
     : _autoCollForRead(opCtx, nsOrUUID, viewMode, deadline),
       _statsTracker(opCtx,
                     _autoCollForRead.getNss(),
                     Top::LockType::ReadLocked,
+                    logMode,
                     _autoCollForRead.getDb() ? _autoCollForRead.getDb()->getProfilingLevel()
                                              : kDoNotChangeProfilingLevel,
                     deadline) {
@@ -272,11 +283,11 @@ AutoGetCollectionForReadCommand::AutoGetCollectionForReadCommand(
 }
 
 OldClientContext::OldClientContext(OperationContext* opCtx, const std::string& ns, bool doVersion)
-    : _opCtx(opCtx), _db(DatabaseHolder::getDatabaseHolder().get(opCtx, ns)) {
+    : _opCtx(opCtx), _db(DatabaseHolder::get(opCtx)->getDb(opCtx, ns)) {
     if (!_db) {
         const auto dbName = nsToDatabaseSubstring(ns);
         invariant(_opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
-        _db = DatabaseHolder::getDatabaseHolder().openDb(_opCtx, dbName, &_justCreated);
+        _db = DatabaseHolder::get(opCtx)->openDb(_opCtx, dbName, &_justCreated);
         invariant(_db);
     }
 

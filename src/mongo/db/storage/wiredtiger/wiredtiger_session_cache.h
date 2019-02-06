@@ -1,26 +1,27 @@
 // wiredtiger_session_cache.h
 
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -155,6 +156,14 @@ public:
      */
     static const uint64_t kMetadataTableId = 0;
 
+    void setIdleExpireTime(Date_t idleExpireTime) {
+        _idleExpireTime = idleExpireTime;
+    }
+
+    Date_t getIdleExpireTime() const {
+        return _idleExpireTime;
+    }
+
 private:
     friend class WiredTigerSessionCache;
 
@@ -179,6 +188,7 @@ private:
     uint64_t _cursorGen;
     int _cursorsOut;
     bool _dropQueuedIdentsAtSessionEnd = true;
+    Date_t _idleExpireTime;
 };
 
 /**
@@ -188,7 +198,7 @@ private:
 class WiredTigerSessionCache {
 public:
     WiredTigerSessionCache(WiredTigerKVEngine* engine);
-    WiredTigerSessionCache(WT_CONNECTION* conn);
+    WiredTigerSessionCache(WT_CONNECTION* conn, ClockSource* cs);
     ~WiredTigerSessionCache();
 
     /**
@@ -210,6 +220,16 @@ public:
      * shuttingDown, but otherwise is thread safe.
      */
     std::unique_ptr<WiredTigerSession, WiredTigerSessionDeleter> getSession();
+
+    /**
+     * Get a count of idle sessions in the session cache.
+     */
+    size_t getIdleSessionsCount();
+
+    /**
+     * Closes all cached sessions whose idle expiration time has been reached.
+     */
+    void closeExpiredIdleSessions(int64_t idleTimeMillis);
 
     /**
      * Free all cached sessions and ensures that previously acquired sessions will be freed on
@@ -285,14 +305,15 @@ public:
     }
 
 private:
-    WiredTigerKVEngine* _engine;  // not owned, might be NULL
-    WT_CONNECTION* _conn;         // not owned
+    WiredTigerKVEngine* _engine;      // not owned, might be NULL
+    WT_CONNECTION* _conn;             // not owned
+    ClockSource* const _clockSource;  // not owned
     WiredTigerSnapshotManager _snapshotManager;
 
     // Used as follows:
     //   The low 31 bits are a count of active calls to releaseSession.
     //   The high bit is a flag that is set if and only if we're shutting down.
-    AtomicUInt32 _shuttingDown;
+    AtomicWord<unsigned> _shuttingDown;
     static const uint32_t kShuttingDownMask = 1 << 31;
 
     stdx::mutex _cacheLock;
@@ -300,13 +321,13 @@ private:
     SessionCache _sessions;
 
     // Bumped when all open sessions need to be closed
-    AtomicUInt64 _epoch;  // atomic so we can check it outside of the lock
+    AtomicWord<unsigned long long> _epoch;  // atomic so we can check it outside of the lock
 
     // Bumped when all open cursors need to be closed
-    AtomicUInt64 _cursorEpoch;  // atomic so we can check it outside of the lock
+    AtomicWord<unsigned long long> _cursorEpoch;  // atomic so we can check it outside of the lock
 
     // Counter and critical section mutex for waitUntilDurable
-    AtomicUInt32 _lastSyncTime;
+    AtomicWord<unsigned> _lastSyncTime;
     stdx::mutex _lastSyncMutex;
 
     // Mutex and cond var for waiting on prepare commit or abort.

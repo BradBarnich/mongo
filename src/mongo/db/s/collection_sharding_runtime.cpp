@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -35,13 +37,41 @@
 #include "mongo/base/checked_cast.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/util/duration.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+MONGO_EXPORT_SERVER_PARAMETER(migrationLockAcquisitionMaxWaitMS, int, 500);
+
 namespace {
 
 // How long to wait before starting cleanup of an emigrated chunk range
 MONGO_EXPORT_SERVER_PARAMETER(orphanCleanupDelaySecs, int, 900);  // 900s = 15m
+
+/**
+ * Returns whether the specified namespace is used for sharding-internal purposes only and can never
+ * be marked as anything other than UNSHARDED, because the call sites which reference these
+ * collections are not prepared to handle StaleConfig errors.
+ */
+bool isNamespaceAlwaysUnsharded(const NamespaceString& nss) {
+    // There should never be a case to mark as sharded collections which are on the config server
+    if (serverGlobalParams.clusterRole != ClusterRole::ShardServer)
+        return true;
+
+    // Local and admin never have sharded collections
+    if (nss.db() == NamespaceString::kLocalDb || nss.db() == NamespaceString::kAdminDb)
+        return true;
+
+    // Certain config collections can never be sharded
+    if (nss == NamespaceString::kSessionTransactionsTableNamespace)
+        return true;
+
+    if (nss.isSystemDotProfile())
+        return true;
+
+    return false;
+}
 
 }  // namespace
 
@@ -49,8 +79,13 @@ CollectionShardingRuntime::CollectionShardingRuntime(ServiceContext* sc,
                                                      NamespaceString nss,
                                                      executor::TaskExecutor* rangeDeleterExecutor)
     : CollectionShardingState(nss),
+      _stateChangeMutex(nss.toString()),
       _nss(std::move(nss)),
-      _metadataManager(std::make_shared<MetadataManager>(sc, _nss, rangeDeleterExecutor)) {}
+      _metadataManager(std::make_shared<MetadataManager>(sc, _nss, rangeDeleterExecutor)) {
+    if (isNamespaceAlwaysUnsharded(_nss)) {
+        _metadataManager->setFilteringMetadata(CollectionMetadata());
+    }
+}
 
 CollectionShardingRuntime* CollectionShardingRuntime::get(OperationContext* opCtx,
                                                           const NamespaceString& nss) {
@@ -60,13 +95,17 @@ CollectionShardingRuntime* CollectionShardingRuntime::get(OperationContext* opCt
 
 void CollectionShardingRuntime::setFilteringMetadata(OperationContext* opCtx,
                                                      CollectionMetadata newMetadata) {
+    invariant(!newMetadata.isSharded() || !isNamespaceAlwaysUnsharded(_nss),
+              str::stream() << "Namespace " << _nss.ns() << " must never be sharded.");
     invariant(opCtx->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_X));
 
     _metadataManager->setFilteringMetadata(std::move(newMetadata));
 }
 
 void CollectionShardingRuntime::clearFilteringMetadata() {
-    _metadataManager->clearFilteringMetadata();
+    if (!isNamespaceAlwaysUnsharded(_nss)) {
+        _metadataManager->clearFilteringMetadata();
+    }
 }
 
 auto CollectionShardingRuntime::beginReceive(ChunkRange const& range) -> CleanupNotification {
@@ -79,8 +118,8 @@ void CollectionShardingRuntime::forgetReceive(const ChunkRange& range) {
 
 auto CollectionShardingRuntime::cleanUpRange(ChunkRange const& range, CleanWhen when)
     -> CleanupNotification {
-    Date_t time = (when == kNow) ? Date_t{} : Date_t::now() +
-            stdx::chrono::seconds{orphanCleanupDelaySecs.load()};
+    Date_t time =
+        (when == kNow) ? Date_t{} : Date_t::now() + Seconds(orphanCleanupDelaySecs.load());
     return _metadataManager->cleanUpRange(range, time);
 }
 
@@ -148,7 +187,13 @@ boost::optional<ScopedCollectionMetadata> CollectionShardingRuntime::_getMetadat
 
 CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx, NamespaceString ns)
     : _nss(std::move(ns)), _opCtx(opCtx) {
-    AutoGetCollection autoColl(_opCtx, _nss, MODE_IX, MODE_X);
+    AutoGetCollection autoColl(_opCtx,
+                               _nss,
+                               MODE_IX,
+                               MODE_X,
+                               AutoGetCollection::ViewMode::kViewsForbidden,
+                               opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                                   Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
     CollectionShardingState::get(opCtx, _nss)->enterCriticalSectionCatchUpPhase(_opCtx);
 }
 
@@ -159,7 +204,13 @@ CollectionCriticalSection::~CollectionCriticalSection() {
 }
 
 void CollectionCriticalSection::enterCommitPhase() {
-    AutoGetCollection autoColl(_opCtx, _nss, MODE_IX, MODE_X);
+    AutoGetCollection autoColl(_opCtx,
+                               _nss,
+                               MODE_IX,
+                               MODE_X,
+                               AutoGetCollection::ViewMode::kViewsForbidden,
+                               _opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                                   Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
     CollectionShardingState::get(_opCtx, _nss)->enterCriticalSectionCommitPhase(_opCtx);
 }
 

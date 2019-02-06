@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -46,7 +48,9 @@
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/explain_options.h"
+#include "mongo/db/resource_yielder.h"
 #include "mongo/db/storage/backup_cursor_state.h"
+#include "mongo/s/chunk_version.h"
 
 namespace mongo {
 
@@ -106,22 +110,29 @@ public:
     virtual bool isSharded(OperationContext* opCtx, const NamespaceString& ns) = 0;
 
     /**
-     * Inserts 'objs' into 'ns' and throws a UserException if the insert fails.
+     * Inserts 'objs' into 'ns' and throws a UserException if the insert fails. If 'targetEpoch' is
+     * set, throws ErrorCodes::StaleEpoch if the targeted collection does not have the same epoch or
+     * the epoch changes during the course of the insert.
      */
     virtual void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                         const NamespaceString& ns,
-                        std::vector<BSONObj>&& objs) = 0;
+                        std::vector<BSONObj>&& objs,
+                        const WriteConcernOptions& wc,
+                        boost::optional<OID> targetEpoch) = 0;
 
     /**
      * Updates the documents matching 'queries' with the objects 'updates'. Throws a UserException
-     * if any of the updates fail.
+     * if any of the updates fail. If 'targetEpoch' is set, throws ErrorCodes::StaleEpoch if the
+     * targeted collection does not have the same epoch, or if the epoch changes during the update.
      */
     virtual void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                         const NamespaceString& ns,
                         std::vector<BSONObj>&& queries,
                         std::vector<BSONObj>&& updates,
+                        const WriteConcernOptions& wc,
                         bool upsert,
-                        bool multi) = 0;
+                        bool multi,
+                        boost::optional<OID> targetEpoch) = 0;
 
     virtual CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
                                                   const NamespaceString& ns) = 0;
@@ -174,20 +185,24 @@ public:
      * - If opts.attachCursorSource is false, the pipeline will be returned without attempting to
      *   add an initial cursor source.
      *
-     * This function returns a non-OK status if parsing the pipeline failed.
+     * This function throws if parsing the pipeline failed.
      */
-    virtual StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> makePipeline(
+    virtual std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
         const std::vector<BSONObj>& rawPipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const MakePipelineOptions opts = MakePipelineOptions{}) = 0;
 
     /**
-     * Attaches a cursor source to the start of a pipeline. Performs no further optimization. This
-     * function asserts if the collection to be aggregated is sharded. NamespaceNotFound will be
-     * returned if ExpressionContext has a UUID and that UUID doesn't exist anymore. That should be
+     * Accepts a pipeline and returns a new one which will draw input from the underlying
+     * collection. Performs no further optimization of the pipeline. NamespaceNotFound will be
+     * thrown if ExpressionContext has a UUID and that UUID doesn't exist anymore. That should be
      * the only case where NamespaceNotFound is returned.
+     *
+     * This function takes ownership of the 'pipeline' argument as if it were a unique_ptr.
+     * Changing it to a unique_ptr introduces a circular dependency on certain platforms where the
+     * compiler expects to find an implementation of PipelineDeleter.
      */
-    virtual Status attachCursorSourceToPipeline(
+    virtual std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
         const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) = 0;
 
     /**
@@ -211,12 +226,26 @@ public:
     /**
      * Returns the fields of the document key (in order) for the collection corresponding to 'uuid',
      * including the shard key and _id. If _id is not in the shard key, it is added last. If the
-     * collection is not sharded or no longer exists, returns only _id. Also retrurns a boolean that
+     * collection is not sharded or no longer exists, returns only _id. Also returns a boolean that
      * indicates whether the returned fields of the document key are final and will never change for
      * the given collection, either because the collection was dropped or has become sharded.
+     *
+     * This method is meant to be called from a mongod which owns at least one chunk for this
+     * collection. It will inspect the CollectionShardingState, not the CatalogCache. If asked about
+     * a collection not hosted on this shard, the answer will be incorrect.
      */
-    virtual std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(
-        OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const = 0;
+    virtual std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFieldsForHostedCollection(
+        OperationContext* opCtx, const NamespaceString&, UUID) const = 0;
+
+    /**
+     * Returns the fields of the document key (in order) for the collection 'nss', according to the
+     * CatalogCache. The document key fields are the shard key (if sharded) and the _id (if not
+     * already in the shard key). If _id is not in the shard key, it is added last. If the
+     * collection is not sharded or is not known to exist, returns only _id. Does not refresh the
+     * CatalogCache.
+     */
+    virtual std::vector<FieldPath> collectDocumentKeyFieldsActingAsRouter(
+        OperationContext* opCtx, const NamespaceString&) const = 0;
 
     /**
      * Returns zero or one documents with the document key 'documentKey'. 'documentKey' is treated
@@ -229,7 +258,8 @@ public:
         const NamespaceString& nss,
         UUID,
         const Document& documentKey,
-        boost::optional<BSONObj> readConcern) = 0;
+        boost::optional<BSONObj> readConcern,
+        bool allowSpeculativeMajorityRead = false) = 0;
 
     /**
      * Returns a vector of all idle (non-pinned) local cursors.
@@ -243,7 +273,11 @@ public:
      */
     virtual BackupCursorState openBackupCursor(OperationContext* opCtx) = 0;
 
-    virtual void closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) = 0;
+    virtual void closeBackupCursor(OperationContext* opCtx, const UUID& backupId) = 0;
+
+    virtual BackupCursorExtendState extendBackupCursor(OperationContext* opCtx,
+                                                       const UUID& backupId,
+                                                       const Timestamp& extendTo) = 0;
 
     /**
      * Returns a vector of BSON objects, where each entry in the vector describes a plan cache entry
@@ -265,6 +299,27 @@ public:
     virtual bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                              const NamespaceString& nss,
                                              const std::set<FieldPath>& uniqueKeyPaths) const = 0;
+
+    /**
+     * Refreshes the CatalogCache entry for the namespace 'nss', and returns the epoch associated
+     * with that namespace, if any. Note that this refresh will not necessarily force a new
+     * request to be sent to the config servers. If another thread has already requested a refresh,
+     * it will instead wait for that response.
+     */
+    virtual boost::optional<ChunkVersion> refreshAndGetCollectionVersion(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const NamespaceString& nss) const = 0;
+
+    /**
+     * Consults the CatalogCache to determine if this node has routing information for the
+     * collection given by 'nss' which reports the same epoch as given by 'targetCollectionVersion'.
+     * Major and minor versions in 'targetCollectionVersion' are ignored.
+     */
+    virtual void checkRoutingInfoEpochOrThrow(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                              const NamespaceString& nss,
+                                              ChunkVersion targetCollectionVersion) const = 0;
+
+    virtual std::unique_ptr<ResourceYielder> getResourceYielder() const = 0;
 };
 
 }  // namespace mongo

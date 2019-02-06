@@ -28,13 +28,13 @@
     let firstTimestamp = PrepareHelpers.prepareTransaction(session);
     let secondTimestamp = PrepareHelpers.prepareTransaction(session);
     assert.eq(firstTimestamp, secondTimestamp);
-    session.abortTransaction();
+    session.abortTransaction_forTesting();
 
     jsTestLog("Test that you can call commitTransaction on a prepared transaction.");
     session.startTransaction();
     assert.commandWorked(sessionColl.insert({_id: 2}));
     let prepareTimestamp = PrepareHelpers.prepareTransaction(session);
-    assert.commandWorked(PrepareHelpers.commitTransaction(session, prepareTimestamp));
+    assert.commandWorked(PrepareHelpers.commitTransactionAfterPrepareTS(session, prepareTimestamp));
 
     jsTestLog("Test that you can call abortTransaction on a prepared transaction.");
     session.startTransaction();
@@ -71,7 +71,7 @@
         stmtId: NumberInt(1),
         autocommit: false
     }),
-                                 ErrorCodes.ConflictingOperationInProgress);
+                                 ErrorCodes.OperationNotSupportedInTransaction);
 
     jsTestLog("Test that you can't run find on a prepared transaction.");
     assert.commandFailedWithCode(assert.throws(function() {
@@ -83,7 +83,6 @@
     assert.commandFailedWithCode(sessionDB.runCommand({
         findandmodify: collName,
         remove: true,
-        readConcern: {level: "snapshot"},
         txnNumber: NumberLong(session.getTxnNumber_forTesting()),
         stmtId: NumberInt(1),
         autocommit: false
@@ -108,7 +107,7 @@
     jsTestLog("Test that you can't run update on a prepared transaction.");
     assert.commandFailedWithCode(sessionColl.update({_id: 4}, {a: 1}),
                                  ErrorCodes.PreparedTransactionInProgress);
-    session.abortTransaction();
+    session.abortTransaction_forTesting();
 
     jsTestLog("Test that you can't run getMore on a prepared transaction.");
     session.startTransaction();
@@ -124,7 +123,7 @@
     assert.commandFailedWithCode(
         sessionDB.runCommand({killCursors: collName, cursors: [res.cursor.id]}),
         ErrorCodes.PreparedTransactionInProgress);
-    session.abortTransaction();
+    session.abortTransaction_forTesting();
 
     session.endSession();
 }());

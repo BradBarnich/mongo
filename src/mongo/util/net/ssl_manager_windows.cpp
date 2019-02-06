@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
@@ -46,6 +48,7 @@
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
@@ -64,10 +67,9 @@
 
 namespace mongo {
 
-namespace {
+extern SSLManagerInterface* theSSLManager;
 
-SimpleMutex sslManagerMtx;
-SSLManagerInterface* theSSLManager = NULL;
+namespace {
 
 /**
 * Free a Certificate Context.
@@ -342,8 +344,8 @@ private:
     UniqueCertificate _sslClusterCertificate;
 };
 
-MONGO_INITIALIZER(SSLManager)(InitializerContext*) {
-    stdx::lock_guard<SimpleMutex> lck(sslManagerMtx);
+MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("EndStartupOptionHandling"))
+(InitializerContext*) {
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
         theSSLManager = new SSLManagerWindows(sslGlobalParams, isSSLServer);
     }
@@ -374,13 +376,6 @@ bool isSSLServer = false;
 std::unique_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
     return stdx::make_unique<SSLManagerWindows>(params, isServer);
-}
-
-SSLManagerInterface* getSSLManager() {
-    stdx::lock_guard<SimpleMutex> lck(sslManagerMtx);
-    if (theSSLManager)
-        return theSSLManager;
-    return NULL;
 }
 
 namespace {
@@ -415,10 +410,12 @@ SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
         uassertStatusOK(initSSLContext(&_serverCred, params, ConnectionDirection::kIncoming));
 
         if (_serverCertificates[0] != nullptr) {
+            SSLX509Name subjectName;
             uassertStatusOK(
                 _validateCertificate(_serverCertificates[0],
-                                     &_sslConfiguration.serverSubjectName,
+                                     &subjectName,
                                      &_sslConfiguration.serverCertificateExpirationDate));
+            uassertStatusOK(_sslConfiguration.setServerSubjectName(std::move(subjectName)));
         }
 
         // Monitor the server certificate's expiration
@@ -802,10 +799,13 @@ StatusWith<UniqueCertificateWithPrivateKey> readCertPEMFile(StringData fileName,
     // Create the right Crypto context depending on whether we running in a server or outside.
     // See https://msdn.microsoft.com/en-us/library/windows/desktop/aa375195(v=vs.85).aspx
     if (isSSLServer) {
-        // Generate a unique name for our key container
+        // Generate a unique name for each key container
         // Use the the log file if possible
         if (!serverGlobalParams.logpath.empty()) {
-            wstr = toNativeString(serverGlobalParams.logpath.c_str());
+            static AtomicWord<int> counter{0};
+            std::string keyContainerName = str::stream() << serverGlobalParams.logpath
+                                                         << counter.fetchAndAdd(1);
+            wstr = toNativeString(keyContainerName.c_str());
         } else {
             auto us = UUID::gen().toString();
             wstr = toNativeString(us.c_str());
@@ -1481,6 +1481,7 @@ Status SSLManagerWindows::_validateCertificate(PCCERT_CONTEXT cert,
             Date_t::fromMillisSinceEpoch(FiletimeToEpocMillis(cert->pCertInfo->NotAfter));
     }
 
+    uassertStatusOK(subjectName->normalizeStrings());
     return Status::OK();
 }
 
@@ -1691,6 +1692,7 @@ Status validatePeerCertificate(const std::string& remoteHost,
             return Status(ErrorCodes::SSLHandshakeFailed, msg);
         }
     }
+    uassertStatusOK(peerSubjectName->normalizeStrings());
     return Status::OK();
 }
 
@@ -1788,6 +1790,11 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManagerWindows::parseAndValidatePeer
     }
 
     LOG(2) << "Accepted TLS connection from peer: " << peerSubjectName;
+
+    // If this is a server and client and server certificate are the same, log a warning.
+    if (remoteHost.empty() && _sslConfiguration.serverSubjectName() == peerSubjectName) {
+        warning() << "Client connecting with server's own TLS certificate";
+    }
 
     // On the server side, parse the certificate for roles
     if (remoteHost.empty()) {

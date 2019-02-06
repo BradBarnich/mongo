@@ -1,35 +1,37 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
+#include <map>
 #include <memory>
-#include <set>
 #include <vector>
 
 #include <poll.h>
@@ -53,7 +55,7 @@ namespace transport {
  *
  * We implement our networking reactor on top of poll + eventfd for wakeups
  */
-class TransportLayerASIO::BatonASIO : public Baton {
+class TransportLayerASIO::BatonASIO : public NetworkingBaton {
     /**
      * We use this internal reactor timer to exit run_until calls (by forcing an early timeout for
      * ::poll).
@@ -79,7 +81,8 @@ class TransportLayerASIO::BatonASIO : public Baton {
     struct EventFDHolder {
         EventFDHolder() : fd(::eventfd(0, EFD_CLOEXEC)) {
             if (fd < 0) {
-                severe() << "error in eventfd: " << errnoWithDescription(errno);
+                auto ewd = errnoWithDescription();
+                severe() << "error in eventfd: " << ewd;
                 fassertFailed(50833);
             }
         }
@@ -115,6 +118,8 @@ class TransportLayerASIO::BatonASIO : public Baton {
         }
 
         const int fd;
+
+        static const Client::Decoration<EventFDHolder> getForClient;
     };
 
 public:
@@ -127,74 +132,69 @@ public:
         invariant(_timers.empty());
     }
 
-    void detach() override {
-        {
-            stdx::lock_guard<stdx::mutex> lk(_mutex);
-            invariant(_sessions.empty());
-            invariant(_scheduled.empty());
-            invariant(_timers.empty());
-        }
+    void markKillOnClientDisconnect() noexcept override {
+        if (_opCtx->getClient() && _opCtx->getClient()->session()) {
+            addSessionImpl(*(_opCtx->getClient()->session()), POLLRDHUP).getAsync([this](Status s) {
+                if (!s.isOK()) {
+                    return;
+                }
 
-        {
-            stdx::lock_guard<Client> lk(*_opCtx->getClient());
-            invariant(_opCtx->getBaton().get() == this);
-            _opCtx->setBaton(nullptr);
-        }
-
-        _opCtx = nullptr;
-    }
-
-    Future<void> addSession(Session& session, Type type) override {
-        auto fd = checked_cast<ASIOSession&>(session).getSocket().native_handle();
-        auto pf = makePromiseFuture<void>();
-
-        _safeExecute([ fd, type, sp = pf.promise.share(), this ] {
-            _sessions[fd] = TransportSession{type, sp};
-        });
-
-        return std::move(pf.future);
-    }
-
-    Future<void> waitUntil(const ReactorTimer& timer, Date_t expiration) override {
-        auto pf = makePromiseFuture<void>();
-        _safeExecute([ timerPtr = &timer, expiration, sp = pf.promise.share(), this ] {
-            auto pair = _timers.insert({
-                timerPtr, expiration, sp,
+                _opCtx->markKilled(ErrorCodes::ClientDisconnect);
             });
-            invariant(pair.second);
-            _timersById[pair.first->id] = pair.first;
-        });
-
-        return std::move(pf.future);
+        }
     }
 
-    bool cancelSession(Session& session) override {
-        const auto fd = checked_cast<ASIOSession&>(session).getSocket().native_handle();
+    Future<void> addSession(Session& session, Type type) noexcept override {
+        return addSessionImpl(session, type == Type::In ? POLLIN : POLLOUT);
+    }
+
+    Future<void> waitUntil(const ReactorTimer& timer, Date_t expiration) noexcept override {
+        auto pf = makePromiseFuture<void>();
+        auto id = timer.id();
 
         stdx::unique_lock<stdx::mutex> lk(_mutex);
 
-        if (_sessions.find(fd) == _sessions.end()) {
+        if (!_opCtx) {
+            return Status(ErrorCodes::ShutdownInProgress,
+                          "baton is detached, cannot waitUntil on timer");
+        }
+
+        _safeExecute(std::move(lk),
+                     [ id, expiration, promise = std::move(pf.promise), this ]() mutable {
+                         auto iter = _timers.emplace(std::piecewise_construct,
+                                                     std::forward_as_tuple(expiration),
+                                                     std::forward_as_tuple(id, std::move(promise)));
+                         _timersById[id] = iter;
+                     });
+
+        return std::move(pf.future);
+    }
+
+    bool cancelSession(Session& session) noexcept override {
+        const auto id = session.id();
+
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
+
+        if (_sessions.find(id) == _sessions.end()) {
             return false;
         }
 
-        // TODO: There's an ABA issue here with fds where between previously and before we could
-        // have removed the fd, then opened and added a new socket with the same fd.  We need to
-        // solve it via using session id's for handles.
-        _safeExecute(std::move(lk), [fd, this] { _sessions.erase(fd); });
+        _safeExecute(std::move(lk), [id, this] { _sessions.erase(id); });
 
         return true;
     }
 
-    bool cancelTimer(const ReactorTimer& timer) override {
+    bool cancelTimer(const ReactorTimer& timer) noexcept override {
+        const auto id = timer.id();
+
         stdx::unique_lock<stdx::mutex> lk(_mutex);
 
-        if (_timersById.find(&timer) == _timersById.end()) {
+        if (_timersById.find(id) == _timersById.end()) {
             return false;
         }
 
-        // TODO: Same ABA issue as above, but for pointers.
-        _safeExecute(std::move(lk), [ timerPtr = &timer, this ] {
-            auto iter = _timersById.find(timerPtr);
+        _safeExecute(std::move(lk), [id, this] {
+            auto iter = _timersById.find(id);
 
             if (iter != _timersById.end()) {
                 _timers.erase(iter->second);
@@ -205,18 +205,24 @@ public:
         return true;
     }
 
-    void schedule(unique_function<void()> func) override {
+    void schedule(unique_function<void(OperationContext*)> func) noexcept override {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+        if (!_opCtx) {
+            func(nullptr);
+
+            return;
+        }
 
         _scheduled.push_back(std::move(func));
 
         if (_inPoll) {
-            _efd.notify();
+            efd().notify();
         }
     }
 
     void notify() noexcept override {
-        schedule([] {});
+        efd().notify();
     }
 
     /**
@@ -242,10 +248,10 @@ public:
     }
 
     void run(ClockSource* clkSource) noexcept override {
-        std::vector<SharedPromise<void>> toFulfill;
+        std::vector<Promise<void>> toFulfill;
 
         // We'll fulfill promises and run jobs on the way out, ensuring we don't hold any locks
-        const auto guard = MakeGuard([&] {
+        const auto guard = makeGuard([&] {
             for (auto& promise : toFulfill) {
                 promise.emplaceValue();
             }
@@ -260,7 +266,7 @@ public:
 
                 lk.unlock();
                 for (auto& job : toRun) {
-                    job();
+                    job(_opCtx);
                 }
                 lk.lock();
             }
@@ -277,21 +283,19 @@ public:
 
         // If we have a timer, poll no longer than that
         if (_timers.size()) {
-            deadline = _timers.begin()->expiration;
+            deadline = _timers.begin()->first;
         }
 
         std::vector<decltype(_sessions)::iterator> sessions;
         sessions.reserve(_sessions.size());
         std::vector<pollfd> pollSet;
+
         pollSet.reserve(_sessions.size() + 1);
 
-        pollSet.push_back(pollfd{_efd.fd, POLLIN, 0});
+        pollSet.push_back(pollfd{efd().fd, POLLIN, 0});
 
         for (auto iter = _sessions.begin(); iter != _sessions.end(); ++iter) {
-            pollSet.push_back(
-                pollfd{iter->first,
-                       static_cast<short>(iter->second.type == Type::In ? POLLIN : POLLOUT),
-                       0});
+            pollSet.push_back(pollfd{iter->second.fd, iter->second.type, 0});
             sessions.push_back(iter);
         }
 
@@ -312,7 +316,7 @@ public:
                           pollSet.size(),
                           deadline ? Milliseconds(*deadline - now).count() : -1);
 
-            const auto pollGuard = MakeGuard([&] {
+            const auto pollGuard = makeGuard([&] {
                 lk.lock();
                 _inPoll = false;
             });
@@ -327,9 +331,9 @@ public:
         now = clkSource->now();
 
         // Fire expired timers
-        for (auto iter = _timers.begin(); iter != _timers.end() && iter->expiration < now;) {
-            toFulfill.push_back(std::move(iter->promise));
-            _timersById.erase(iter->id);
+        for (auto iter = _timers.begin(); iter != _timers.end() && iter->first < now;) {
+            toFulfill.push_back(std::move(iter->second.promise));
+            _timersById.erase(iter->second.id);
             iter = _timers.erase(iter);
         }
 
@@ -340,12 +344,13 @@ public:
             auto pollIter = pollSet.begin();
 
             if (pollIter->revents) {
-                _efd.wait();
+                efd().wait();
 
                 remaining--;
             }
 
             ++pollIter;
+
             for (auto sessionIter = sessions.begin(); sessionIter != sessions.end() && remaining;
                  ++sessionIter, ++pollIter) {
                 if (pollIter->revents) {
@@ -363,27 +368,74 @@ public:
     }
 
 private:
-    struct Timer {
-        const ReactorTimer* id;
-        Date_t expiration;
-        SharedPromise<void> promise;
+    Future<void> addSessionImpl(Session& session, short type) noexcept {
+        auto fd = checked_cast<ASIOSession&>(session).getSocket().native_handle();
+        auto id = session.id();
+        auto pf = makePromiseFuture<void>();
 
-        struct LessThan {
-            bool operator()(const Timer& lhs, const Timer& rhs) const {
-                return std::tie(lhs.expiration, lhs.id) < std::tie(rhs.expiration, rhs.id);
+        stdx::unique_lock<stdx::mutex> lk(_mutex);
+
+        if (!_opCtx) {
+            return Status(ErrorCodes::ShutdownInProgress, "baton is detached, cannot addSession");
+        }
+
+        _safeExecute(std::move(lk),
+                     [ id, fd, type, promise = std::move(pf.promise), this ]() mutable {
+                         _sessions[id] = TransportSession{fd, type, std::move(promise)};
+                     });
+
+        return std::move(pf.future);
+    }
+
+    void detachImpl() noexcept override {
+        decltype(_sessions) sessions;
+        decltype(_scheduled) scheduled;
+        decltype(_timers) timers;
+
+        {
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+            {
+                stdx::lock_guard<Client> lk(*_opCtx->getClient());
+                invariant(_opCtx->getBaton().get() == this);
+                _opCtx->setBaton(nullptr);
             }
-        };
+
+            _opCtx = nullptr;
+
+            using std::swap;
+            swap(_sessions, sessions);
+            swap(_scheduled, scheduled);
+            swap(_timers, timers);
+        }
+
+        for (auto& job : scheduled) {
+            job(nullptr);
+        }
+
+        for (auto& session : sessions) {
+            session.second.promise.setError(Status(ErrorCodes::ShutdownInProgress,
+                                                   "baton is detached, cannot wait for socket"));
+        }
+
+        for (auto& pair : timers) {
+            pair.second.promise.setError(Status(ErrorCodes::ShutdownInProgress,
+                                                "baton is detached, completing timer early"));
+        }
+    }
+
+    struct Timer {
+        Timer(size_t id, Promise<void> promise) : id(id), promise(std::move(promise)) {}
+
+        size_t id;
+        Promise<void> promise;  // Needs to be mutable to move from it while in std::set.
     };
 
     struct TransportSession {
-        Type type;
-        SharedPromise<void> promise;
+        int fd;
+        short type;
+        Promise<void> promise;
     };
-
-    template <typename Callback>
-    void _safeExecute(Callback&& cb) {
-        return _safeExecute(stdx::unique_lock<stdx::mutex>(_mutex), std::forward<Callback>(cb));
-    }
 
     /**
      * Safely executes method on the reactor.  If we're in poll, we schedule a task, then write to
@@ -392,15 +444,20 @@ private:
     template <typename Callback>
     void _safeExecute(stdx::unique_lock<stdx::mutex> lk, Callback&& cb) {
         if (_inPoll) {
-            _scheduled.push_back([cb, this] {
-                stdx::lock_guard<stdx::mutex> lk(_mutex);
-                cb();
-            });
+            _scheduled.push_back(
+                [ cb = std::forward<Callback>(cb), this ](OperationContext*) mutable {
+                    stdx::lock_guard<stdx::mutex> lk(_mutex);
+                    cb();
+                });
 
-            _efd.notify();
+            efd().notify();
         } else {
             cb();
         }
+    }
+
+    EventFDHolder& efd() {
+        return EventFDHolder::getForClient(_opCtx->getClient());
     }
 
     stdx::mutex _mutex;
@@ -409,20 +466,22 @@ private:
 
     bool _inPoll = false;
 
-    EventFDHolder _efd;
-
     // This map stores the sessions we need to poll on. We unwind it into a pollset for every
     // blocking call to run
-    stdx::unordered_map<int, TransportSession> _sessions;
+    stdx::unordered_map<SessionId, TransportSession> _sessions;
 
     // The set is used to find the next timer which will fire.  The unordered_map looks up the
     // timers so we can remove them in O(1)
-    std::set<Timer, Timer::LessThan> _timers;
-    stdx::unordered_map<const ReactorTimer*, decltype(_timers)::const_iterator> _timersById;
+    std::multimap<Date_t, Timer> _timers;
+    stdx::unordered_map<size_t, decltype(_timers)::const_iterator> _timersById;
 
     // For tasks that come in via schedule.  Or that were deferred because we were in poll
-    std::vector<unique_function<void()>> _scheduled;
+    std::vector<unique_function<void(OperationContext*)>> _scheduled;
 };
+
+const Client::Decoration<TransportLayerASIO::BatonASIO::EventFDHolder>
+    TransportLayerASIO::BatonASIO::EventFDHolder::getForClient =
+        Client::declareDecoration<TransportLayerASIO::BatonASIO::EventFDHolder>();
 
 }  // namespace transport
 }  // namespace mongo

@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
@@ -38,8 +40,9 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/exec/pipeline_proxy.h"
+#include "mongo/db/exec/change_stream_proxy.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/accumulator.h"
@@ -60,6 +63,7 @@
 #include "mongo/db/read_concern.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
@@ -136,6 +140,7 @@ bool handleCursorCommand(OperationContext* opCtx,
     invariant(cursor);
 
     BSONObj next;
+    bool stashedResult = false;
     for (int objCount = 0; objCount < batchSize; objCount++) {
         // The initial getNext() on a PipelineProxyStage may be very expensive so we don't
         // do it when batchSize is 0 since that indicates a desire for a fast return.
@@ -152,8 +157,6 @@ bool handleCursorCommand(OperationContext* opCtx,
         }
 
         if (state == PlanExecutor::IS_EOF) {
-            responseBuilder.setLatestOplogTimestamp(
-                cursor->getExecutor()->getLatestOplogTimestamp());
             if (!cursor->isTailable()) {
                 // make it an obvious error to use cursor or executor after this point
                 cursor = nullptr;
@@ -170,14 +173,27 @@ bool handleCursorCommand(OperationContext* opCtx,
         // for later.
         if (!FindCommon::haveSpaceForNext(next, objCount, responseBuilder.bytesUsed())) {
             cursor->getExecutor()->enqueue(next);
+            stashedResult = true;
             break;
         }
 
+        // TODO SERVER-38539: We need to set both the latestOplogTimestamp and the PBRT until the
+        // former is removed in a future release.
         responseBuilder.setLatestOplogTimestamp(cursor->getExecutor()->getLatestOplogTimestamp());
+        responseBuilder.setPostBatchResumeToken(cursor->getExecutor()->getPostBatchResumeToken());
         responseBuilder.append(next);
     }
 
     if (cursor) {
+        // For empty batches, or in the case where the final result was added to the batch rather
+        // than being stashed, we update the PBRT to ensure that it is the most recent available.
+        const auto* exec = cursor->getExecutor();
+        if (!stashedResult) {
+            // TODO SERVER-38539: We need to set both the latestOplogTimestamp and the PBRT until
+            // the former is removed in a future release.
+            responseBuilder.setLatestOplogTimestamp(exec->getLatestOplogTimestamp());
+            responseBuilder.setPostBatchResumeToken(exec->getPostBatchResumeToken());
+        }
         // If a time limit was set on the pipeline, remaining time is "rolled over" to the
         // cursor (for use by future getmore ops).
         cursor->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
@@ -338,6 +354,38 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
 
     return expCtx;
 }
+
+/**
+ * Upconverts the read concern for a change stream aggregation, if necesssary.
+ *
+ * If there is no given read concern level on the given object, upgrades the level to 'majority' and
+ * waits for read concern. If a read concern level is already specified on the given read concern
+ * object, this method does nothing.
+ */
+void _adjustChangeStreamReadConcern(OperationContext* opCtx) {
+    repl::ReadConcernArgs& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    // There is already a read concern level set. Do nothing.
+    if (readConcernArgs.hasLevel()) {
+        return;
+    }
+    // We upconvert an empty read concern to 'majority'.
+    {
+        // We must obtain the client lock to set the ReadConcernArgs on the operation
+        // context as it may be concurrently read by CurrentOp.
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        readConcernArgs = repl::ReadConcernArgs(repl::ReadConcernLevel::kMajorityReadConcern);
+
+        // Change streams are allowed to use the speculative majority read mechanism, if
+        // the storage engine doesn't support majority reads directly.
+        if (!serverGlobalParams.enableMajorityReadConcern) {
+            readConcernArgs.setMajorityReadMechanism(
+                repl::ReadConcernArgs::MajorityReadMechanism::kSpeculative);
+        }
+    }
+    // Wait for read concern again since we changed the original read concern.
+    uassertStatusOK(waitForReadConcern(opCtx, readConcernArgs, true));
+}
+
 }  // namespace
 
 Status runAggregate(OperationContext* opCtx,
@@ -364,7 +412,8 @@ Status runAggregate(OperationContext* opCtx,
 
         try {
             // Check whether the parsed pipeline supports the given read concern.
-            liteParsedPipeline.assertSupportsReadConcern(opCtx, request.getExplain());
+            liteParsedPipeline.assertSupportsReadConcern(
+                opCtx, request.getExplain(), serverGlobalParams.enableMajorityReadConcern);
         } catch (const DBException& ex) {
             auto txnParticipant = TransactionParticipant::get(opCtx);
             // If we are in a multi-document transaction, we intercept the 'readConcern'
@@ -379,16 +428,10 @@ Status runAggregate(OperationContext* opCtx,
         if (liteParsedPipeline.hasChangeStream()) {
             nss = NamespaceString::kRsOplogNamespace;
 
-            // If the read concern is not specified, upgrade to 'majority' and wait to make sure we
-            // have a snapshot available.
-            auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-            if (!readConcernArgs.hasLevel()) {
-                readConcernArgs =
-                    repl::ReadConcernArgs(repl::ReadConcernLevel::kMajorityReadConcern);
-                uassertStatusOK(waitForReadConcern(opCtx, readConcernArgs, true));
-            }
+            // Upgrade and wait for read concern if necessary.
+            _adjustChangeStreamReadConcern(opCtx);
 
-            if (!origNss.isCollectionlessAggregateNS()) {
+            if (liteParsedPipeline.shouldResolveUUIDAndCollation()) {
                 // AutoGetCollectionForReadCommand will raise an error if 'origNss' is a view.
                 AutoGetCollectionForReadCommand origNssCtx(opCtx, origNss);
 
@@ -418,7 +461,11 @@ Status runAggregate(OperationContext* opCtx,
         // If this is a collectionless aggregation with no foreign namespaces, we don't want to
         // acquire any locks. Otherwise, lock the collection or view.
         if (nss.isCollectionlessAggregateNS() && pipelineInvolvedNamespaces.empty()) {
-            statsTracker.emplace(opCtx, nss, Top::LockType::NotLocked, 0);
+            statsTracker.emplace(opCtx,
+                                 nss,
+                                 Top::LockType::NotLocked,
+                                 AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                 0);
         } else {
             ctx.emplace(opCtx, nss, AutoGetCollection::ViewMode::kViewsPermitted);
         }
@@ -533,8 +580,8 @@ Status runAggregate(OperationContext* opCtx,
 
                 // Create a new pipeline for the consumer consisting of a single
                 // DocumentSourceExchange.
-                boost::intrusive_ptr<DocumentSource> consumer =
-                    new DocumentSourceExchange(expCtx, exchange, idx);
+                boost::intrusive_ptr<DocumentSource> consumer = new DocumentSourceExchange(
+                    expCtx, exchange, idx, expCtx->mongoProcessInterface->getResourceYielder());
                 pipelines.emplace_back(uassertStatusOK(Pipeline::create({consumer}, expCtx)));
             }
         } else {
@@ -544,8 +591,9 @@ Status runAggregate(OperationContext* opCtx,
         for (size_t idx = 0; idx < pipelines.size(); ++idx) {
             // Transfer ownership of the Pipeline to the PipelineProxyStage.
             auto ws = make_unique<WorkingSet>();
-            auto proxy =
-                make_unique<PipelineProxyStage>(opCtx, std::move(pipelines[idx]), ws.get());
+            auto proxy = liteParsedPipeline.hasChangeStream()
+                ? make_unique<ChangeStreamProxyStage>(opCtx, std::move(pipelines[idx]), ws.get())
+                : make_unique<PipelineProxyStage>(opCtx, std::move(pipelines[idx]), ws.get());
 
             // This PlanExecutor will simply forward requests to the Pipeline, so does not need to
             // yield or to be registered with any collection's CursorManager to receive
@@ -575,21 +623,20 @@ Status runAggregate(OperationContext* opCtx,
     std::vector<ClientCursorPin> pins;
     std::vector<ClientCursor*> cursors;
 
-    ScopeGuard cursorFreer = MakeGuard(
-        [](std::vector<ClientCursorPin>* pins) {
-            for (auto& p : *pins) {
-                p.deleteUnderlying();
-            }
-        },
-        &pins);
+    auto cursorFreer = makeGuard([&] {
+        for (auto& p : pins) {
+            p.deleteUnderlying();
+        }
+    });
 
     for (size_t idx = 0; idx < execs.size(); ++idx) {
         ClientCursorParams cursorParams(
             std::move(execs[idx]),
             origNss,
             AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-            repl::ReadConcernArgs::get(opCtx).getLevel(),
-            cmdObj);
+            repl::ReadConcernArgs::get(opCtx),
+            cmdObj,
+            ClientCursorParams::LockPolicy::kLocksInternally);
         if (expCtx->tailableMode == TailableModeEnum::kTailable) {
             cursorParams.setTailable(true);
         } else if (expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData) {
@@ -613,7 +660,7 @@ Status runAggregate(OperationContext* opCtx,
         const bool keepCursor =
             handleCursorCommand(opCtx, origNss, std::move(cursors), request, result);
         if (keepCursor) {
-            cursorFreer.Dismiss();
+            cursorFreer.dismiss();
         }
     }
 

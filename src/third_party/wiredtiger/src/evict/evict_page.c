@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -22,7 +22,7 @@ __evict_exclusive_clear(
 {
 	WT_ASSERT(session, ref->state == WT_REF_LOCKED && ref->page != NULL);
 
-	ref->state = previous_state;
+	WT_REF_SET_STATE(ref, previous_state);
 }
 
 /*
@@ -38,7 +38,7 @@ __evict_exclusive(WT_SESSION_IMPL *session, WT_REF *ref)
 	 * Check for a hazard pointer indicating another thread is using the
 	 * page, meaning the page cannot be evicted.
 	 */
-	if (__wt_hazard_check(session, ref) == NULL)
+	if (__wt_hazard_check(session, ref, NULL) == NULL)
 		return (0);
 
 	WT_STAT_DATA_INCR(session, cache_eviction_hazard);
@@ -77,7 +77,7 @@ __wt_page_release_evict(WT_SESSION_IMPL *session, WT_REF *ref)
 		locked = true;
 	if ((ret = __wt_hazard_clear(session, ref)) != 0 || !locked) {
 		if (locked)
-			ref->state = previous_state;
+			WT_REF_SET_STATE(ref, previous_state);
 		return (ret == 0 ? EBUSY : ret);
 	}
 
@@ -231,8 +231,7 @@ __wt_evict(WT_SESSION_IMPL *session,
 
 	if (0) {
 err:		if (!closing)
-			__evict_exclusive_clear(
-			    session, ref, previous_state);
+			__evict_exclusive_clear(session, ref, previous_state);
 
 		WT_STAT_CONN_INCR(session, cache_eviction_fail);
 		WT_STAT_DATA_INCR(session, cache_eviction_fail);
@@ -294,7 +293,7 @@ __evict_delete_ref(WT_SESSION_IMPL *session, WT_REF *ref, bool closing)
 		}
 	}
 
-	WT_PUBLISH(ref->state, WT_REF_DELETED);
+	WT_REF_SET_STATE(ref, WT_REF_DELETED);
 	return (0);
 }
 
@@ -317,7 +316,7 @@ __evict_page_clean_update(WT_SESSION_IMPL *session, WT_REF *ref, bool closing)
 	    F_ISSET(session->dhandle, WT_DHANDLE_DEAD) ||
 	    (ref->page_las != NULL && ref->page_las->eviction_to_lookaside) ||
 	    __wt_txn_visible_all(session, ref->page->modify->rec_max_txn,
-	    WT_TIMESTAMP_NULL(&ref->page->modify->rec_max_timestamp)));
+	    ref->page->modify->rec_max_timestamp));
 
 	/*
 	 * Discard the page and update the reference structure. If evicting a
@@ -332,13 +331,13 @@ __evict_page_clean_update(WT_SESSION_IMPL *session, WT_REF *ref, bool closing)
 	    ref->page_las->eviction_to_lookaside &&
 	    __wt_page_las_active(session, ref)) {
 		ref->page_las->eviction_to_lookaside = false;
-		WT_PUBLISH(ref->state, WT_REF_LOOKASIDE);
+		WT_REF_SET_STATE(ref, WT_REF_LOOKASIDE);
 	} else if (ref->addr == NULL) {
 		WT_WITH_PAGE_INDEX(session,
 		    ret = __evict_delete_ref(session, ref, closing));
 		WT_RET_BUSY_OK(ret);
 	} else
-		WT_PUBLISH(ref->state, WT_REF_DISK);
+		WT_REF_SET_STATE(ref, WT_REF_DISK);
 
 	return (0);
 }
@@ -428,10 +427,10 @@ __evict_page_dirty_update(WT_SESSION_IMPL *session, WT_REF *ref, bool closing)
 				*ref->page_las = mod->mod_page_las;
 				__wt_page_modify_clear(session, ref->page);
 				__wt_ref_out(session, ref);
-				WT_PUBLISH(ref->state, WT_REF_LOOKASIDE);
+				WT_REF_SET_STATE(ref, WT_REF_LOOKASIDE);
 			} else {
 				__wt_ref_out(session, ref);
-				WT_PUBLISH(ref->state, WT_REF_DISK);
+				WT_REF_SET_STATE(ref, WT_REF_DISK);
 			}
 		} else {
 			/*
@@ -670,7 +669,7 @@ __evict_review(
 	 */
 	if (WT_SESSION_BTREE_SYNC(session) && !__wt_page_is_modified(page) &&
 	    !__wt_txn_visible_all(session, page->modify->rec_max_txn,
-	    WT_TIMESTAMP_NULL(&page->modify->rec_max_timestamp)))
+	    page->modify->rec_max_timestamp))
 		return (__wt_set_return(session, EBUSY));
 
 	/*

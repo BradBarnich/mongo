@@ -49,13 +49,11 @@ executor:
       syncdelay: 5
       set_parameters:
         enableTestCommands: 1
-        numInitialSyncAttempts: 1
         logComponentVerbosity:
           replication:
             heartbeats: 2
             rollback: 2
           storage:
             recovery: 2
-        failpoint.skipShardingPartsOfPrepareTransaction: "{mode:'alwaysOn'}"
     num_nodes: 2
     voting_secondaries: false

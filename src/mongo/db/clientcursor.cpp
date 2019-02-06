@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2008, 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -45,6 +47,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/cursor_server_params.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/query/explain.h"
@@ -77,7 +80,6 @@ long long ClientCursor::totalOpen() {
 }
 
 ClientCursor::ClientCursor(ClientCursorParams params,
-                           CursorManager* cursorManager,
                            CursorId cursorId,
                            OperationContext* operationUsingCursor,
                            Date_t now)
@@ -86,16 +88,15 @@ ClientCursor::ClientCursor(ClientCursorParams params,
       _authenticatedUsers(std::move(params.authenticatedUsers)),
       _lsid(operationUsingCursor->getLogicalSessionId()),
       _txnNumber(operationUsingCursor->getTxnNumber()),
-      _readConcernLevel(params.readConcernLevel),
-      _cursorManager(cursorManager),
+      _readConcernArgs(params.readConcernArgs),
       _originatingCommand(params.originatingCommandObj),
       _queryOptions(params.queryOptions),
+      _lockPolicy(params.lockPolicy),
       _exec(std::move(params.exec)),
       _operationUsingCursor(operationUsingCursor),
       _lastUseDate(now),
       _createdDate(now),
       _planSummary(Explain::getPlanSummary(_exec.get())) {
-    invariant(_cursorManager);
     invariant(_exec);
     invariant(_operationUsingCursor);
 
@@ -128,7 +129,7 @@ void ClientCursor::dispose(OperationContext* opCtx) {
         return;
     }
 
-    _exec->dispose(opCtx, _cursorManager);
+    _exec->dispose(opCtx);
     _disposed = true;
 }
 
@@ -156,11 +157,12 @@ GenericCursor ClientCursor::toGenericCursor() const {
 // Pin methods
 //
 
-ClientCursorPin::ClientCursorPin(OperationContext* opCtx, ClientCursor* cursor)
-    : _opCtx(opCtx), _cursor(cursor) {
+ClientCursorPin::ClientCursorPin(OperationContext* opCtx,
+                                 ClientCursor* cursor,
+                                 CursorManager* cursorManager)
+    : _opCtx(opCtx), _cursor(cursor), _cursorManager(cursorManager) {
     invariant(_cursor);
     invariant(_cursor->_operationUsingCursor);
-    invariant(_cursor->_cursorManager);
     invariant(!_cursor->_disposed);
 
     // We keep track of the number of cursors currently pinned. The cursor can become unpinned
@@ -171,7 +173,7 @@ ClientCursorPin::ClientCursorPin(OperationContext* opCtx, ClientCursor* cursor)
 }
 
 ClientCursorPin::ClientCursorPin(ClientCursorPin&& other)
-    : _opCtx(other._opCtx), _cursor(other._cursor) {
+    : _opCtx(other._opCtx), _cursor(other._cursor), _cursorManager(other._cursorManager) {
     // The pinned cursor is being transferred to us from another pin. The 'other' pin must have a
     // pinned cursor.
     invariant(other._cursor);
@@ -180,6 +182,7 @@ ClientCursorPin::ClientCursorPin(ClientCursorPin&& other)
     // Be sure to set the 'other' pin's cursor to null in order to transfer ownership to ourself.
     other._cursor = nullptr;
     other._opCtx = nullptr;
+    other._cursorManager = nullptr;
 }
 
 ClientCursorPin& ClientCursorPin::operator=(ClientCursorPin&& other) {
@@ -202,6 +205,9 @@ ClientCursorPin& ClientCursorPin::operator=(ClientCursorPin&& other) {
     _opCtx = other._opCtx;
     other._opCtx = nullptr;
 
+    _cursorManager = other._cursorManager;
+    other._cursorManager = nullptr;
+
     return *this;
 }
 
@@ -213,24 +219,13 @@ void ClientCursorPin::release() {
     if (!_cursor)
         return;
 
-    // Note it's not safe to dereference _cursor->_cursorManager unless we know we haven't been
-    // killed. If we're not locked we assume we haven't been killed because we're working with the
-    // global cursor manager which never kills cursors.
-    dassert(_opCtx->lockState()->isCollectionLockedForMode(_cursor->_nss.ns(), MODE_IS) ||
-            _cursor->_cursorManager->isGlobalManager());
-
     invariant(_cursor->_operationUsingCursor);
+    invariant(_cursorManager);
 
-    if (_cursor->getExecutor()->isMarkedAsKilled()) {
-        // The ClientCursor was killed while we had it.  Therefore, it is our responsibility to
-        // call dispose() and delete it.
-        deleteUnderlying();
-    } else {
-        // Unpin the cursor under the collection cursor manager lock.
-        _cursor->_cursorManager->unpin(
-            _opCtx, std::unique_ptr<ClientCursor, ClientCursor::Deleter>(_cursor));
-        cursorStatsOpenPinned.decrement();
-    }
+    // Unpin the cursor. This must be done by calling into the cursor manager, since the cursor
+    // manager must acquire the appropriate mutex in order to safely perform the unpin operation.
+    _cursorManager->unpin(_opCtx, std::unique_ptr<ClientCursor, ClientCursor::Deleter>(_cursor));
+    cursorStatsOpenPinned.decrement();
 
     _cursor = nullptr;
 }
@@ -238,23 +233,17 @@ void ClientCursorPin::release() {
 void ClientCursorPin::deleteUnderlying() {
     invariant(_cursor);
     invariant(_cursor->_operationUsingCursor);
+    invariant(_cursorManager);
     // Note the following subtleties of this method's implementation:
-    // - We must unpin the cursor before destruction, since it is an error to delete a pinned
-    //   cursor.
-    // - In addition, we must deregister the cursor before unpinning, since it is an
-    //   error to unpin a registered cursor without holding the cursor manager lock (note that
-    //   we can't simply unpin with the cursor manager lock here, since we need to guarantee
-    //   exclusive ownership of the cursor when we are deleting it).
+    // - We must unpin the cursor (by clearing the '_operationUsingCursor' field) before
+    //   destruction, since it is an error to delete a pinned cursor.
+    // - In addition, we must deregister the cursor before clearing the '_operationUsingCursor'
+    //   field, since it is an error to unpin a registered cursor without holding the appropriate
+    //   cursor manager mutex. By first deregistering the cursor, we ensure that no other thread can
+    //   access '_cursor', meaning that it is safe for us to write to '_operationUsingCursor'
+    //   without holding the CursorManager mutex.
 
-    // Note it's not safe to dereference _cursor->_cursorManager unless we know we haven't been
-    // killed. If we're not locked we assume we haven't been killed because we're working with the
-    // global cursor manager which never kills cursors.
-    dassert(_opCtx->lockState()->isCollectionLockedForMode(_cursor->_nss.ns(), MODE_IS) ||
-            _cursor->_cursorManager->isGlobalManager());
-
-    if (!_cursor->getExecutor()->isMarkedAsKilled()) {
-        _cursor->_cursorManager->deregisterCursor(_cursor);
-    }
+    _cursorManager->deregisterCursor(_cursor);
 
     // Make sure the cursor is disposed and unpinned before being destroyed.
     _cursor->dispose(_opCtx);
@@ -284,14 +273,13 @@ public:
     }
 
     void run() {
-        Client::initThread("clientcursormon");
-        ON_BLOCK_EXIT([] { Client::destroy(); });
+        ThreadClient tc("clientcursormon", getGlobalServiceContext());
         while (!globalInShutdownDeprecated()) {
             {
                 const ServiceContext::UniqueOperationContext opCtx = cc().makeOperationContext();
                 auto now = opCtx->getServiceContext()->getPreciseClockSource()->now();
                 cursorStatsTimedOut.increment(
-                    CursorManager::timeoutCursorsGlobal(opCtx.get(), now));
+                    CursorManager::getGlobalCursorManager()->timeoutCursors(opCtx.get(), now));
             }
             MONGO_IDLE_THREAD_BLOCK;
             sleepsecs(getClientCursorMonitorFrequencySecs());

@@ -29,6 +29,7 @@ selector:
   # namespaces collide across mongos processes'
   - jstests/concurrency/fsm_workloads/map_reduce_drop.js
   - jstests/concurrency/fsm_workloads/map_reduce_inline.js
+  - jstests/concurrency/fsm_workloads/map_reduce_interrupt.js
   - jstests/concurrency/fsm_workloads/map_reduce_merge.js
   - jstests/concurrency/fsm_workloads/map_reduce_merge_nonatomic.js
   - jstests/concurrency/fsm_workloads/map_reduce_reduce.js
@@ -90,10 +91,6 @@ selector:
   - jstests/concurrency/fsm_workloads/rename_collection_dbname_droptarget.js
   - jstests/concurrency/fsm_workloads/rename_collection_droptarget.js
 
-  # our update queries lack shard keys
-  - jstests/concurrency/fsm_workloads/update_upsert_multi.js
-  - jstests/concurrency/fsm_workloads/update_upsert_multi_noindex.js
-
   # cannot use upsert command with $where with sharded collections
   - jstests/concurrency/fsm_workloads/upsert_where.js
 
@@ -118,6 +115,7 @@ selector:
   # Uses getmores.
   - jstests/concurrency/fsm_workloads/agg_base.js
   - jstests/concurrency/fsm_workloads/create_index_background.js
+  - jstests/concurrency/fsm_workloads/create_index_background_partial_filter.js
   - jstests/concurrency/fsm_workloads/create_index_background_wildcard.js
   - jstests/concurrency/fsm_workloads/globally_managed_cursors.js
   - jstests/concurrency/fsm_workloads/indexed_insert_ordered_bulk.js

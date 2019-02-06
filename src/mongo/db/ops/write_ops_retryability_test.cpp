@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -59,7 +61,7 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 boost::optional<repl::OpTime> preImageOpTime = boost::none,
                                 boost::optional<repl::OpTime> postImageOpTime = boost::none) {
     return repl::OplogEntry(opTime,                           // optime
-                            0,                                // hash
+                            boost::none,                      // hash
                             opType,                           // opType
                             nss,                              // namespace
                             boost::none,                      // uuid
@@ -77,15 +79,15 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
 }
 
 TEST_F(WriteOpsRetryability, ParseOplogEntryForUpdate) {
-    const auto entry = assertGet(
-        repl::OplogEntry::parse(BSON("ts" << Timestamp(50, 10) << "t" << 1LL << "h" << 0LL << "op"
-                                          << "u"
-                                          << "ns"
-                                          << "a.b"
-                                          << "o"
-                                          << BSON("_id" << 1 << "x" << 5)
-                                          << "o2"
-                                          << BSON("_id" << 1))));
+    const auto entry =
+        assertGet(repl::OplogEntry::parse(BSON("ts" << Timestamp(50, 10) << "t" << 1LL << "op"
+                                                    << "u"
+                                                    << "ns"
+                                                    << "a.b"
+                                                    << "o"
+                                                    << BSON("_id" << 1 << "x" << 5)
+                                                    << "o2"
+                                                    << BSON("_id" << 1))));
 
     auto res = parseOplogEntryForUpdate(entry);
 
@@ -114,13 +116,13 @@ TEST_F(WriteOpsRetryability, ParseOplogEntryForNestedUpdate) {
 }
 
 TEST_F(WriteOpsRetryability, ParseOplogEntryForUpsert) {
-    const auto entry = assertGet(
-        repl::OplogEntry::parse(BSON("ts" << Timestamp(50, 10) << "t" << 1LL << "h" << 0LL << "op"
-                                          << "i"
-                                          << "ns"
-                                          << "a.b"
-                                          << "o"
-                                          << BSON("_id" << 1 << "x" << 5))));
+    const auto entry =
+        assertGet(repl::OplogEntry::parse(BSON("ts" << Timestamp(50, 10) << "t" << 1LL << "op"
+                                                    << "i"
+                                                    << "ns"
+                                                    << "a.b"
+                                                    << "o"
+                                                    << BSON("_id" << 1 << "x" << 5))));
 
     auto res = parseOplogEntryForUpdate(entry);
 

@@ -1,30 +1,31 @@
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
@@ -53,7 +54,6 @@
 
 namespace mongo {
 namespace unittest {
-
 namespace {
 
 bool stringContains(const std::string& haystack, const std::string& needle) {
@@ -64,7 +64,7 @@ logger::MessageLogDomain* unittestOutput = logger::globalLogManager()->getNamedD
 
 typedef std::map<std::string, std::shared_ptr<Suite>> SuiteMap;
 
-inline SuiteMap& _allSuites() {
+SuiteMap& _allSuites() {
     static SuiteMap allSuites;
     return allSuites;
 }
@@ -73,6 +73,10 @@ inline SuiteMap& _allSuites() {
 
 logger::LogstreamBuilder log() {
     return LogstreamBuilder(unittestOutput, getThreadName(), logger::LogSeverity::Log());
+}
+
+logger::LogstreamBuilder warning() {
+    return LogstreamBuilder(unittestOutput, getThreadName(), logger::LogSeverity::Warning());
 }
 
 void setupTestLogger() {
@@ -92,17 +96,23 @@ public:
     Result(const std::string& name)
         : _name(name), _rc(0), _tests(0), _fails(), _asserts(0), _millis(0) {}
 
-    std::string toString() {
-        std::stringstream ss;
+    std::string toString() const {
+        char result[144];
+        size_t numWritten = std::snprintf(
+            result,
+            sizeof(result),
+            "%-40s | tests: %4d | fails: %4d | assert calls: %10d | time secs: %6.3f\n",
+            _name.c_str(),
+            _tests,
+            static_cast<int>(_fails.size()),
+            _asserts,
+            _millis / 1000.0);
 
-        char result[128];
-        sprintf(result,
-                "%-30s | tests: %4d | fails: %4d | assert calls: %10d | time secs: %6.3f\n",
-                _name.c_str(),
-                _tests,
-                static_cast<int>(_fails.size()),
-                _asserts,
-                _millis / 1000.0);
+        if (numWritten >= sizeof(result)) {
+            warning() << "Output for test " << _name << " was truncated";
+        }
+
+        std::stringstream ss;
         ss << result;
 
         for (const auto& i : _messages) {
@@ -151,9 +161,41 @@ private:
 };
 
 template <typename F>
-inline UnsafeScopeGuard<F> MakeUnsafeScopeGuard(F fun) {
+UnsafeScopeGuard<F> MakeUnsafeScopeGuard(F fun) {
     return UnsafeScopeGuard<F>(std::move(fun));
 }
+
+// Attempting to read the featureCompatibilityVersion parameter before it is explicitly initialized
+// with a meaningful value will trigger failures as of SERVER-32630.
+void setUpFCV() {
+    serverGlobalParams.featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
+}
+void tearDownFCV() {
+    serverGlobalParams.featureCompatibility.reset();
+}
+
+struct TestSuiteEnvironment {
+    explicit TestSuiteEnvironment() {
+        setUpFCV();
+    }
+
+    ~TestSuiteEnvironment() noexcept(false) {
+        tearDownFCV();
+    }
+};
+
+struct UnitTestEnvironment {
+    explicit UnitTestEnvironment(Test* const t) : test(t) {
+        test->setUp();
+    }
+
+    ~UnitTestEnvironment() noexcept(false) {
+        test->tearDown();
+    }
+
+    Test* const test;
+};
 
 }  // namespace
 
@@ -166,8 +208,7 @@ Test::~Test() {
 }
 
 void Test::run() {
-    setUp();
-    auto guard = MakeUnsafeScopeGuard([this] { tearDown(); });
+    UnitTestEnvironment environment(this);
 
     // An uncaught exception does not prevent the tear down from running. But
     // such an event still constitutes an error. To test this behavior we use a
@@ -175,19 +216,9 @@ void Test::run() {
     // not considered an error.
     try {
         _doTest();
-    } catch (FixtureExceptionForTesting&) {
+    } catch (const FixtureExceptionForTesting&) {
         return;
     }
-}
-
-// Attempting to read the featureCompatibilityVersion parameter before it is explicitly initialized
-// with a meaningful value will trigger failures as of SERVER-32630.
-void Test::setUp() {
-    serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
-}
-void Test::tearDown() {
-    serverGlobalParams.featureCompatibility.reset();
 }
 
 namespace {
@@ -298,7 +329,9 @@ Result* Suite::run(const std::string& filter, int runsPerTest) {
                 if (runsPerTest > 1) {
                     runTimes << "  (" << x + 1 << "/" << runsPerTest << ")";
                 }
+
                 log() << "\t going to run test: " << tc->getName() << runTimes.str();
+                TestSuiteEnvironment environment;
                 tc->run();
             }
             passes = true;

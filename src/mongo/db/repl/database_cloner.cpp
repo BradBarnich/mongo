@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -114,7 +116,7 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
                                const ListCollectionsPredicateFn& listCollectionsPred,
                                StorageInterface* si,
                                const CollectionCallbackFn& collWork,
-                               const CallbackFn& onCompletion)
+                               CallbackFn onCompletion)
     : _executor(executor),
       _dbWorkThreadPool(dbWorkThreadPool),
       _source(source),
@@ -126,7 +128,7 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
       _listCollectionsPredicate(listCollectionsPred ? listCollectionsPred : acceptAllPred),
       _storageInterface(si),
       _collectionWork(collWork),
-      _onCompletion(onCompletion),
+      _onCompletion(std::move(onCompletion)),
       _listCollectionsFetcher(_executor,
                               _source,
                               _dbname,
@@ -150,7 +152,7 @@ DatabaseCloner::DatabaseCloner(executor::TaskExecutor* executor,
     uassert(ErrorCodes::BadValue, "empty database name", !dbname.empty());
     uassert(ErrorCodes::BadValue, "storage interface cannot be null", si);
     uassert(ErrorCodes::BadValue, "collection callback function cannot be null", collWork);
-    uassert(ErrorCodes::BadValue, "callback function cannot be null", onCompletion);
+    uassert(ErrorCodes::BadValue, "callback function cannot be null", _onCompletion);
 
     _stats.dbname = _dbname;
 }
@@ -257,7 +259,7 @@ void DatabaseCloner::join() {
     _condition.wait(lk, [this]() { return !_isActive_inlock(); });
 }
 
-void DatabaseCloner::setScheduleDbWorkFn_forTest(const CollectionCloner::ScheduleDbWorkFn& work) {
+void DatabaseCloner::setScheduleDbWorkFn_forTest(const ScheduleDbWorkFn& work) {
     LockGuard lk(_mutex);
 
     _scheduleDbWorkFn = work;
@@ -344,7 +346,7 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
         const std::string collectionName = nameElement.String();
         if (seen.find(collectionName) != seen.end()) {
             _finishCallback_inlock(lk,
-                                   {ErrorCodes::DuplicateKey,
+                                   {ErrorCodes::Error(51005),
                                     str::stream()
                                         << "collection info contains duplicate collection name "
                                         << "'"

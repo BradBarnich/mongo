@@ -15,6 +15,29 @@
     assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
 
     /**
+     * Test that shardCollection correctly validates that a zone is associated with a shard.
+     */
+    function testShardZoneAssociationValidation(proposedShardKey, numberLongMin, numberLongMax) {
+        var zoneMin = numberLongMin ? {x: NumberLong(0)} : {x: 0};
+        var zoneMax = numberLongMax ? {x: NumberLong(10)} : {x: 10};
+        assert.commandWorked(configDB.tags.insert(
+            {_id: {ns: ns, min: zoneMin}, ns: ns, min: zoneMin, max: zoneMax, tag: zoneName}));
+
+        var tagDoc = configDB.tags.findOne();
+        assert.eq(ns, tagDoc.ns);
+        assert.eq(zoneMin, tagDoc.min);
+        assert.eq(zoneMax, tagDoc.max);
+        assert.eq(zoneName, tagDoc.tag);
+
+        assert.commandFailed(mongos.adminCommand({shardCollection: ns, key: proposedShardKey}));
+
+        assert.commandWorked(st.s.adminCommand({addShardToZone: shardName, zone: zoneName}));
+        assert.commandWorked(mongos.adminCommand({shardCollection: ns, key: proposedShardKey}));
+
+        assert.commandWorked(testDB.runCommand({drop: kCollName}));
+    }
+
+    /**
      * Test that shardCollection correctly validates shard key against existing zones.
      */
     function testShardKeyValidation(proposedShardKey, numberLongMin, numberLongMax, success) {
@@ -27,6 +50,7 @@
             {updateZoneKeyRange: ns, min: zoneMin, max: zoneMax, zone: zoneName}));
 
         var tagDoc = configDB.tags.findOne();
+        jsTestLog("xxx tag doc " + tojson(tagDoc));
         assert.eq(ns, tagDoc.ns);
         assert.eq(zoneMin, tagDoc.min);
         assert.eq(zoneMax, tagDoc.max);
@@ -104,8 +128,56 @@
         assert.commandWorked(testDB.runCommand({drop: kCollName}));
     }
 
-    // test that shardCollection uses existing zones to validate shard key
+    /**
+     * Tests that a non-empty collection associated with zones can be sharded.
+     */
+    function testNonemptyZonedCollection() {
+        var shardKey = {x: 1};
+        var shards = configDB.shards.find().toArray();
+        var testColl = testDB.getCollection(kCollName);
+        var ranges = [
+            {min: {x: 0}, max: {x: 10}},
+            {min: {x: 10}, max: {x: 20}},
+            {min: {x: 20}, max: {x: 40}}
+        ];
 
+        for (let i = 0; i < 40; i++) {
+            assert.writeOK(testColl.insert({x: i}));
+        }
+
+        assert.commandWorked(testColl.createIndex(shardKey));
+
+        for (let i = 0; i < shards.length; i++) {
+            assert.commandWorked(
+                mongos.adminCommand({addShardToZone: shards[i]._id, zone: zoneName + i}));
+            assert.commandWorked(mongos.adminCommand({
+                updateZoneKeyRange: ns,
+                min: ranges[i].min,
+                max: ranges[i].max,
+                zone: zoneName + i
+            }));
+        }
+
+        assert.commandWorked(mongos.adminCommand({shardCollection: ns, key: shardKey}));
+
+        // Check that there is initially 1 chunk.
+        assert.eq(1, configDB.chunks.count({ns: ns}));
+
+        st.startBalancer();
+
+        // Check that the chunks were moved properly.
+        assert.soon(() => {
+            let res = configDB.chunks.count({ns: ns});
+            return res === 5;
+        }, 'balancer never ran', 10 * 60 * 1000, 1000);
+
+        assert.commandWorked(testDB.runCommand({drop: kCollName}));
+    }
+
+    // test that shardCollection checks that a zone is associated with a shard.
+    testShardZoneAssociationValidation({x: 1}, false, false);
+
+    // test that shardCollection uses existing zones to validate shard key
     testShardKeyValidation({x: 1}, false, false, true);
 
     // cannot use a completely different key from the zone shard key or a key
@@ -125,6 +197,8 @@
 
     testChunkSplits(false);
     testChunkSplits(true);
+
+    testNonemptyZonedCollection();
 
     st.stop();
 })();

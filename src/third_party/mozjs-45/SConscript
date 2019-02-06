@@ -6,10 +6,7 @@ Import([
     ])
 
 env = env.Clone()
-env.InjectThirdPartyIncludePaths(libraries=[
-    'zlib',
-    'lz4',
-])
+env.InjectThirdParty(libraries=['zlib','lz4'])
 
 def removeIfPresent(lst, item):
     try:

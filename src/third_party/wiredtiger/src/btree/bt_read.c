@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -113,16 +113,17 @@ __las_page_instantiate_verbose(WT_SESSION_IMPL *session, uint64_t las_pageid)
  *	Instantiate lookaside update records in a recently read page.
  */
 static int
-__las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref, bool *preparedp)
+__las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref)
 {
 	WT_CACHE *cache;
 	WT_CURSOR *cursor;
 	WT_CURSOR_BTREE cbt;
 	WT_DECL_ITEM(current_key);
 	WT_DECL_RET;
-	WT_ITEM las_key, las_timestamp, las_value;
+	WT_ITEM las_key, las_value;
 	WT_PAGE *page;
 	WT_UPDATE *first_upd, *last_upd, *upd;
+	wt_timestamp_t durable_timestamp, las_timestamp;
 	size_t incr, total_incr;
 	uint64_t current_recno, las_counter, las_pageid, las_txnid, recno;
 	uint32_t las_id, session_flags;
@@ -166,7 +167,6 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref, bool *preparedp)
 	__wt_readlock(session, &cache->las_sweepwalk_lock);
 	WT_PUBLISH(cache->las_reader, false);
 	locked = true;
-	*preparedp = false;
 	for (ret = __wt_las_cursor_position(cursor, las_pageid);
 	    ret == 0;
 	    ret = cursor->next(cursor)) {
@@ -183,18 +183,14 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref, bool *preparedp)
 		/* Allocate the WT_UPDATE structure. */
 		WT_ERR(cursor->get_value(
 		    cursor, &las_txnid, &las_timestamp,
-		    &prepare_state, &upd_type, &las_value));
+		    &durable_timestamp, &prepare_state, &upd_type, &las_value));
 		WT_ERR(__wt_update_alloc(
 		    session, &las_value, &upd, &incr, upd_type));
 		total_incr += incr;
 		upd->txnid = las_txnid;
+		upd->timestamp = las_timestamp;
 		upd->prepare_state = prepare_state;
-		if (prepare_state == WT_PREPARE_INPROGRESS)
-			*preparedp = true;
-#ifdef HAVE_TIMESTAMPS
-		WT_ASSERT(session, las_timestamp.size == WT_TIMESTAMP_SIZE);
-		memcpy(&upd->timestamp, las_timestamp.data, las_timestamp.size);
-#endif
+		upd->durable_timestamp = durable_timestamp;
 
 		switch (page->type) {
 		case WT_PAGE_COL_FIX:
@@ -284,12 +280,13 @@ __las_page_instantiate(WT_SESSION_IMPL *session, WT_REF *ref, bool *preparedp)
 		FLD_SET(page->modify->restore_state, WT_PAGE_RS_LOOKASIDE);
 
 		if (ref->page_las->skew_newest &&
+		    !ref->page_las->has_prepares &&
 		    !S2C(session)->txn_global.has_stable_timestamp &&
 		    __wt_txn_visible_all(session, ref->page_las->unstable_txn,
-		    WT_TIMESTAMP_NULL(&ref->page_las->unstable_timestamp))) {
+		    ref->page_las->unstable_timestamp)) {
 			page->modify->rec_max_txn = ref->page_las->max_txn;
-			__wt_timestamp_set(&page->modify->rec_max_timestamp,
-			    &ref->page_las->max_timestamp);
+			page->modify->rec_max_timestamp =
+			    ref->page_las->max_timestamp;
 			__wt_page_modify_clear(session, page);
 		}
 	}
@@ -320,6 +317,7 @@ __evict_force_check(WT_SESSION_IMPL *session, WT_REF *ref)
 {
 	WT_BTREE *btree;
 	WT_PAGE *page;
+	size_t footprint;
 
 	btree = S2BT(session);
 	page = ref->page;
@@ -335,8 +333,20 @@ __evict_force_check(WT_SESSION_IMPL *session, WT_REF *ref)
 	if (__wt_page_evict_clean(page))
 		return (false);
 
+	/*
+	 * Exclude the disk image size from the footprint checks.  Usually the
+	 * disk image size is small compared with the in-memory limit (e.g.
+	 * 16KB vs 5MB), so this doesn't make a big difference.  Where it is
+	 * important is for pages with a small number of large values, where
+	 * the disk image size takes into account large values that have
+	 * already been written and should not trigger forced eviction.
+	 */
+	footprint = page->memory_footprint;
+	if (page->dsk != NULL)
+		footprint -= page->dsk->mem_size;
+
 	/* Pages are usually small enough, check that first. */
-	if (page->memory_footprint < btree->splitmempage)
+	if (footprint < btree->splitmempage)
 		return (false);
 
 	/*
@@ -349,7 +359,7 @@ __evict_force_check(WT_SESSION_IMPL *session, WT_REF *ref)
 	/* If we can do an in-memory split, do it. */
 	if (__wt_leaf_page_can_split(session, page))
 		return (true);
-	if (page->memory_footprint < btree->maxmempage)
+	if (footprint < btree->maxmempage)
 		return (false);
 
 	/* Bump the oldest ID, we're about to do some visibility checks. */
@@ -378,7 +388,7 @@ __evict_force_check(WT_SESSION_IMPL *session, WT_REF *ref)
  */
 static inline int
 __page_read_lookaside(WT_SESSION_IMPL *session, WT_REF *ref,
-    uint32_t previous_state, uint32_t *final_statep, bool *preparedp)
+    uint32_t previous_state, uint32_t *final_statep)
 {
 	/*
 	 * Reading a lookaside ref for the first time, and not requiring the
@@ -390,8 +400,8 @@ __page_read_lookaside(WT_SESSION_IMPL *session, WT_REF *ref,
 			WT_STAT_CONN_INCR(
 			    session, cache_read_lookaside_skipped);
 			ref->page_las->eviction_to_lookaside = true;
-			*final_statep = WT_REF_LIMBO;
 		}
+		*final_statep = WT_REF_LIMBO;
 		return (0);
 	}
 
@@ -403,7 +413,7 @@ __page_read_lookaside(WT_SESSION_IMPL *session, WT_REF *ref,
 			    cache_read_lookaside_delay_checkpoint);
 	}
 
-	WT_RET(__las_page_instantiate(session, ref, preparedp));
+	WT_RET(__las_page_instantiate(session, ref));
 	ref->page_las->eviction_to_lookaside = false;
 	return (0);
 }
@@ -419,10 +429,10 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 	WT_ITEM tmp;
 	WT_PAGE *notused;
 	size_t addr_size;
-	uint64_t time_start, time_stop;
+	uint64_t time_diff, time_start, time_stop;
 	uint32_t page_flags, final_state, new_state, previous_state;
 	const uint8_t *addr;
-	bool prepared, timer;
+	bool timer;
 
 	time_start = time_stop = 0;
 
@@ -486,9 +496,10 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 	WT_ERR(__wt_bt_read(session, &tmp, addr, addr_size));
 	if (timer) {
 		time_stop = __wt_clock(session);
+		time_diff = WT_CLOCKDIFF_US(time_stop, time_start);
 		WT_STAT_CONN_INCR(session, cache_read_app_count);
-		WT_STAT_CONN_INCRV(session, cache_read_app_time,
-		    WT_CLOCKDIFF_US(time_stop, time_start));
+		WT_STAT_CONN_INCRV(session, cache_read_app_time, time_diff);
+		WT_STAT_SESSION_INCRV(session, read_time, time_diff);
 	}
 
 	/*
@@ -520,7 +531,6 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 	    F_ISSET(ref->page->dsk, WT_PAGE_LAS_UPDATE));
 
 skip_read:
-	prepared = false;
 	switch (previous_state) {
 	case WT_REF_DELETED:
 		/*
@@ -530,7 +540,7 @@ skip_read:
 		 * then apply the delete.
 		 */
 		if (ref->page_las != NULL) {
-			WT_ERR(__las_page_instantiate(session, ref, &prepared));
+			WT_ERR(__las_page_instantiate(session, ref));
 			ref->page_las->eviction_to_lookaside = false;
 		}
 
@@ -540,7 +550,7 @@ skip_read:
 	case WT_REF_LIMBO:
 	case WT_REF_LOOKASIDE:
 		WT_ERR(__page_read_lookaside(
-		    session, ref, previous_state, &final_state, &prepared));
+		    session, ref, previous_state, &final_state));
 		break;
 	}
 
@@ -556,12 +566,12 @@ skip_read:
 	 *
 	 * Don't free WT_REF.page_las, there may be concurrent readers.
 	 */
-	if (final_state == WT_REF_MEM &&
-	    ref->page_las != NULL && (prepared || !ref->page_las->skew_newest))
+	if (final_state == WT_REF_MEM && ref->page_las != NULL &&
+	    (!ref->page_las->skew_newest || ref->page_las->has_prepares))
 		WT_ERR(__wt_las_remove_block(
 		    session, ref->page_las->las_pageid));
 
-	WT_PUBLISH(ref->state, final_state);
+	WT_REF_SET_STATE(ref, final_state);
 	return (ret);
 
 err:	/*
@@ -571,7 +581,7 @@ err:	/*
 	 */
 	if (ref->page != NULL && previous_state != WT_REF_LIMBO)
 		__wt_ref_out(session, ref);
-	WT_PUBLISH(ref->state, previous_state);
+	WT_REF_SET_STATE(ref, previous_state);
 
 	__wt_buf_free(session, &tmp);
 

@@ -1,25 +1,27 @@
 // bson_collection_catalog_entry.cpp
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -99,6 +101,9 @@ void parseMultikeyPathsFromBytes(BSONObj multikeyPathsObj, MultikeyPaths* multik
 }
 
 }  // namespace
+
+const StringData BSONCollectionCatalogEntry::kIndexBuildScanning = "scanning"_sd;
+const StringData BSONCollectionCatalogEntry::kIndexBuildDraining = "draining"_sd;
 
 BSONCollectionCatalogEntry::BSONCollectionCatalogEntry(StringData ns)
     : CollectionCatalogEntry(ns) {}
@@ -298,6 +303,18 @@ BSONObj BSONCollectionCatalogEntry::MetaData::toBSON() const {
             sub.append("head", static_cast<long long>(indexes[i].head.repr()));
             sub.append("prefix", indexes[i].prefix.toBSONValue());
             sub.append("backgroundSecondary", indexes[i].isBackgroundSecondaryBuild);
+
+            sub.append("runTwoPhaseBuild", indexes[i].runTwoPhaseBuild);
+            sub.append("versionOfBuild", static_cast<long long>(indexes[i].versionOfBuild));
+            if (indexes[i].buildPhase) {
+                sub.append("buildPhase", *indexes[i].buildPhase);
+            }
+            if (indexes[i].constraintViolationsIdent) {
+                sub.append("constraintViolationsIdent", *indexes[i].constraintViolationsIdent);
+            }
+            if (indexes[i].sideWritesIdent) {
+                sub.append("sideWritesIdent", *indexes[i].sideWritesIdent);
+            }
             sub.doneFast();
         }
         arr.doneFast();
@@ -337,6 +354,20 @@ void BSONCollectionCatalogEntry::MetaData::parse(const BSONObj& obj) {
             auto bgSecondary = BSONElement(idx["backgroundSecondary"]);
             // Opt-in to rebuilding behavior for old-format index catalog objects.
             imd.isBackgroundSecondaryBuild = bgSecondary.eoo() || bgSecondary.trueValue();
+
+            imd.runTwoPhaseBuild = idx["runTwoPhaseBuild"].trueValue();
+            if (idx.hasField("versionOfBuild")) {
+                imd.versionOfBuild = idx["versionOfBuild"].numberLong();
+            }
+            if (idx["buildPhase"]) {
+                imd.buildPhase = idx["buildPhase"].str();
+            }
+            if (idx["constraintViolationsIdent"]) {
+                imd.constraintViolationsIdent = idx["constraintViolationsIdent"].str();
+            }
+            if (idx["sideWritesIdent"]) {
+                imd.sideWritesIdent = idx["sideWritesIdent"].str();
+            }
             indexes.push_back(imd);
         }
     }

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -72,7 +73,6 @@ namespace repl {
 
 class HeartbeatResponseAction;
 class LastVote;
-class OplogReader;
 class ReplicationProcess;
 class ReplSetRequestVotesArgs;
 class ReplSetConfig;
@@ -110,7 +110,9 @@ public:
 
     virtual Status waitForMemberState(MemberState expectedState, Milliseconds timeout) override;
 
-    virtual bool isInPrimaryOrSecondaryState() const override;
+    virtual bool isInPrimaryOrSecondaryState(OperationContext* opCtx) const override;
+
+    virtual bool isInPrimaryOrSecondaryState_UNSAFE() const override;
 
     virtual Seconds getSlaveDelaySecs() const override;
 
@@ -133,6 +135,13 @@ public:
     bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx, const NamespaceString& ns) override;
 
     virtual Status checkIfWriteConcernCanBeSatisfied(const WriteConcernOptions& writeConcern) const;
+
+    virtual Status checkIfCommitQuorumCanBeSatisfied(
+        const CommitQuorumOptions& commitQuorum) const override;
+
+    virtual StatusWith<bool> checkIfCommitQuorumIsSatisfied(
+        const CommitQuorumOptions& commitQuorum,
+        const std::vector<HostAndPort>& commitReadyMembers) const override;
 
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
@@ -162,12 +171,17 @@ public:
 
     virtual Status waitUntilOpTimeForRead(OperationContext* opCtx,
                                           const ReadConcernArgs& readConcern) override;
-
+    Status awaitOpTimeCommitted(OperationContext* opCtx, OpTime opTime) override;
     virtual OID getElectionId() override;
 
     virtual int getMyId() const override;
 
+    virtual HostAndPort getMyHostAndPort() const override;
+
     virtual Status setFollowerMode(const MemberState& newState) override;
+
+    virtual Status setFollowerModeStrict(OperationContext* opCtx,
+                                         const MemberState& newState) override;
 
     virtual ApplierState getApplierState() override;
 
@@ -260,8 +274,6 @@ public:
 
     virtual bool getWriteConcernMajorityShouldJournal() override;
 
-    virtual void summarizeAsHtml(ReplSetHtmlSummary* s) override;
-
     virtual void dropAllSnapshots() override;
     /**
      * Get current term from topology coordinator
@@ -289,14 +301,17 @@ public:
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) override;
 
-    virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const override;
-    virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) override;
-
     virtual Status stepUpIfEligible(bool skipDryRun) override;
 
     virtual Status abortCatchupIfNeeded() override;
 
     void signalDropPendingCollectionsRemovedFromStorage() final;
+
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() override;
+
+    virtual bool setContainsArbiter() const override;
+
+    virtual void attemptToAdvanceStableTimestamp() override;
 
     // ================== Test support API ===================
 
@@ -341,7 +356,7 @@ public:
     executor::TaskExecutor::CallbackHandle getCatchupTakeoverCbh_forTest() const;
 
     /**
-     * Simple wrappers around _setLastOptime_inlock to make it easier to test.
+     * Simple wrappers around _setLastOptime to make it easier to test.
      */
     Status setLastAppliedOptime_forTest(long long cfgVer, long long memberId, const OpTime& opTime);
     Status setLastDurableOptime_forTest(long long cfgVer, long long memberId, const OpTime& opTime);
@@ -349,11 +364,10 @@ public:
     /**
      * Simple test wrappers that expose private methods.
      */
-    boost::optional<OpTime> calculateStableOpTime_forTest(const std::set<OpTime>& candidates,
-                                                          const OpTime& commitPoint);
+    boost::optional<OpTime> chooseStableOpTimeFromCandidates_forTest(
+        const std::set<OpTime>& candidates, const OpTime& maximumStableOpTime);
     void cleanupStableOpTimeCandidates_forTest(std::set<OpTime>* candidates, OpTime stableOpTime);
     std::set<OpTime> getStableOpTimeCandidates_forTest();
-    boost::optional<OpTime> getStableOpTime_forTest();
 
     /**
      * Non-blocking version of updateTerm.
@@ -432,10 +446,61 @@ private:
      */
     enum PostMemberStateUpdateAction {
         kActionNone,
-        kActionCloseAllConnections,  // Also indicates that we should clear sharding state.
+        kActionSteppedDownOrRemoved,
         kActionFollowerModeStateChange,
-        kActionWinElection,
         kActionStartSingleNodeElection
+    };
+
+    // This object handles killing user operations and aborting stashed running
+    // transactions during step down.
+    class KillOpContainer {
+    public:
+        KillOpContainer(ReplicationCoordinatorImpl* repl, OperationContext* opCtx)
+            : _replCord(repl), _stepDownOpCtx(opCtx){};
+
+        /**
+         * It will spawn a new thread killOpThread to kill user operations.
+         */
+        void startKillOpThread();
+
+        /**
+         * On stepdown, we need to kill all write operations and all transactional operations,
+         * so that unprepared and prepared transactions can release or yield their locks.
+         * The required ordering between stepdown steps is:
+         * 1) Enqueue RSTL in X mode.
+         * 2) Kill all write operations and operations with S locks
+         * 3) Abort unprepared transactions.
+         * 4) Repeat step 2) and 3) until the stepdown thread can acquire RSTL.
+         * 5) Yield locks of all prepared transactions.
+         *
+         * Since prepared transactions don't hold RSTL, step 1) to step 3) make sure all
+         * running transactions that may hold RSTL finish, get killed or yield their locks,
+         * so that we can acquire RSTL at step 4). Holding the locks of prepared transactions
+         * until step 5) guarantees if any conflict operations (e.g. DDL operations) failed
+         * to be killed for any reason, we will get a deadlock instead of a silent data corruption.
+         *
+         * Loops continuously to kill all user operations that have global lock except in IS mode.
+         * And, aborts all stashed (inactive) transactions.
+         * Terminates once killSignaled is set true.
+        */
+        void killOpThreadFn();
+
+        /*
+         * Signals killOpThread to stop killing user operations.
+         */
+        void stopAndWaitForKillOpThread();
+
+    private:
+        ReplicationCoordinatorImpl* const _replCord;  // not owned.
+        OperationContext* const _stepDownOpCtx;       // not owned.
+        // Thread that will run killOpThreadFn().
+        std::unique_ptr<stdx::thread> _killOpThread;
+        // Protects killSignaled and stopKillingOps cond. variable.
+        stdx::mutex _mutex;
+        // Signals thread about the change of killSignaled value.
+        stdx::condition_variable _stopKillingOps;
+        // Once this is set to true, the killOpThreadFn method will terminate.
+        bool _killSignaled = false;
     };
 
     // Abstract struct that holds information about clients waiting for replication.
@@ -548,7 +613,49 @@ private:
         std::unique_ptr<CallbackWaiter> _waiter;
     };
 
-    void _resetMyLastOpTimes_inlock();
+    // Inner class to manage the concurrency of _canAcceptNonLocalWrites and _canServeNonLocalReads.
+    class ReadWriteAbility {
+    public:
+        ReadWriteAbility(bool canAcceptNonLocalWrites)
+            : _canAcceptNonLocalWrites(canAcceptNonLocalWrites), _canServeNonLocalReads(0U) {}
+
+        // Asserts ReplicationStateTransitionLock is held in mode X.
+        void setCanAcceptNonLocalWrites(WithLock, OperationContext* opCtx, bool newVal);
+
+        bool canAcceptNonLocalWrites(WithLock) const;
+        bool canAcceptNonLocalWrites_UNSAFE() const;  // For early errors.
+
+        // Asserts ReplicationStateTransitionLock is held in an intent or exclusive mode.
+        bool canAcceptNonLocalWrites(OperationContext* opCtx) const;
+
+        bool canServeNonLocalReads_UNSAFE() const;
+
+        // Asserts ReplicationStateTransitionLock is held in an intent or exclusive mode.
+        bool canServeNonLocalReads(OperationContext* opCtx) const;
+
+        // Asserts ReplicationStateTransitionLock is held in mode X.
+        void setCanServeNonLocalReads(OperationContext* opCtx, unsigned int newVal);
+
+        void setCanServeNonLocalReads_UNSAFE(unsigned int newVal);
+
+    private:
+        // Flag that indicates whether writes to databases other than "local" are allowed.  Used to
+        // answer canAcceptWritesForDatabase() and canAcceptWritesFor() questions. In order to read
+        // it, must have either the RSTL or the replication coordinator mutex. To set it, must have
+        // both the RSTL in mode X and the replication coordinator mutex.
+        // Always true for standalone nodes.
+        bool _canAcceptNonLocalWrites;
+
+        // Flag that indicates whether reads from databases other than "local" are allowed. Unlike
+        // _canAcceptNonLocalWrites, above, this question is about admission control on secondaries.
+        // Accidentally providing the prior value for a limited period of time is acceptable, except
+        // during rollback. In order to read it, must have the RSTL. To set it when transitioning
+        // into RS_ROLLBACK, must have the RSTL in mode X. Otherwise, no lock or mutex is necessary
+        // to set it.
+        AtomicWord<unsigned> _canServeNonLocalReads;
+    };
+
+    void _resetMyLastOpTimes(WithLock lk);
 
     /**
      * Returns the _writeConcernMajorityJournalDefault of our current _rsConfig.
@@ -577,9 +684,10 @@ private:
      * Returns an action to be performed after unlocking _mutex, via
      * _performPostMemberStateUpdateAction.
      */
-    PostMemberStateUpdateAction _setCurrentRSConfig_inlock(OperationContext* opCtx,
-                                                           const ReplSetConfig& newConfig,
-                                                           int myIndex);
+    PostMemberStateUpdateAction _setCurrentRSConfig(WithLock lk,
+                                                    OperationContext* opCtx,
+                                                    const ReplSetConfig& newConfig,
+                                                    int myIndex);
 
     /**
      * Helper to wake waiters in _replicationWaiterList that are doneWaitingForReplication.
@@ -624,6 +732,9 @@ private:
 
     Status _checkIfWriteConcernCanBeSatisfied_inlock(const WriteConcernOptions& writeConcern) const;
 
+    Status _checkIfCommitQuorumCanBeSatisfied(WithLock,
+                                              const CommitQuorumOptions& commitQuorum) const;
+
     bool _canAcceptWritesFor_inlock(const NamespaceString& ns);
 
     int _getMyId_inlock() const;
@@ -637,8 +748,9 @@ private:
      * "configVersion" will be populated with our config version if it and the configVersion
      * of "args" differ.
      */
-    Status _setLastOptime_inlock(const UpdatePositionArgs::UpdateInfo& args,
-                                 long long* configVersion);
+    Status _setLastOptime(WithLock lk,
+                          const UpdatePositionArgs::UpdateInfo& args,
+                          long long* configVersion);
 
     /**
      * This function will report our position externally (like upstream) if necessary.
@@ -652,10 +764,11 @@ private:
     /**
      * Helpers to set the last applied and durable OpTime.
      */
-    void _setMyLastAppliedOpTime_inlock(const OpTime& opTime,
-                                        bool isRollbackAllowed,
-                                        DataConsistency consistency);
-    void _setMyLastDurableOpTime_inlock(const OpTime& opTime, bool isRollbackAllowed);
+    void _setMyLastAppliedOpTime(WithLock lk,
+                                 const OpTime& opTime,
+                                 bool isRollbackAllowed,
+                                 DataConsistency consistency);
+    void _setMyLastDurableOpTime(WithLock lk, const OpTime& opTime, bool isRollbackAllowed);
 
     /**
      * Schedules a heartbeat to be sent to "target" at "when". "targetIndex" is the index
@@ -712,6 +825,13 @@ private:
 
 
     MemberState _getMemberState_inlock() const;
+
+    /**
+     * Helper method for setting this node to a specific follower mode.
+     *
+     * Note: The opCtx may be null, but must be non-null if the new state is RS_ROLLBACK.
+     */
+    Status _setFollowerMode(OperationContext* opCtx, const MemberState& newState);
 
     /**
      * Starts loading the replication configuration from local storage, and if it is valid,
@@ -777,13 +897,23 @@ private:
      * Note: opCtx may be null as currently not all paths thread an OperationContext all the way
      * down, but it must be non-null for any calls that change _canAcceptNonLocalWrites.
      */
-    PostMemberStateUpdateAction _updateMemberStateFromTopologyCoordinator_inlock(
-        OperationContext* opCtx);
+    PostMemberStateUpdateAction _updateMemberStateFromTopologyCoordinator(WithLock lk,
+                                                                          OperationContext* opCtx);
 
     /**
      * Performs a post member-state update action.  Do not call while holding _mutex.
      */
     void _performPostMemberStateUpdateAction(PostMemberStateUpdateAction action);
+
+    /**
+     * Update state after winning an election.
+     */
+    void _postWonElectionUpdateMemberState(WithLock lk);
+
+    /**
+     * Helper to select appropriate sync source after transitioning from a follower state.
+     */
+    void _onFollowerModeStateChange();
 
     /**
      * Begins an attempt to elect this node.
@@ -856,6 +986,11 @@ private:
     executor::TaskExecutor::EventHandle _stepDownStart();
 
     /**
+     * kill all user operations that have taken a global lock except in IS mode.
+     */
+    void _killUserOperationsOnStepDown(const OperationContext* stepDownOpCtx);
+
+    /**
      * Completes a step-down of the current node.  Must be run with a global
      * shared or global exclusive lock.
      * Signals 'finishedEvent' on successful completion.
@@ -897,7 +1032,7 @@ private:
      * Updates the last committed OpTime to be "committedOpTime" if it is more recent than the
      * current last committed OpTime.
      */
-    void _advanceCommitPoint_inlock(const OpTime& committedOpTime);
+    void _advanceCommitPoint(WithLock lk, const OpTime& committedOpTime);
 
     /**
      * Scan the memberData and determine the highest last applied or last
@@ -908,7 +1043,7 @@ private:
      * Whether the last applied or last durable op time is used depends on whether
      * the config getWriteConcernMajorityShouldJournal is set.
      */
-    void _updateLastCommittedOpTime_inlock();
+    void _updateLastCommittedOpTime(WithLock lk);
 
     /**
      * Callback that attempts to set the current term in topology coordinator and
@@ -953,15 +1088,18 @@ private:
      * A helper method that returns the current stable optime based on the current commit point and
      * set of stable optime candidates.
      */
-    boost::optional<OpTime> _getStableOpTime_inlock();
+    boost::optional<OpTime> _recalculateStableOpTime(WithLock lk);
 
     /**
-     * Calculates the 'stable' replication optime given a set of optime candidates and the
-     * current commit point. The stable optime is the greatest optime in 'candidates' that is
-     * also less than or equal to 'commitPoint'.
+     * Calculates the 'stable' replication optime given a set of optime candidates and a maximum
+     * stable optime. The stable optime is the greatest optime in 'candidates' that is also less
+     * than or equal to 'maximumStableOpTime' and other criteria.
+     *
+     * Returns boost::none if there is no satisfactory candidate.
      */
-    boost::optional<OpTime> _calculateStableOpTime_inlock(const std::set<OpTime>& candidates,
-                                                          const OpTime& commitPoint);
+    boost::optional<OpTime> _chooseStableOpTimeFromCandidates(WithLock lk,
+                                                              const std::set<OpTime>& candidates,
+                                                              OpTime maximumStableOpTime);
 
     /**
      * Removes any optimes from the optime set 'candidates' that are less than
@@ -970,11 +1108,11 @@ private:
     void _cleanupStableOpTimeCandidates(std::set<OpTime>* candidates, OpTime stableOpTime);
 
     /**
-     * Calculates and sets the value of the 'stable' replication optime for the storage engine.
-     * See ReplicationCoordinatorImpl::_calculateStableOpTime for a definition of 'stable', in
-     * this context.
+     * Calculates and sets the value of the 'stable' replication optime for the storage engine.  See
+     * ReplicationCoordinatorImpl::_chooseStableOpTimeFromCandidates for a definition of 'stable',
+     * in this context.
      */
-    void _setStableTimestampForStorage_inlock();
+    void _setStableTimestampForStorage(WithLock lk);
 
     /**
      * Drops all snapshots and clears the "committed" snapshot.
@@ -1027,7 +1165,7 @@ private:
      * All other non-shutdown scheduling failures will abort the process.
      * Does not run 'work' if callback is canceled.
      */
-    CallbackHandle _scheduleWorkAt(Date_t when, const CallbackFn& work);
+    CallbackHandle _scheduleWorkAt(Date_t when, CallbackFn work);
 
     /**
      * Creates an event.
@@ -1099,8 +1237,6 @@ private:
     // (PS) Pointer is read-only in concurrent operation, item pointed to is self-synchronizing;
     //      Access in any context.
     // (M)  Reads and writes guarded by _mutex
-    // (GM) Readable under any global intent lock or _mutex.  Must hold both the global lock in
-    //      exclusive mode (MODE_X) and hold _mutex to write.
     // (I)  Independently synchronized, see member variable comment.
 
     // Protects member data of this ReplicationCoordinator.
@@ -1184,17 +1320,8 @@ private:
     // Whether we slept last time we attempted an election but possibly tied with other nodes.
     bool _sleptLastElection;  // (M)
 
-    // Flag that indicates whether writes to databases other than "local" are allowed.  Used to
-    // answer canAcceptWritesForDatabase() and canAcceptWritesFor() questions.
-    // Always true for standalone nodes.
-    bool _canAcceptNonLocalWrites;  // (GM)
-
-    // Flag that indicates whether reads from databases other than "local" are allowed.  Unlike
-    // _canAcceptNonLocalWrites, above, this question is about admission control on secondaries,
-    // and we do not require that its observers be strongly synchronized.  Accidentally
-    // providing the prior value for a limited period of time is acceptable.  Also unlike
-    // _canAcceptNonLocalWrites, its value is only meaningful on replica set secondaries.
-    AtomicUInt32 _canServeNonLocalReads;  // (S)
+    // Used to manage the concurrency around _canAcceptNonLocalWrites and _canServeNonLocalReads.
+    std::unique_ptr<ReadWriteAbility> _readWriteAbility;  // (S)
 
     // ReplicationProcess used to hold information related to the replication and application of
     // operations from the sync source.
@@ -1207,7 +1334,7 @@ private:
         _initialSyncer;  // (I) pointer set under mutex, copied by callers.
 
     // Hands out the next snapshot name.
-    AtomicUInt64 _snapshotNameGenerator;  // (S)
+    AtomicWord<unsigned long long> _snapshotNameGenerator;  // (S)
 
     // The OpTimes and SnapshotNames for all snapshots newer than the current commit point, kept in
     // sorted order. Any time this is changed, you must also update _uncommitedSnapshotsSize.
@@ -1215,7 +1342,7 @@ private:
 
     // A cache of the size of _uncommittedSnaphots that can be read without any locking.
     // May only be written to while holding _mutex.
-    AtomicUInt64 _uncommittedSnapshotsSize;  // (I)
+    AtomicWord<unsigned long long> _uncommittedSnapshotsSize;  // (I)
 
     // The non-null OpTime and SnapshotName of the current snapshot used for committed reads, if
     // there is one.
@@ -1268,15 +1395,10 @@ private:
     int _earliestMemberId = -1;  // (M)
 
     // Cached copy of the current config protocol version.
-    AtomicInt64 _protVersion{1};  // (S)
+    AtomicWord<long long> _protVersion{1};  // (S)
 
     // Source of random numbers used in setting election timeouts, etc.
     PseudoRandom _random;  // (M)
-
-    // This setting affects the Applier prefetcher behavior.
-    mutable stdx::mutex _indexPrefetchMutex;
-    ReplSettings::IndexPrefetchConfig _indexPrefetchConfig =
-        ReplSettings::IndexPrefetchConfig::PREFETCH_ALL;  // (I)
 
     // The catchup state including all catchup logic. The presence of a non-null pointer indicates
     // that the node is currently in catchup mode.
@@ -1286,7 +1408,7 @@ private:
     // function.
     // This variable must be written immediately after _term, and thus its value can lag.
     // Reading this value does not require the replication coordinator mutex to be locked.
-    AtomicInt64 _termShadow;  // (S)
+    AtomicWord<long long> _termShadow;  // (S)
 
     // When we decide to step down due to hearing about a higher term, we remember the term we heard
     // here so we can update our term to match as part of finishing stepdown.

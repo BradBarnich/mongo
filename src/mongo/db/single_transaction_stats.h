@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -92,6 +94,26 @@ public:
     Microseconds getDuration(TickSource* tickSource, TickSource::Tick curTick) const;
 
     /**
+     * If the transaction is currently in progress, this method returns the duration
+     * the transaction has been in the prepared state for in microseconds, given the
+     * current time value.
+     *
+     * For a completed transaction, this method returns the total duration the transaction
+     * has been in the prepared state in microseconds.
+     *
+     * This method cannot be called until setStartTime() and setPreparedStartTime() have been
+     * called.
+     */
+    Microseconds getPreparedDuration(TickSource* tickSource, TickSource::Tick curTick) const;
+
+    /**
+     * Sets the time at which a transaction enters the prepared state.
+     *
+     * This method cannot be called until setStartTime() has been called.
+     */
+    void setPreparedStartTime(TickSource::Tick time);
+
+    /**
      * Sets the transaction's end time, only if the start time has already been set.
      *
      * This method cannot be called until setStartTime() has been called.
@@ -150,6 +172,9 @@ public:
     /**
      * Returns the OpDebug object stored in this SingleTransactionStats instance.
      */
+    const OpDebug* getOpDebug() const {
+        return &_opDebug;
+    }
     OpDebug* getOpDebug() {
         return &_opDebug;
     }
@@ -236,6 +261,11 @@ private:
 
     // Holds information about the last client to run a transaction operation.
     LastClientInfo _lastClientInfo;
+
+    // The time at which a transaction becomes prepared. It is possible for _preparedStartTime to
+    // not be set in a transaction that is in state kPrepared if an exception is thrown after the
+    // transaction transitions to the prepared state but before setPreparedStartTime is called.
+    boost::optional<TickSource::Tick> _preparedStartTime{boost::none};
 };
 
 }  // namespace mongo

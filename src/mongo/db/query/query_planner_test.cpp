@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -42,6 +44,24 @@
 namespace {
 
 using namespace mongo;
+
+/**
+ * Make a minimal IndexEntry from just a key pattern and a name.
+ */
+IndexEntry buildSimpleIndexEntry(const BSONObj& kp, const std::string& indexName) {
+    return {kp,
+            IndexNames::nameToType(IndexNames::findPluginName(kp)),
+            false,
+            {},
+            {},
+            false,
+            false,
+            CoreIndexInfo::Identifier(indexName),
+            nullptr,
+            {},
+            nullptr,
+            nullptr};
+}
 
 TEST_F(QueryPlannerTest, PlannerUsesCoveredIxscanForCountWhenIndexSatisfiesQuery) {
     params.options = QueryPlannerParams::IS_COUNT;
@@ -339,13 +359,19 @@ TEST_F(QueryPlannerTest, NotEqualsNullInElemMatchValueSparseMultiKeyIndex) {
 }
 
 TEST_F(QueryPlannerTest, NotEqualsNullInElemMatchObjectSparseMultiKeyAboveElemMatch) {
-    IndexEntry ind(BSON("a.b.c.d" << 1),
+    auto keyPattern = BSON("a.b.c.d" << 1);
+    IndexEntry ind(keyPattern,
+                   IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
                    true,
+                   {},
+                   {},
                    true,
                    false,
                    IndexEntry::Identifier{"ind"},
-                   NULL,  // filterExpr
-                   BSONObj());
+                   nullptr,  // filterExpr
+                   BSONObj(),
+                   nullptr,
+                   nullptr);
     ind.multikeyPaths = {{0U, 1U}};
     addIndex(ind);
 
@@ -362,13 +388,19 @@ TEST_F(QueryPlannerTest, NotEqualsNullInElemMatchObjectSparseMultiKeyAboveElemMa
 TEST_F(QueryPlannerTest, NotEqualsNullInElemMatchObjectSparseMultiKeyBelowElemMatch) {
     // "a.b.c" being multikey will prevent us from using the index since $elemMatch doesn't do
     // implicit array traversal.
-    IndexEntry ind(BSON("a.b.c.d" << 1),
+    auto keyPattern = BSON("a.b.c.d" << 1);
+    IndexEntry ind(keyPattern,
+                   IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
                    true,
+                   {},
+                   {},
                    true,
                    false,
                    IndexEntry::Identifier{"ind"},
-                   NULL,  // filterExpr
-                   BSONObj());
+                   nullptr,  // filterExpr
+                   BSONObj(),
+                   nullptr,
+                   nullptr);
     ind.multikeyPaths = {{2U}};
     addIndex(ind);
 
@@ -4415,7 +4447,7 @@ TEST_F(QueryPlannerTest, CacheDataFromTaggedTreeFailsOnBadInput) {
     ASSERT_NOT_OK(QueryPlanner::cacheDataFromTaggedTree(NULL, relevantIndices).getStatus());
 
     // No relevant index matching the index tag.
-    relevantIndices.push_back(IndexEntry(BSON("a" << 1)));
+    relevantIndices.push_back(buildSimpleIndexEntry(BSON("a" << 1), "a_1"));
 
     auto qr = stdx::make_unique<QueryRequest>(NamespaceString("test.collection"));
     qr->setFilter(BSON("a" << 3));
@@ -4438,7 +4470,7 @@ TEST_F(QueryPlannerTest, TagAccordingToCacheFailsOnBadInput) {
     std::unique_ptr<CanonicalQuery> scopedCq = std::move(statusWithCQ.getValue());
 
     std::unique_ptr<PlanCacheIndexTree> indexTree(new PlanCacheIndexTree());
-    indexTree->setIndexEntry(IndexEntry(BSON("a" << 1), "a_1"));
+    indexTree->setIndexEntry(buildSimpleIndexEntry(BSON("a" << 1), "a_1"));
 
     std::map<IndexEntry::Identifier, size_t> indexMap;
 
@@ -4468,7 +4500,7 @@ TEST_F(QueryPlannerTest, TagAccordingToCacheFailsOnBadInput) {
 
     // Mismatched tree topology.
     PlanCacheIndexTree* child = new PlanCacheIndexTree();
-    child->setIndexEntry(IndexEntry(BSON("a" << 1)));
+    child->setIndexEntry(buildSimpleIndexEntry(BSON("a" << 1), "a_1"));
     indexTree->children.push_back(child);
     s = QueryPlanner::tagAccordingToCache(scopedCq->root(), indexTree.get(), indexMap);
     ASSERT_NOT_OK(s);

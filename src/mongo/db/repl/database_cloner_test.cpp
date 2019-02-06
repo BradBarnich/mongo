@@ -1,23 +1,24 @@
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -53,7 +54,7 @@ using namespace unittest;
 const std::string dbname("db");
 
 struct CollectionCloneInfo {
-    CollectionMockStats stats;
+    std::shared_ptr<CollectionMockStats> stats = std::make_shared<CollectionMockStats>();
     CollectionBulkLoaderMock* loader = nullptr;
     Status status{ErrorCodes::NotYetInitialized, ""};
 };
@@ -102,10 +103,9 @@ void DatabaseClonerTest::setUp() {
                                           storageInterface.get(),
                                           makeCollectionWorkClosure(),
                                           makeSetStatusClosure());
-    _databaseCloner->setScheduleDbWorkFn_forTest(
-        [this](const executor::TaskExecutor::CallbackFn& work) {
-            return getExecutor().scheduleWork(work);
-        });
+    _databaseCloner->setScheduleDbWorkFn_forTest([this](executor::TaskExecutor::CallbackFn work) {
+        return getExecutor().scheduleWork(std::move(work));
+    });
 
     _mockServer = stdx::make_unique<MockRemoteDBServer>(target.toString());
     _mockServer->assignCollectionUuid("db.a", *_options1.uuid);
@@ -124,14 +124,17 @@ void DatabaseClonerTest::setUp() {
         [this](const NamespaceString& nss,
                const CollectionOptions& options,
                const BSONObj& idIndexSpec,
-               const std::vector<BSONObj>& secondaryIndexSpecs) {
+               const std::vector<BSONObj>& secondaryIndexSpecs)
+        -> StatusWith<std::unique_ptr<CollectionBulkLoaderMock>> {
             const auto collInfo = &_collections[nss];
-            (collInfo->loader = new CollectionBulkLoaderMock(&collInfo->stats))
-                ->init(secondaryIndexSpecs)
-                .transitional_ignore();
 
-            return StatusWith<std::unique_ptr<CollectionBulkLoader>>(
-                std::unique_ptr<CollectionBulkLoader>(collInfo->loader));
+            auto localLoader = std::make_unique<CollectionBulkLoaderMock>(collInfo->stats);
+            auto status = localLoader->init(secondaryIndexSpecs);
+            if (!status.isOK())
+                return status;
+            collInfo->loader = localLoader.get();
+
+            return std::move(localLoader);
         };
 }
 
@@ -230,10 +233,9 @@ public:
                                                    ShouldFailRequestFn shouldFailRequest)
         : unittest::TaskExecutorProxy(executor), _shouldFailRequest(shouldFailRequest) {}
 
-    StatusWith<CallbackHandle> scheduleRemoteCommand(
-        const executor::RemoteCommandRequest& request,
-        const RemoteCommandCallbackFn& cb,
-        const transport::BatonHandle& baton = nullptr) override {
+    StatusWith<CallbackHandle> scheduleRemoteCommand(const executor::RemoteCommandRequest& request,
+                                                     const RemoteCommandCallbackFn& cb,
+                                                     const BatonHandle& baton = nullptr) override {
         if (_shouldFailRequest(request)) {
             return Status(ErrorCodes::OperationFailed, "failed to schedule remote command");
         }
@@ -540,7 +542,7 @@ TEST_F(DatabaseClonerTest, CollectionInfoNameDuplicate) {
                                                              << _options2.toBSON()))));
     }
 
-    ASSERT_EQUALS(ErrorCodes::DuplicateKey, getStatus().code());
+    ASSERT_EQUALS(51005, getStatus().code());
     ASSERT_STRING_CONTAINS(getStatus().reason(), "duplicate collection name 'a'");
     ASSERT_FALSE(_databaseCloner->isActive());
     ASSERT_EQUALS(DatabaseCloner::State::kComplete, _databaseCloner->getState_forTest());
@@ -652,16 +654,15 @@ TEST_F(DatabaseClonerTest, DatabaseClonerResendsListCollectionsRequestOnRetriabl
 }
 
 TEST_F(DatabaseClonerTest, ListCollectionsReturnsEmptyCollectionName) {
-    _databaseCloner =
-        stdx::make_unique<DatabaseCloner>(&getExecutor(),
-                                          dbWorkThreadPool.get(),
-                                          target,
-                                          dbname,
-                                          BSONObj(),
-                                          DatabaseCloner::ListCollectionsPredicateFn(),
-                                          storageInterface.get(),
-                                          makeCollectionWorkClosure(),
-                                          makeSetStatusClosure());
+    _databaseCloner = std::make_unique<DatabaseCloner>(&getExecutor(),
+                                                       dbWorkThreadPool.get(),
+                                                       target,
+                                                       dbname,
+                                                       BSONObj(),
+                                                       DatabaseCloner::ListCollectionsPredicateFn(),
+                                                       storageInterface.get(),
+                                                       makeCollectionWorkClosure(),
+                                                       makeSetStatusClosure());
     ASSERT_EQUALS(DatabaseCloner::State::kPreStart, _databaseCloner->getState_forTest());
 
     ASSERT_OK(_databaseCloner->startup());
@@ -833,14 +834,14 @@ TEST_F(DatabaseClonerTest, FirstCollectionListIndexesFailed) {
     // We have attempted, and failed, to clone the first collection.
     auto collInfo = _collections[NamespaceString{"db.a"}];
     ASSERT_EQUALS(ErrorCodes::CursorNotFound, collInfo.status.code());
-    auto stats = collInfo.stats;
+    auto stats = *collInfo.stats;
     stats.insertCount = 0;
     stats.commitCalled = false;
 
     // We have not attempted to clone the second collection.
     collInfo = _collections[NamespaceString{"db.b"}];
     ASSERT_EQUALS(ErrorCodes::NotYetInitialized, collInfo.status.code());
-    stats = collInfo.stats;
+    stats = *collInfo.stats;
     stats.insertCount = 0;
     stats.commitCalled = true;
 }
@@ -891,13 +892,13 @@ TEST_F(DatabaseClonerTest, CreateCollections) {
 
     auto collInfo = _collections[NamespaceString{"db.a"}];
     ASSERT_OK(collInfo.status);
-    auto stats = collInfo.stats;
+    auto stats = *collInfo.stats;
     stats.insertCount = 0;
     stats.commitCalled = true;
 
     collInfo = _collections[NamespaceString{"db.b"}];
     ASSERT_OK(collInfo.status);
-    stats = collInfo.stats;
+    stats = *collInfo.stats;
     stats.insertCount = 0;
     stats.commitCalled = true;
 }

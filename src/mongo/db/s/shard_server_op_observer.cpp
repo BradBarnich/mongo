@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -204,8 +206,8 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
                                       std::vector<InsertStatement>::const_iterator begin,
                                       std::vector<InsertStatement>::const_iterator end,
                                       bool fromMigrate) {
-    auto const css = CollectionShardingState::get(opCtx, nss);
-    const auto metadata = css->getMetadata(opCtx);
+    auto* const css = CollectionShardingState::get(opCtx, nss);
+    const auto metadata = css->getMetadataForOperation(opCtx);
 
     for (auto it = begin; it != end; ++it) {
         const auto& insertedDoc = it->doc;
@@ -234,8 +236,8 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
 }
 
 void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
-    auto const css = CollectionShardingState::get(opCtx, args.nss);
-    const auto metadata = css->getMetadata(opCtx);
+    auto* const css = CollectionShardingState::get(opCtx, args.nss);
+    const auto metadata = css->getMetadataForOperation(opCtx);
 
     if (args.nss == NamespaceString::kShardConfigCollectionsNamespace) {
         // Notification of routing table changes are only needed on secondaries
@@ -320,7 +322,9 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             if (setField.hasField(ShardDatabaseType::enterCriticalSectionCounter.name())) {
                 AutoGetDb autoDb(opCtx, db, MODE_X);
                 if (autoDb.getDb()) {
-                    DatabaseShardingState::get(autoDb.getDb()).setDbVersion(opCtx, boost::none);
+                    auto& dss = DatabaseShardingState::get(autoDb.getDb());
+                    auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, &dss);
+                    dss.setDbVersion(opCtx, boost::none, dssLock);
                 }
             }
         }
@@ -366,7 +370,9 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
 
         AutoGetDb autoDb(opCtx, deletedDatabase, MODE_X);
         if (autoDb.getDb()) {
-            DatabaseShardingState::get(autoDb.getDb()).setDbVersion(opCtx, boost::none);
+            auto& dss = DatabaseShardingState::get(autoDb.getDb());
+            auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, &dss);
+            dss.setDbVersion(opCtx, boost::none, dssLock);
         }
     }
 
@@ -389,7 +395,9 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
 
 repl::OpTime ShardServerOpObserver::onDropCollection(OperationContext* opCtx,
                                                      const NamespaceString& collectionName,
-                                                     OptionalCollectionUUID uuid) {
+                                                     OptionalCollectionUUID uuid,
+                                                     std::uint64_t numRecords,
+                                                     const CollectionDropType dropType) {
     if (collectionName == NamespaceString::kServerConfigurationNamespace) {
         // Dropping system collections is not allowed for end users
         invariant(!opCtx->writesAreReplicated());

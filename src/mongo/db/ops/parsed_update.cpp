@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -63,17 +65,19 @@ Status ParsedUpdate::parseRequest() {
         _collator = std::move(collator.getValue());
     }
 
-    Status status = parseArrayFilters();
-    if (!status.isOK()) {
-        return status;
+    auto statusWithArrayFilters =
+        parseArrayFilters(_request->getArrayFilters(), _opCtx, _collator.get());
+    if (!statusWithArrayFilters.isOK()) {
+        return statusWithArrayFilters.getStatus();
     }
+    _arrayFilters = std::move(statusWithArrayFilters.getValue());
 
     // We parse the update portion before the query portion because the dispostion of the update
     // may determine whether or not we need to produce a CanonicalQuery at all.  For example, if
     // the update involves the positional-dollar operator, we must have a CanonicalQuery even if
     // it isn't required for query execution.
     parseUpdate();
-    status = parseQuery();
+    Status status = parseQuery();
     if (!status.isOK())
         return status;
     return Status::OK();
@@ -145,15 +149,19 @@ void ParsedUpdate::parseUpdate() {
     _driver.parse(_request->getUpdates(), _arrayFilters, _request->isMulti());
 }
 
-Status ParsedUpdate::parseArrayFilters() {
-    for (auto rawArrayFilter : _request->getArrayFilters()) {
-        boost::intrusive_ptr<ExpressionContext> expCtx(
-            new ExpressionContext(_opCtx, _collator.get()));
+StatusWith<std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>>
+ParsedUpdate::parseArrayFilters(const std::vector<BSONObj>& rawArrayFiltersIn,
+                                OperationContext* opCtx,
+                                CollatorInterface* collator) {
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFiltersOut;
+    for (auto rawArrayFilter : rawArrayFiltersIn) {
+        boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, collator));
         auto parsedArrayFilter =
             MatchExpressionParser::parse(rawArrayFilter,
                                          std::move(expCtx),
                                          ExtensionsCallbackNoop(),
                                          MatchExpressionParser::kBanAllSpecialFeatures);
+
         if (!parsedArrayFilter.isOK()) {
             return parsedArrayFilter.getStatus().withContext("Error parsing array filter");
         }
@@ -170,17 +178,17 @@ Status ParsedUpdate::parseArrayFilters() {
                 ErrorCodes::FailedToParse,
                 "Cannot use an expression without a top-level field name in arrayFilters");
         }
-        if (_arrayFilters.find(*fieldName) != _arrayFilters.end()) {
+        if (arrayFiltersOut.find(*fieldName) != arrayFiltersOut.end()) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream()
                               << "Found multiple array filters with the same top-level field name "
                               << *fieldName);
         }
 
-        _arrayFilters[*fieldName] = std::move(finalArrayFilter);
+        arrayFiltersOut[*fieldName] = std::move(finalArrayFilter);
     }
 
-    return Status::OK();
+    return std::move(arrayFiltersOut);
 }
 
 PlanExecutor::YieldPolicy ParsedUpdate::yieldPolicy() const {

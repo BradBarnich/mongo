@@ -1,23 +1,25 @@
-/*
- *    Copyright (C) 2012 10gen, Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -130,7 +132,7 @@ Status buildResponse(const AuthenticationSession* session,
                      BSONType responsePayloadType,
                      BSONObjBuilder* result) {
     result->appendIntOrLL(saslCommandConversationIdFieldName, 1);
-    result->appendBool(saslCommandDoneFieldName, session->getMechanism().isDone());
+    result->appendBool(saslCommandDoneFieldName, session->getMechanism().isSuccess());
 
     if (responsePayload.size() > size_t(std::numeric_limits<int>::max())) {
         return Status(ErrorCodes::InvalidLength, "Response payload too long");
@@ -199,7 +201,7 @@ Status doSaslStep(OperationContext* opCtx,
         return status;
     }
 
-    if (mechanism.isDone()) {
+    if (mechanism.isSuccess()) {
         UserName userName(mechanism.getPrincipalName(), mechanism.getAuthenticationDatabase());
         status =
             AuthorizationSession::get(opCtx->getClient())->addAndAuthorizeUser(opCtx, userName);
@@ -218,7 +220,8 @@ Status doSaslStep(OperationContext* opCtx,
 StatusWith<std::unique_ptr<AuthenticationSession>> doSaslStart(OperationContext* opCtx,
                                                                const std::string& db,
                                                                const BSONObj& cmdObj,
-                                                               BSONObjBuilder* result) {
+                                                               BSONObjBuilder* result,
+                                                               std::string* principalName) {
     bool autoAuthorize = false;
     Status status = bsonExtractBooleanFieldWithDefault(
         cmdObj, saslCommandAutoAuthorizeFieldName, autoAuthorizeDefault, &autoAuthorize);
@@ -240,6 +243,7 @@ StatusWith<std::unique_ptr<AuthenticationSession>> doSaslStart(OperationContext*
 
     auto session = std::make_unique<AuthenticationSession>(std::move(swMech.getValue()));
     Status statusStep = doSaslStep(opCtx, session.get(), cmdObj, result);
+    *principalName = session->getMechanism().getPrincipalName().toString();
     if (!statusStep.isOK()) {
         return statusStep;
     }
@@ -280,21 +284,19 @@ bool CmdSaslStart::run(OperationContext* opCtx,
         return false;
     }
 
-    StatusWith<std::unique_ptr<AuthenticationSession>> swSession =
-        doSaslStart(opCtx, db, cmdObj, &result);
-    uassertStatusOK(swSession.getStatus());
-    auto session = std::move(swSession.getValue());
+    std::string principalName;
+    auto swSession = doSaslStart(opCtx, db, cmdObj, &result, &principalName);
 
-    auto& mechanism = session->getMechanism();
-    if (mechanism.isDone()) {
-        audit::logAuthentication(client,
-                                 mechanismName,
-                                 UserName(mechanism.getPrincipalName(), db),
-                                 swSession.getStatus().code());
+    if (!swSession.isOK() || swSession.getValue()->getMechanism().isSuccess()) {
+        audit::logAuthentication(
+            client, mechanismName, UserName(principalName, db), swSession.getStatus().code());
+        uassertStatusOK(swSession.getStatus());
     } else {
+        auto session = std::move(swSession.getValue());
         AuthenticationSession::swap(client, session);
     }
-    return swSession.isOK();
+
+    return true;
 }
 
 CmdSaslContinue::CmdSaslContinue() : BasicCommand(saslContinueCommandName) {}
@@ -329,7 +331,7 @@ bool CmdSaslContinue::run(OperationContext* opCtx,
     Status status = doSaslContinue(opCtx, session, cmdObj, &result);
     CommandHelpers::appendCommandStatusNoThrow(result, status);
 
-    if (mechanism.isDone()) {
+    if (mechanism.isSuccess() || !status.isOK()) {
         audit::logAuthentication(
             client,
             mechanism.mechanismName(),

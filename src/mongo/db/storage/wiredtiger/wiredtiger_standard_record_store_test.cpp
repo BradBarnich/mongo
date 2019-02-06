@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -95,9 +97,9 @@ public:
 
     virtual std::unique_ptr<RecordStore> newNonCappedRecordStore(const std::string& ns) {
         WiredTigerRecoveryUnit* ru =
-            dynamic_cast<WiredTigerRecoveryUnit*>(_engine.newRecoveryUnit());
+            checked_cast<WiredTigerRecoveryUnit*>(_engine.newRecoveryUnit());
         OperationContextNoop opCtx(ru);
-        string uri = "table:" + ns;
+        string uri = WiredTigerKVEngine::kTableUriPrefix + ns;
 
         const bool prefixed = false;
         StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
@@ -114,7 +116,7 @@ public:
 
         WiredTigerRecordStore::Params params;
         params.ns = ns;
-        params.uri = uri;
+        params.ident = ns;
         params.engineName = kWiredTigerEngineName;
         params.isCapped = false;
         params.isEphemeral = false;
@@ -139,7 +141,8 @@ public:
         WiredTigerRecoveryUnit* ru =
             dynamic_cast<WiredTigerRecoveryUnit*>(_engine.newRecoveryUnit());
         OperationContextNoop opCtx(ru);
-        string uri = "table:a.b";
+        string ident = "a.b";
+        string uri = WiredTigerKVEngine::kTableUriPrefix + "a.b";
 
         CollectionOptions options;
         options.capped = true;
@@ -159,7 +162,7 @@ public:
 
         WiredTigerRecordStore::Params params;
         params.ns = ns;
-        params.uri = uri;
+        params.ident = ident;
         params.engineName = kWiredTigerEngineName;
         params.isCapped = true;
         params.isEphemeral = false;
@@ -213,9 +216,10 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
     unique_ptr<WiredTigerHarnessHelper> harnessHelper(new WiredTigerHarnessHelper());
     unique_ptr<RecordStore> rs(harnessHelper->newNonCappedRecordStore());
 
+    string ident = rs->getIdent();
     string uri = checked_cast<WiredTigerRecordStore*>(rs.get())->getURI();
 
-    string indexUri = "table:myindex";
+    string indexUri = WiredTigerKVEngine::kTableUriPrefix + "myindex";
     const bool enableWtLogging = false;
     WiredTigerSizeStorer ss(harnessHelper->conn(), indexUri, enableWtLogging);
     checked_cast<WiredTigerRecordStore*>(rs.get())->setSizeStorer(&ss);
@@ -250,7 +254,7 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         WiredTigerRecordStore::Params params;
         params.ns = "a.b"_sd;
-        params.uri = uri;
+        params.ident = ident;
         params.engineName = kWiredTigerEngineName;
         params.isCapped = false;
         params.isEphemeral = false;
@@ -316,10 +320,13 @@ private:
         harnessHelper.reset(new WiredTigerHarnessHelper());
         const bool enableWtLogging = false;
         sizeStorer.reset(
-            new WiredTigerSizeStorer(harnessHelper->conn(), "table:sizeStorer", enableWtLogging));
+            new WiredTigerSizeStorer(harnessHelper->conn(),
+                                     WiredTigerKVEngine::kTableUriPrefix + "sizeStorer",
+                                     enableWtLogging));
         rs = harnessHelper->newNonCappedRecordStore();
         WiredTigerRecordStore* wtrs = checked_cast<WiredTigerRecordStore*>(rs.get());
         wtrs->setSizeStorer(sizeStorer.get());
+        ident = wtrs->getIdent();
         uri = wtrs->getURI();
 
         expectedNumRecords = 100;
@@ -359,6 +366,7 @@ protected:
     std::unique_ptr<WiredTigerHarnessHelper> harnessHelper;
     std::unique_ptr<WiredTigerSizeStorer> sizeStorer;
     std::unique_ptr<RecordStore> rs;
+    std::string ident;
     std::string uri;
 
     long long expectedNumRecords;
@@ -416,7 +424,7 @@ TEST_F(SizeStorerValidateTest, InvalidSizeStorerAtCreation) {
 
     WiredTigerRecordStore::Params params;
     params.ns = "a.b"_sd;
-    params.uri = uri;
+    params.ident = ident;
     params.engineName = kWiredTigerEngineName;
     params.isCapped = false;
     params.isEphemeral = false;
@@ -429,8 +437,8 @@ TEST_F(SizeStorerValidateTest, InvalidSizeStorerAtCreation) {
     ret->postConstructorInit(opCtx.get());
     rs.reset(ret);
 
-    ASSERT_EQUALS(expectedNumRecords * 2, rs->numRecords(NULL));
-    ASSERT_EQUALS(expectedDataSize * 2, rs->dataSize(NULL));
+    ASSERT_EQUALS(expectedNumRecords * 2, rs->numRecords(opCtx.get()));
+    ASSERT_EQUALS(expectedDataSize * 2, rs->dataSize(opCtx.get()));
 
     // Full validation should fix record and size counters.
     GoodValidateAdaptor adaptor;
@@ -442,8 +450,8 @@ TEST_F(SizeStorerValidateTest, InvalidSizeStorerAtCreation) {
     ASSERT_EQUALS(expectedNumRecords, getNumRecords());
     ASSERT_EQUALS(expectedDataSize, getDataSize());
 
-    ASSERT_EQUALS(expectedNumRecords, rs->numRecords(NULL));
-    ASSERT_EQUALS(expectedDataSize, rs->dataSize(NULL));
+    ASSERT_EQUALS(expectedNumRecords, rs->numRecords(opCtx.get()));
+    ASSERT_EQUALS(expectedDataSize, rs->dataSize(opCtx.get()));
 }
 
 }  // namespace

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -45,9 +47,9 @@ namespace {
 using namespace mongo;
 using namespace mongo::repl;
 
-BSONObj makeOp(long long seconds, long long hash) {
+BSONObj makeOp(long long seconds, long long term = 1LL) {
     auto uuid = unittest::assertGet(UUID::parse("b4c66a44-c1ca-4d86-8d25-12e82fa2de5b"));
-    return BSON("ts" << Timestamp(seconds, seconds) << "h" << hash << "t" << seconds << "op"
+    return BSON("ts" << Timestamp(seconds, seconds) << "t" << term << "op"
                      << "n"
                      << "o"
                      << BSONObj()
@@ -58,8 +60,8 @@ BSONObj makeOp(long long seconds, long long hash) {
 }
 
 int recordId = 0;
-OplogInterfaceMock::Operation makeOpAndRecordId(long long seconds, long long hash) {
-    return std::make_pair(makeOp(seconds, hash), RecordId(++recordId));
+OplogInterfaceMock::Operation makeOpAndRecordId(long long seconds, long long term = 1LL) {
+    return std::make_pair(makeOp(seconds), RecordId(++recordId));
 }
 
 TEST(RollBackLocalOperationsTest, InvalidLocalOplogIterator) {
@@ -82,7 +84,7 @@ TEST(RollBackLocalOperationsTest, InvalidLocalOplogIterator) {
 }
 
 TEST(RollBackLocalOperationsTest, InvalidRollbackOperationFunction) {
-    ASSERT_THROWS_CODE(RollBackLocalOperations(OplogInterfaceMock({makeOpAndRecordId(1, 0)}),
+    ASSERT_THROWS_CODE(RollBackLocalOperations(OplogInterfaceMock({makeOpAndRecordId(1)}),
                                                RollBackLocalOperations::RollbackOperationFn()),
                        AssertionException,
                        ErrorCodes::BadValue);
@@ -91,17 +93,17 @@ TEST(RollBackLocalOperationsTest, InvalidRollbackOperationFunction) {
 TEST(RollBackLocalOperationsTest, EmptyLocalOplog) {
     OplogInterfaceMock localOplog;
     RollBackLocalOperations finder(localOplog, [](const BSONObj&) { return Status::OK(); });
-    auto result = finder.onRemoteOperation(makeOp(1, 0));
+    auto result = finder.onRemoteOperation(makeOp(1));
     ASSERT_EQUALS(ErrorCodes::OplogStartMissing, result.getStatus().code());
 }
 
 TEST(RollBackLocalOperationsTest, RollbackMultipleLocalOperations) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
+    auto commonOperation = makeOpAndRecordId(1);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(5, 1),
-        makeOpAndRecordId(4, 1),
-        makeOpAndRecordId(3, 1),
-        makeOpAndRecordId(2, 1),
+        makeOpAndRecordId(5),
+        makeOpAndRecordId(4),
+        makeOpAndRecordId(3),
+        makeOpAndRecordId(2),
         commonOperation,
     });
     OplogInterfaceMock localOplog(localOperations);
@@ -124,9 +126,9 @@ TEST(RollBackLocalOperationsTest, RollbackMultipleLocalOperations) {
 }
 
 TEST(RollBackLocalOperationsTest, RollbackOperationFailed) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
+    auto commonOperation = makeOpAndRecordId(1);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(2, 1), commonOperation,
+        makeOpAndRecordId(2), commonOperation,
     });
     OplogInterfaceMock localOplog(localOperations);
     auto rollbackOperation = [&](const BSONObj& operation) {
@@ -138,9 +140,9 @@ TEST(RollBackLocalOperationsTest, RollbackOperationFailed) {
 }
 
 TEST(RollBackLocalOperationsTest, EndOfLocalOplog) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
+    auto commonOperation = makeOpAndRecordId(1);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(2, 1),
+        makeOpAndRecordId(2),
     });
     OplogInterfaceMock localOplog(localOperations);
     RollBackLocalOperations finder(localOplog, [](const BSONObj&) { return Status::OK(); });
@@ -149,9 +151,9 @@ TEST(RollBackLocalOperationsTest, EndOfLocalOplog) {
 }
 
 TEST(RollBackLocalOperationsTest, SkipRemoteOperations) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
+    auto commonOperation = makeOpAndRecordId(1);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(5, 1), makeOpAndRecordId(4, 1), makeOpAndRecordId(2, 1), commonOperation,
+        makeOpAndRecordId(5), makeOpAndRecordId(4), makeOpAndRecordId(2), commonOperation,
     });
     OplogInterfaceMock localOplog(localOperations);
     auto i = localOperations.cbegin();
@@ -162,12 +164,12 @@ TEST(RollBackLocalOperationsTest, SkipRemoteOperations) {
     };
     RollBackLocalOperations finder(localOplog, rollbackOperation);
     {
-        auto result = finder.onRemoteOperation(makeOp(6, 1));
+        auto result = finder.onRemoteOperation(makeOp(6));
         ASSERT_EQUALS(ErrorCodes::NoSuchKey, result.getStatus().code());
         ASSERT_TRUE(i == localOperations.cbegin());
     }
     {
-        auto result = finder.onRemoteOperation(makeOp(3, 1));
+        auto result = finder.onRemoteOperation(makeOp(3));
         ASSERT_EQUALS(ErrorCodes::NoSuchKey, result.getStatus().code());
         ASSERT_TRUE(std::distance(localOperations.cbegin(), i) == 2);
     }
@@ -182,68 +184,24 @@ TEST(RollBackLocalOperationsTest, SkipRemoteOperations) {
     ASSERT_TRUE(i == localOperations.cend());
 }
 
-TEST(RollBackLocalOperationsTest, SameTimestampDifferentHashess) {
+TEST(RollBackLocalOperationsTest, SameTimestampDifferentTermsRollbackNoSuchKey) {
     auto commonOperation = makeOpAndRecordId(1, 1);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(1, 5), makeOpAndRecordId(1, 3), commonOperation,
-    });
-    OplogInterfaceMock localOplog(localOperations);
-    auto i = localOperations.cbegin();
-    auto rollbackOperation = [&](const BSONObj& operation) {
-        ASSERT_BSONOBJ_EQ(i->first, operation);
-        i++;
-        return Status::OK();
-    };
-    RollBackLocalOperations finder(localOplog, rollbackOperation);
-    {
-        auto result = finder.onRemoteOperation(makeOp(1, 4));
-        ASSERT_EQUALS(ErrorCodes::NoSuchKey, result.getStatus().code());
-        ASSERT_TRUE(std::distance(localOperations.cbegin(), i) == 1);
-    }
-    {
-        auto result = finder.onRemoteOperation(makeOp(1, 2));
-        ASSERT_EQUALS(ErrorCodes::NoSuchKey, result.getStatus().code());
-        ASSERT_TRUE(std::distance(localOperations.cbegin(), i) == 2);
-    }
-    auto result = finder.onRemoteOperation(commonOperation.first);
-    ASSERT_OK(result.getStatus());
-    ASSERT_EQUALS(OpTime::parseFromOplogEntry(commonOperation.first),
-                  result.getValue().getOpTime());
-    ASSERT_EQUALS(commonOperation.second, result.getValue().getRecordId());
-    ASSERT_FALSE(i == localOperations.cend());
-    ASSERT_BSONOBJ_EQ(commonOperation.first, i->first);
-    i++;
-    ASSERT_TRUE(i == localOperations.cend());
-}
-
-TEST(RollBackLocalOperationsTest, SameTimestampDifferentHashesRollbackOperationFailed) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
-    OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(1, 3), commonOperation,
+        makeOpAndRecordId(2, 3), commonOperation,
     });
     OplogInterfaceMock localOplog(localOperations);
     auto rollbackOperation = [&](const BSONObj& operation) {
         return Status(ErrorCodes::OperationFailed, "");
     };
     RollBackLocalOperations finder(localOplog, rollbackOperation);
-    auto result = finder.onRemoteOperation(makeOp(1, 2));
-    ASSERT_EQUALS(ErrorCodes::OperationFailed, result.getStatus().code());
-}
-
-TEST(RollBackLocalOperationsTest, SameTimestampDifferentHashesEndOfLocalOplog) {
-    OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(1, 3),
-    });
-    OplogInterfaceMock localOplog(localOperations);
-    RollBackLocalOperations finder(localOplog, [](const BSONObj&) { return Status::OK(); });
-    auto result = finder.onRemoteOperation(makeOp(1, 2));
-    ASSERT_EQUALS(ErrorCodes::NoMatchingDocument, result.getStatus().code());
+    auto result = finder.onRemoteOperation(makeOp(2, 2));
+    ASSERT_EQUALS(ErrorCodes::NoSuchKey, result.getStatus().code());
 }
 
 TEST(SyncRollBackLocalOperationsTest, OplogStartMissing) {
     ASSERT_EQUALS(ErrorCodes::OplogStartMissing,
                   syncRollBackLocalOperations(OplogInterfaceMock(),
-                                              OplogInterfaceMock({makeOpAndRecordId(1, 0)}),
+                                              OplogInterfaceMock({makeOpAndRecordId(1)}),
                                               [](const BSONObj&) { return Status::OK(); })
                       .getStatus()
                       .code());
@@ -251,7 +209,7 @@ TEST(SyncRollBackLocalOperationsTest, OplogStartMissing) {
 
 TEST(SyncRollBackLocalOperationsTest, RemoteOplogMissing) {
     ASSERT_EQUALS(ErrorCodes::InvalidSyncSource,
-                  syncRollBackLocalOperations(OplogInterfaceMock({makeOpAndRecordId(1, 0)}),
+                  syncRollBackLocalOperations(OplogInterfaceMock({makeOpAndRecordId(1)}),
                                               OplogInterfaceMock(),
                                               [](const BSONObj&) { return Status::OK(); })
                       .getStatus()
@@ -259,9 +217,9 @@ TEST(SyncRollBackLocalOperationsTest, RemoteOplogMissing) {
 }
 
 TEST(SyncRollBackLocalOperationsTest, RollbackTwoOperations) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
+    auto commonOperation = makeOpAndRecordId(1);
     OplogInterfaceMock::Operations localOperations({
-        makeOpAndRecordId(3, 1), makeOpAndRecordId(2, 1), commonOperation,
+        makeOpAndRecordId(3), makeOpAndRecordId(2), commonOperation,
     });
     auto i = localOperations.cbegin();
     auto result = syncRollBackLocalOperations(OplogInterfaceMock(localOperations),
@@ -282,8 +240,8 @@ TEST(SyncRollBackLocalOperationsTest, RollbackTwoOperations) {
 }
 
 TEST(SyncRollBackLocalOperationsTest, SkipOneRemoteOperation) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
-    auto remoteOperation = makeOpAndRecordId(2, 1);
+    auto commonOperation = makeOpAndRecordId(1);
+    auto remoteOperation = makeOpAndRecordId(2);
     auto result =
         syncRollBackLocalOperations(OplogInterfaceMock({commonOperation}),
                                     OplogInterfaceMock({remoteOperation, commonOperation}),
@@ -297,77 +255,10 @@ TEST(SyncRollBackLocalOperationsTest, SkipOneRemoteOperation) {
     ASSERT_EQUALS(commonOperation.second, result.getValue().getRecordId());
 }
 
-TEST(SyncRollBackLocalOperationsTest, SameTimestampDifferentHashes) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
-    auto localOperation = makeOpAndRecordId(1, 2);
-    auto remoteOperation = makeOpAndRecordId(1, 3);
-    bool called = false;
-    auto result =
-        syncRollBackLocalOperations(OplogInterfaceMock({localOperation, commonOperation}),
-                                    OplogInterfaceMock({remoteOperation, commonOperation}),
-                                    [&](const BSONObj& operation) {
-                                        ASSERT_BSONOBJ_EQ(localOperation.first, operation);
-                                        called = true;
-                                        return Status::OK();
-                                    });
-    ASSERT_OK(result.getStatus());
-    ASSERT_EQUALS(OpTime::parseFromOplogEntry(commonOperation.first),
-                  result.getValue().getOpTime());
-    ASSERT_EQUALS(commonOperation.second, result.getValue().getRecordId());
-    ASSERT_TRUE(called);
-}
-
-TEST(SyncRollBackLocalOperationsTest, SameTimestampEndOfLocalOplog) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
-    auto localOperation = makeOpAndRecordId(1, 2);
-    auto remoteOperation = makeOpAndRecordId(1, 3);
-    bool called = false;
-    auto result =
-        syncRollBackLocalOperations(OplogInterfaceMock({localOperation}),
-                                    OplogInterfaceMock({remoteOperation, commonOperation}),
-                                    [&](const BSONObj& operation) {
-                                        ASSERT_BSONOBJ_EQ(localOperation.first, operation);
-                                        called = true;
-                                        return Status::OK();
-                                    });
-    ASSERT_EQUALS(ErrorCodes::NoMatchingDocument, result.getStatus().code());
-    ASSERT_STRING_CONTAINS(result.getStatus().reason(), "reached beginning of local oplog");
-    ASSERT_TRUE(called);
-}
-
-TEST(SyncRollBackLocalOperationsTest, SameTimestampRollbackOperationFailed) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
-    auto localOperation = makeOpAndRecordId(1, 2);
-    auto remoteOperation = makeOpAndRecordId(1, 3);
-    auto result = syncRollBackLocalOperations(
-        OplogInterfaceMock({localOperation, commonOperation}),
-        OplogInterfaceMock({remoteOperation, commonOperation}),
-        [&](const BSONObj& operation) { return Status(ErrorCodes::OperationFailed, ""); });
-    ASSERT_EQUALS(ErrorCodes::OperationFailed, result.getStatus().code());
-}
-
-TEST(SyncRollBackLocalOperationsTest, SameTimestampEndOfRemoteOplog) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
-    auto localOperation = makeOpAndRecordId(1, 2);
-    auto remoteOperation = makeOpAndRecordId(1, 3);
-    bool called = false;
-    auto result =
-        syncRollBackLocalOperations(OplogInterfaceMock({localOperation, commonOperation}),
-                                    OplogInterfaceMock({remoteOperation}),
-                                    [&](const BSONObj& operation) {
-                                        ASSERT_BSONOBJ_EQ(localOperation.first, operation);
-                                        called = true;
-                                        return Status::OK();
-                                    });
-    ASSERT_EQUALS(ErrorCodes::NoMatchingDocument, result.getStatus().code());
-    ASSERT_STRING_CONTAINS(result.getStatus().reason(), "reached beginning of remote oplog");
-    ASSERT_TRUE(called);
-}
-
 TEST(SyncRollBackLocalOperationsTest, DifferentTimestampEndOfLocalOplog) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
-    auto localOperation = makeOpAndRecordId(3, 1);
-    auto remoteOperation = makeOpAndRecordId(2, 1);
+    auto commonOperation = makeOpAndRecordId(1);
+    auto localOperation = makeOpAndRecordId(3);
+    auto remoteOperation = makeOpAndRecordId(2);
     bool called = false;
     auto result =
         syncRollBackLocalOperations(OplogInterfaceMock({localOperation}),
@@ -383,8 +274,8 @@ TEST(SyncRollBackLocalOperationsTest, DifferentTimestampEndOfLocalOplog) {
 }
 
 TEST(SyncRollBackLocalOperationsTest, DifferentTimestampRollbackOperationFailed) {
-    auto localOperation = makeOpAndRecordId(3, 1);
-    auto remoteOperation = makeOpAndRecordId(2, 1);
+    auto localOperation = makeOpAndRecordId(3);
+    auto remoteOperation = makeOpAndRecordId(2);
     auto result = syncRollBackLocalOperations(
         OplogInterfaceMock({localOperation}),
         OplogInterfaceMock({remoteOperation}),
@@ -393,9 +284,9 @@ TEST(SyncRollBackLocalOperationsTest, DifferentTimestampRollbackOperationFailed)
 }
 
 TEST(SyncRollBackLocalOperationsTest, DifferentTimestampEndOfRemoteOplog) {
-    auto commonOperation = makeOpAndRecordId(1, 1);
-    auto localOperation = makeOpAndRecordId(2, 1);
-    auto remoteOperation = makeOpAndRecordId(3, 1);
+    auto commonOperation = makeOpAndRecordId(1);
+    auto localOperation = makeOpAndRecordId(2);
+    auto remoteOperation = makeOpAndRecordId(3);
     auto result = syncRollBackLocalOperations(OplogInterfaceMock({localOperation, commonOperation}),
                                               OplogInterfaceMock({remoteOperation}),
                                               [&](const BSONObj& operation) {
@@ -431,8 +322,8 @@ public:
         unittest::log() << "Returning success on DBClientCursorForTest::query()";
 
         BSONArrayBuilder builder;
-        builder.append(makeOp(1, 1));
-        builder.append(makeOp(2, 2));
+        builder.append(makeOp(1));
+        builder.append(makeOp(2));
         return std::make_unique<DBClientMockCursor>(this, builder.arr());
     }
 
@@ -445,7 +336,7 @@ void checkRemoteIterator(int numNetworkFailures, bool expectedToSucceed) {
     DBClientConnectionForTest conn(numNetworkFailures);
     auto getConnection = [&]() -> DBClientBase* { return &conn; };
 
-    auto localOperation = makeOpAndRecordId(1, 1);
+    auto localOperation = makeOpAndRecordId(1);
     OplogInterfaceRemote remoteOplogMock(
         HostAndPort("229w43rd", 10036), getConnection, "somecollection", 0);
 

@@ -1,39 +1,45 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/mongos_process_interface.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -43,8 +49,12 @@
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/s/query/cluster_query_knobs.h"
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/query/router_exec_stage.h"
+#include "mongo/s/transaction_router.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -54,6 +64,7 @@ using std::string;
 using std::unique_ptr;
 
 namespace {
+
 /**
  * Determines the single shard to which the given query will be targeted, and its associated
  * shardVersion. Throws if the query targets more than one shard.
@@ -102,7 +113,9 @@ bool supportsUniqueKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                ? index.getObjectField(IndexDescriptor::kCollationFieldName)
                                : CollationSpec::kSimpleSpec));
 
-    return index.getBoolField(IndexDescriptor::kUniqueFieldName) &&
+    // SERVER-5335: The _id index does not report to be unique, but in fact is unique.
+    auto isIdIndex = index[IndexDescriptor::kIndexNameFieldName].String() == "_id_";
+    return (isIdIndex || index.getBoolField(IndexDescriptor::kUniqueFieldName)) &&
         !index.hasField(IndexDescriptor::kPartialFilterExprFieldName) &&
         MongoProcessCommon::keyPatternNamesExactPaths(
                index.getObjectField(IndexDescriptor::kKeyPatternFieldName), uniqueKeyPaths) &&
@@ -111,12 +124,37 @@ bool supportsUniqueKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
 
 }  // namespace
 
+std::unique_ptr<Pipeline, PipelineDeleter> MongoSInterface::makePipeline(
+    const std::vector<BSONObj>& rawPipeline,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const MakePipelineOptions pipelineOptions) {
+    // Explain is not supported for auxiliary lookups.
+    invariant(!expCtx->explain);
+
+    auto pipeline = uassertStatusOK(Pipeline::parse(rawPipeline, expCtx));
+    if (pipelineOptions.optimize) {
+        pipeline->optimizePipeline();
+    }
+    if (pipelineOptions.attachCursorSource) {
+        // 'attachCursorSourceToPipeline' handles any complexity related to sharding.
+        pipeline = attachCursorSourceToPipeline(expCtx, pipeline.release());
+    }
+
+    return pipeline;
+}
+
+std::unique_ptr<Pipeline, PipelineDeleter> MongoSInterface::attachCursorSourceToPipeline(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* ownedPipeline) {
+    return sharded_agg_helpers::targetShardsAndAddMergeCursors(expCtx, ownedPipeline);
+}
+
 boost::optional<Document> MongoSInterface::lookupSingleDocument(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& nss,
     UUID collectionUUID,
     const Document& filter,
-    boost::optional<BSONObj> readConcern) {
+    boost::optional<BSONObj> readConcern,
+    bool allowSpeculativeMajorityRead) {
     auto foreignExpCtx = expCtx->copyWith(nss, collectionUUID);
 
     // Create the find command to be dispatched to the shard in order to return the post-change
@@ -133,6 +171,9 @@ boost::optional<Document> MongoSInterface::lookupSingleDocument(
     cmdBuilder.append("comment", expCtx->comment);
     if (readConcern) {
         cmdBuilder.append(repl::ReadConcernArgs::kReadConcernFieldName, *readConcern);
+    }
+    if (allowSpeculativeMajorityRead) {
+        cmdBuilder.append("allowSpeculativeMajorityRead", true);
     }
 
     auto shardResult = std::vector<RemoteCursor>();
@@ -204,36 +245,6 @@ boost::optional<Document> MongoSInterface::lookupSingleDocument(
             batch.size() <= 1u);
 
     return (!batch.empty() ? Document(batch.front()) : boost::optional<Document>{});
-}
-
-std::pair<std::vector<FieldPath>, bool> MongoSInterface::collectDocumentKeyFields(
-    OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const {
-
-    invariant(!nssOrUUID.uuid(), "Did not expect to use this method with a UUID on mongos");
-    const NamespaceString& nss = *nssOrUUID.nss();
-
-    auto collRoutInfo = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss);
-    if (collRoutInfo == ErrorCodes::NamespaceNotFound) {
-        return {{"_id"}, false};
-    }
-    uassertStatusOKWithContext(collRoutInfo, "Collection Routing Info is unavailable");
-
-    auto cm = collRoutInfo.getValue().cm();
-    if (!cm)
-        return {{"_id"}, false};
-
-    // Unpack the shard key.
-    std::vector<FieldPath> result;
-    bool gotId = false;
-    for (auto& field : cm->getShardKeyPattern().getKeyPatternFields()) {
-        result.emplace_back(field->dottedField());
-        gotId |= (result.back().fullPath() == "_id");
-    }
-    if (!gotId) {  // If not part of the shard key, "_id" comes last.
-        result.emplace_back("_id");
-    }
-    // Collection is sharded so the document key fields will never change, mark as final.
-    return {result, true};
 }
 
 BSONObj MongoSInterface::_reportCurrentOpForClient(OperationContext* opCtx,

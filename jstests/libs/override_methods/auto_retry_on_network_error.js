@@ -185,17 +185,15 @@
         } else if (cmdName === "aggregate") {
             var stages = cmdObj.pipeline;
 
-            // $listLocalCursors and $listLocalSessions must be the first stage in the pipeline.
+            // $listLocalSessions must be the first stage in the pipeline.
             const firstStage =
                 stages && Array.isArray(stages) && (stages.length > 0) ? stages[0] : undefined;
             const hasListLocalStage = firstStage && (typeof firstStage === "object") &&
-                (firstStage.hasOwnProperty("$listLocalCursors") ||
-                 firstStage.hasOwnProperty("$listLocalSessions"));
+                firstStage.hasOwnProperty("$listLocalSessions");
             if (hasListLocalStage) {
-                throw new Error(
-                    "Refusing to run a test that issues an aggregation command with" +
-                    " $listLocalCursors or $listLocalSessions because they rely on in-memory" +
-                    " state that may not survive failovers.");
+                throw new Error("Refusing to run a test that issues an aggregation command with" +
+                                " $listLocalSessions because it relies on in-memory" +
+                                " state that may not survive failovers.");
             }
 
             // Aggregate can be either a read or a write depending on whether it has a $out stage.
@@ -222,8 +220,11 @@
                 " std::terminate() if interrupted by a stepdown.");
         }
 
+        let retry = false;
         do {
             try {
+                TestData.retryingOnNetworkError = retry;
+                retry = true;
                 let res = clientFunction.apply(mongo, clientFunctionArguments);
 
                 if (isRetryableWriteCmd) {
@@ -231,7 +232,8 @@
                     if ((cmdName === "findandmodify" || cmdName === "findAndModify") &&
                         isRetryableExecutorCodeAndMessage(res.code, res.errmsg)) {
                         print("=-=-=-= Retrying because of executor interruption: " + cmdName +
-                              ", retries remaining: " + numRetries);
+                              ", retries remaining: " + numRetries + " error: " +
+                              tojsononeline(res));
                         continue;
                     }
 
@@ -328,12 +330,15 @@
                     }
                 }
 
+                TestData.retryingOnNetworkError = false;
                 return res;
             } catch (e) {
                 const kReplicaSetMonitorError =
                     /^Could not find host matching read preference.*mode: "primary"/;
 
                 if (numRetries === 0) {
+                    TestData.retryingOnNetworkError = false;
+                    jsTestLog("=-=-=-= No retries, throwing");
                     throw e;
                 } else if (e.message.match(kReplicaSetMonitorError) &&
                            Date.now() - startTime < 5 * 60 * 1000) {
@@ -344,10 +349,14 @@
                     print("=-=-=-= Failed to find primary when attempting to run " + cmdName +
                           " command, will retry for another 15 seconds");
                     continue;
+                } else if ((e.message.indexOf("writeConcernError") >= 0) && isRetryableError(e)) {
+                    print("=-=-=-= Retrying write concern error with retryable code for command: " +
+                          cmdName + ", retries remaining: " + numRetries + " error: " + tojson(e));
+                    continue;
                 } else if (!isNetworkError(e)) {
                     throw e;
                 } else if (isRetryableWriteCmd) {
-                    if (canRetryWrites) {
+                    if (_serverSession.canRetryWrites(cmdObj)) {
                         // If the command is retryable, assume the command has already gone through
                         // or will go through the retry logic in SessionAwareClient, so propagate
                         // the error.

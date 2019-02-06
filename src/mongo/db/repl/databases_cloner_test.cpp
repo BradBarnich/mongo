@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -64,7 +65,7 @@ using namespace unittest;
 using Responses = std::vector<std::pair<std::string, BSONObj>>;
 
 struct CollectionCloneInfo {
-    CollectionMockStats stats;
+    std::shared_ptr<CollectionMockStats> stats = std::make_shared<CollectionMockStats>();
     CollectionBulkLoaderMock* loader = nullptr;
     Status status{ErrorCodes::NotYetInitialized, ""};
 };
@@ -132,7 +133,7 @@ public:
         getNet()->runReadyNetworkOperations();
         if (getNet()->hasReadyRequests()) {
             log() << "The network has unexpected requests to process, next req:";
-            NetworkInterfaceMock::NetworkOperation req = *getNet()->getNextReadyRequest();
+            const NetworkInterfaceMock::NetworkOperation& req = *getNet()->getNextReadyRequest();
             log() << req.getDiagnosticString();
         }
         ASSERT_FALSE(getNet()->hasReadyRequests());
@@ -174,18 +175,20 @@ protected:
             [this](const NamespaceString& nss,
                    const CollectionOptions& options,
                    const BSONObj idIndexSpec,
-                   const std::vector<BSONObj>& secondaryIndexSpecs) {
+                   const std::vector<BSONObj>& secondaryIndexSpecs)
+            -> StatusWith<std::unique_ptr<CollectionBulkLoaderMock>> {
                 // Get collection info from map.
                 const auto collInfo = &_collections[nss];
-                if (collInfo->stats.initCalled) {
+                if (collInfo->stats->initCalled) {
                     log() << "reusing collection during test which may cause problems, ns:" << nss;
                 }
-                (collInfo->loader = new CollectionBulkLoaderMock(&collInfo->stats))
-                    ->init(secondaryIndexSpecs)
-                    .transitional_ignore();
+                auto localLoader = std::make_unique<CollectionBulkLoaderMock>(collInfo->stats);
+                auto status = localLoader->init(secondaryIndexSpecs);
+                if (!status.isOK())
+                    return status;
+                collInfo->loader = localLoader.get();
 
-                return StatusWith<std::unique_ptr<CollectionBulkLoader>>(
-                    std::unique_ptr<CollectionBulkLoader>(collInfo->loader));
+                return std::move(localLoader);
             };
 
         _dbWorkThreadPool.startup();
@@ -299,8 +302,8 @@ protected:
                                    result = status;
                                    cvDone.notify_all();
                                }};
-        cloner.setScheduleDbWorkFn_forTest([this](const executor::TaskExecutor::CallbackFn& work) {
-            return getExecutor().scheduleWork(work);
+        cloner.setScheduleDbWorkFn_forTest([this](executor::TaskExecutor::CallbackFn work) {
+            return getExecutor().scheduleWork(std::move(work));
         });
 
         cloner.setStartCollectionClonerFn([this](CollectionCloner& cloner) {
@@ -769,10 +772,9 @@ public:
                                                    ShouldFailRequestFn shouldFailRequest)
         : unittest::TaskExecutorProxy(executor), _shouldFailRequest(shouldFailRequest) {}
 
-    StatusWith<CallbackHandle> scheduleRemoteCommand(
-        const executor::RemoteCommandRequest& request,
-        const RemoteCommandCallbackFn& cb,
-        const transport::BatonHandle& baton = nullptr) override {
+    StatusWith<CallbackHandle> scheduleRemoteCommand(const executor::RemoteCommandRequest& request,
+                                                     const RemoteCommandCallbackFn& cb,
+                                                     const BatonHandle& baton = nullptr) override {
         if (_shouldFailRequest(request)) {
             return Status(ErrorCodes::OperationFailed, "failed to schedule remote command");
         }
@@ -931,13 +933,11 @@ TEST_F(DBsClonerTest, SingleDatabaseCopiesCompletely) {
         // count:a
         {"count", BSON("n" << 1 << "ok" << 1)},
         // listIndexes:a
-        {
-            "listIndexes",
-            fromjson(str::stream()
-                     << "{ok:1, cursor:{id:NumberLong(0), ns:'a.$cmd.listIndexes.a', firstBatch:["
-                        "{v:"
-                     << OplogEntry::kOplogVersion
-                     << ", key:{_id:1}, name:'_id_', ns:'a.a'}]}}")},
+        {"listIndexes",
+         fromjson(str::stream() << "{ok:1, cursor:{id:NumberLong(0), ns:'a.a', firstBatch:["
+                                   "{v:"
+                                << OplogEntry::kOplogVersion
+                                << ", key:{_id:1}, name:'_id_', ns:'a.a'}]}}")},
         // Clone Done
     };
     runCompleteClone(resps);
@@ -950,48 +950,45 @@ TEST_F(DBsClonerTest, TwoDatabasesCopiesCompletely) {
     options2.uuid = UUID::gen();
     _mockServer->assignCollectionUuid("a.a", *options1.uuid);
     _mockServer->assignCollectionUuid("b.b", *options1.uuid);
-    const Responses resps =
-        {
-            // Clone Start
-            // listDatabases
-            {"listDatabases", fromjson("{ok:1, databases:[{name:'a'}, {name:'b'}]}")},
-            // listCollections for "a"
-            {"listCollections",
-             BSON("ok" << 1 << "cursor" << BSON("id" << 0ll << "ns"
-                                                     << "a.$cmd.listCollections"
-                                                     << "firstBatch"
-                                                     << BSON_ARRAY(BSON("name"
-                                                                        << "a"
-                                                                        << "options"
-                                                                        << options1.toBSON()))))},
-            // count:a
-            {"count", BSON("n" << 1 << "ok" << 1)},
-            // listIndexes:a
-            {"listIndexes",
-             fromjson(str::stream()
-                      << "{ok:1, cursor:{id:NumberLong(0), ns:'a.$cmd.listIndexes.a', firstBatch:["
-                         "{v:"
-                      << OplogEntry::kOplogVersion
-                      << ", key:{_id:1}, name:'_id_', ns:'a.a'}]}}")},
-            // listCollections for "b"
-            {"listCollections",
-             BSON("ok" << 1 << "cursor" << BSON("id" << 0ll << "ns"
-                                                     << "b.$cmd.listCollections"
-                                                     << "firstBatch"
-                                                     << BSON_ARRAY(BSON("name"
-                                                                        << "b"
-                                                                        << "options"
-                                                                        << options2.toBSON()))))},
-            // count:b
-            {"count", BSON("n" << 2 << "ok" << 1)},
-            // listIndexes:b
-            {"listIndexes",
-             fromjson(str::stream()
-                      << "{ok:1, cursor:{id:NumberLong(0), ns:'b.$cmd.listIndexes.b', firstBatch:["
-                         "{v:"
-                      << OplogEntry::kOplogVersion
-                      << ", key:{_id:1}, name:'_id_', ns:'b.b'}]}}")},
-        };
+    const Responses resps = {
+        // Clone Start
+        // listDatabases
+        {"listDatabases", fromjson("{ok:1, databases:[{name:'a'}, {name:'b'}]}")},
+        // listCollections for "a"
+        {"listCollections",
+         BSON("ok" << 1 << "cursor" << BSON("id" << 0ll << "ns"
+                                                 << "a.$cmd.listCollections"
+                                                 << "firstBatch"
+                                                 << BSON_ARRAY(BSON("name"
+                                                                    << "a"
+                                                                    << "options"
+                                                                    << options1.toBSON()))))},
+        // count:a
+        {"count", BSON("n" << 1 << "ok" << 1)},
+        // listIndexes:a
+        {"listIndexes",
+         fromjson(str::stream() << "{ok:1, cursor:{id:NumberLong(0), ns:'a.a', firstBatch:["
+                                   "{v:"
+                                << OplogEntry::kOplogVersion
+                                << ", key:{_id:1}, name:'_id_', ns:'a.a'}]}}")},
+        // listCollections for "b"
+        {"listCollections",
+         BSON("ok" << 1 << "cursor" << BSON("id" << 0ll << "ns"
+                                                 << "b.$cmd.listCollections"
+                                                 << "firstBatch"
+                                                 << BSON_ARRAY(BSON("name"
+                                                                    << "b"
+                                                                    << "options"
+                                                                    << options2.toBSON()))))},
+        // count:b
+        {"count", BSON("n" << 2 << "ok" << 1)},
+        // listIndexes:b
+        {"listIndexes",
+         fromjson(str::stream() << "{ok:1, cursor:{id:NumberLong(0), ns:'b.b', firstBatch:["
+                                   "{v:"
+                                << OplogEntry::kOplogVersion
+                                << ", key:{_id:1}, name:'_id_', ns:'b.b'}]}}")},
+    };
     runCompleteClone(resps);
 }
 

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -111,8 +113,8 @@ void OplogFetcherTest::setUp() {
     rbid = 2;
 
     dataReplicatorExternalState = stdx::make_unique<DataReplicatorExternalStateMock>();
-    dataReplicatorExternalState->currentTerm = lastFetched.opTime.getTerm();
-    dataReplicatorExternalState->lastCommittedOpTime = {{9999, 0}, lastFetched.opTime.getTerm()};
+    dataReplicatorExternalState->currentTerm = lastFetched.getTerm();
+    dataReplicatorExternalState->lastCommittedOpTime = {{9999, 0}, lastFetched.getTerm()};
 
     enqueueDocumentsFn = [this](Fetcher::Documents::const_iterator begin,
                                 Fetcher::Documents::const_iterator end,
@@ -229,7 +231,7 @@ TEST_F(
     FindQueryContainsTermAndStartTimestampIfGetCurrentTermAndLastCommittedOpTimeReturnsValidTerm) {
     auto cmdObj = makeOplogFetcher(_createConfig())->getFindQuery_forTest();
     ASSERT_EQUALS(mongo::BSONType::Object, cmdObj["filter"].type());
-    ASSERT_BSONOBJ_EQ(BSON("ts" << BSON("$gte" << lastFetched.opTime.getTimestamp())),
+    ASSERT_BSONOBJ_EQ(BSON("ts" << BSON("$gte" << lastFetched.getTimestamp())),
                       cmdObj["filter"].Obj());
     ASSERT_EQUALS(dataReplicatorExternalState->currentTerm, cmdObj["term"].numberLong());
     _checkDefaultCommandObjectFields(cmdObj);
@@ -240,7 +242,7 @@ TEST_F(OplogFetcherTest,
     dataReplicatorExternalState->currentTerm = OpTime::kUninitializedTerm;
     auto cmdObj = makeOplogFetcher(_createConfig())->getFindQuery_forTest();
     ASSERT_EQUALS(mongo::BSONType::Object, cmdObj["filter"].type());
-    ASSERT_BSONOBJ_EQ(BSON("ts" << BSON("$gte" << lastFetched.opTime.getTimestamp())),
+    ASSERT_BSONOBJ_EQ(BSON("ts" << BSON("$gte" << lastFetched.getTimestamp())),
                       cmdObj["filter"].Obj());
     ASSERT_FALSE(cmdObj.hasField("term"));
     _checkDefaultCommandObjectFields(cmdObj);
@@ -281,7 +283,7 @@ TEST_F(OplogFetcherTest, InvalidOplogQueryMetadataInResponseStopsTheOplogFetcher
 
 TEST_F(OplogFetcherTest,
        ValidMetadataInResponseWithoutOplogMetadataShouldBeForwardedToProcessMetadataFn) {
-    rpc::ReplSetMetadata metadata(1, lastFetched.opTime, lastFetched.opTime, 1, OID::gen(), 2, 2);
+    rpc::ReplSetMetadata metadata(1, lastFetched, lastFetched, 1, OID::gen(), 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(metadata.writeToMetadata(&bob));
     auto metadataObj = bob.obj();
@@ -354,7 +356,7 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceIsBehind) 
 
 TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceIsNotAhead) {
     rpc::ReplSetMetadata replMetadata(1, OpTime(), OpTime(), 1, OID::gen(), -1, -1);
-    rpc::OplogQueryMetadata oqMetadata(staleOpTime, lastFetched.opTime, rbid, 2, 2);
+    rpc::OplogQueryMetadata oqMetadata(staleOpTime, lastFetched, rbid, 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(replMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
@@ -373,7 +375,7 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreNotProcessedWhenSyncSourceIsNotAhead
 TEST_F(OplogFetcherTest,
        MetadataAndBatchAreProcessedWhenSyncSourceIsNotAheadButHasHigherLastOpCommitted) {
     rpc::ReplSetMetadata replMetadata(1, OpTime(), OpTime(), 1, OID::gen(), -1, -1);
-    rpc::OplogQueryMetadata oqMetadata(remoteNewerOpTime, lastFetched.opTime, rbid, 2, 2);
+    rpc::OplogQueryMetadata oqMetadata(remoteNewerOpTime, lastFetched, rbid, 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(replMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
@@ -395,7 +397,7 @@ TEST_F(OplogFetcherTest,
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
     auto metadataObj = bob.obj();
 
-    auto entry = makeNoopOplogEntry({123LL, staleOpTime});
+    auto entry = makeNoopOplogEntry(staleOpTime);
     ASSERT_EQUALS(
         ErrorCodes::InvalidSyncSource,
         processSingleBatch(
@@ -426,7 +428,7 @@ TEST_F(OplogFetcherTest, MetadataAndBatchAreProcessedWhenSyncSourceIsCurrentButM
 TEST_F(OplogFetcherTest,
        MetadataAndBatchAreProcessedWhenSyncSourceIsNotAheadWithoutRequiringFresherSyncSource) {
     rpc::ReplSetMetadata replMetadata(1, OpTime(), OpTime(), 1, OID::gen(), -1, -1);
-    rpc::OplogQueryMetadata oqMetadata(staleOpTime, lastFetched.opTime, rbid, 2, 2);
+    rpc::OplogQueryMetadata oqMetadata(staleOpTime, lastFetched, rbid, 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(replMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
@@ -441,17 +443,16 @@ TEST_F(OplogFetcherTest,
 
 TEST_F(OplogFetcherTest,
        MetadataWithoutOplogQueryMetadataIsNotProcessedOnBatchThatTriggersRollback) {
-    rpc::ReplSetMetadata metadata(1, lastFetched.opTime, lastFetched.opTime, 1, OID::gen(), 2, 2);
+    rpc::ReplSetMetadata metadata(1, lastFetched, lastFetched, 1, OID::gen(), 2, 2);
     BSONObjBuilder bob;
     ASSERT_OK(metadata.writeToMetadata(&bob));
     auto metadataObj = bob.obj();
-    ASSERT_EQUALS(ErrorCodes::OplogStartMissing,
-                  processSingleBatch(
-                      {concatenate(makeCursorResponse(
-                                       0, {makeNoopOplogEntry(Seconds(456), lastFetched.value)}),
-                                   metadataObj),
-                       Milliseconds(0)})
-                      ->getStatus());
+    ASSERT_EQUALS(
+        ErrorCodes::OplogStartMissing,
+        processSingleBatch(
+            {concatenate(makeCursorResponse(0, {makeNoopOplogEntry(Seconds(456))}), metadataObj),
+             Milliseconds(0)})
+            ->getStatus());
     ASSERT_FALSE(dataReplicatorExternalState->metadataWasProcessed);
 }
 
@@ -462,13 +463,12 @@ TEST_F(OplogFetcherTest, MetadataIsNotProcessedOnBatchThatTriggersRollback) {
     ASSERT_OK(replMetadata.writeToMetadata(&bob));
     ASSERT_OK(oqMetadata.writeToMetadata(&bob));
     auto metadataObj = bob.obj();
-    ASSERT_EQUALS(ErrorCodes::OplogStartMissing,
-                  processSingleBatch(
-                      {concatenate(makeCursorResponse(
-                                       0, {makeNoopOplogEntry(Seconds(456), lastFetched.value)}),
-                                   metadataObj),
-                       Milliseconds(0)})
-                      ->getStatus());
+    ASSERT_EQUALS(
+        ErrorCodes::OplogStartMissing,
+        processSingleBatch(
+            {concatenate(makeCursorResponse(0, {makeNoopOplogEntry(Seconds(456))}), metadataObj),
+             Milliseconds(0)})
+            ->getStatus());
     ASSERT_FALSE(dataReplicatorExternalState->metadataWasProcessed);
 }
 
@@ -496,24 +496,10 @@ TEST_F(
     OplogFetcherTest,
     LastOpTimeFetchedDoesNotMatchFirstDocumentCausesOplogFetcherToStopWithOplogStartMissingError) {
     auto metadataObj = makeOplogQueryMetadataObject(remoteNewerOpTime, rbid, 2, 2);
-    ASSERT_EQUALS(ErrorCodes::OplogStartMissing,
-                  processSingleBatch(
-                      {concatenate(makeCursorResponse(
-                                       0, {makeNoopOplogEntry(Seconds(456), lastFetched.value)}),
-                                   metadataObj),
-                       Milliseconds(0)})
-                      ->getStatus());
-}
-
-TEST_F(OplogFetcherTest,
-       LastHashFetchedDoesNotMatchFirstDocumentCausesOplogFetcherToStopWithOplogStartMissingError) {
-    auto metadataObj = makeOplogQueryMetadataObject(remoteNewerOpTime, rbid, 2, 2);
     ASSERT_EQUALS(
         ErrorCodes::OplogStartMissing,
         processSingleBatch(
-            {concatenate(makeCursorResponse(
-                             0, {makeNoopOplogEntry(remoteNewerOpTime, lastFetched.value + 1)}),
-                         metadataObj),
+            {concatenate(makeCursorResponse(0, {makeNoopOplogEntry(Seconds(456))}), metadataObj),
              Milliseconds(0)})
             ->getStatus());
 }
@@ -539,9 +525,9 @@ TEST_F(OplogFetcherTest, TimestampsNotAdvancingInBatchCausesOplogFetcherStopWith
         ErrorCodes::OplogOutOfOrder,
         processSingleBatch({concatenate(makeCursorResponse(0,
                                                            {makeNoopOplogEntry(lastFetched),
-                                                            makeNoopOplogEntry(Seconds(1000), 1),
-                                                            makeNoopOplogEntry(Seconds(2000), 1),
-                                                            makeNoopOplogEntry(Seconds(1500), 1)}),
+                                                            makeNoopOplogEntry(Seconds(1000)),
+                                                            makeNoopOplogEntry(Seconds(2000)),
+                                                            makeNoopOplogEntry(Seconds(1500))}),
                                         metadataObj),
                             Milliseconds(0)})
             ->getStatus());
@@ -551,8 +537,8 @@ TEST_F(OplogFetcherTest, OplogFetcherShouldExcludeFirstDocumentInFirstBatchWhenE
     auto metadataObj = makeOplogQueryMetadataObject(remoteNewerOpTime, rbid, 2, 2);
 
     auto firstEntry = makeNoopOplogEntry(lastFetched);
-    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.opTime.getTerm()}, 200);
-    auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.opTime.getTerm()}, 300);
+    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
+    auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.getTerm()});
     Fetcher::Documents documents{firstEntry, secondEntry, thirdEntry};
 
     auto shutdownState = processSingleBatch(
@@ -570,11 +556,10 @@ TEST_F(OplogFetcherTest, OplogFetcherShouldExcludeFirstDocumentInFirstBatchWhenE
     ASSERT_EQUALS(size_t(secondEntry.objsize() + thirdEntry.objsize()),
                   lastEnqueuedDocumentsInfo.toApplyDocumentBytes);
 
-    ASSERT_EQUALS(thirdEntry["h"].numberLong(), lastEnqueuedDocumentsInfo.lastDocument.value);
     ASSERT_EQUALS(unittest::assertGet(OpTime::parseFromOplogEntry(thirdEntry)),
-                  lastEnqueuedDocumentsInfo.lastDocument.opTime);
+                  lastEnqueuedDocumentsInfo.lastDocument);
 
-    // The last fetched optime and hash should be updated after pushing the operations into the
+    // The last fetched optime should be updated after pushing the operations into the
     // buffer and reflected in the shutdown callback arguments.
     ASSERT_OK(shutdownState->getStatus());
 }
@@ -583,8 +568,8 @@ TEST_F(OplogFetcherTest, OplogFetcherShouldReportErrorsThrownFromCallback) {
     auto metadataObj = makeOplogQueryMetadataObject(remoteNewerOpTime, rbid, 2, 2);
 
     auto firstEntry = makeNoopOplogEntry(lastFetched);
-    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.opTime.getTerm()}, 200);
-    auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.opTime.getTerm()}, 300);
+    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
+    auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.getTerm()});
     Fetcher::Documents documents{firstEntry, secondEntry, thirdEntry};
 
     enqueueDocumentsFn = [](Fetcher::Documents::const_iterator,
@@ -601,8 +586,8 @@ TEST_F(OplogFetcherTest, OplogFetcherShouldReportErrorsThrownFromCallback) {
 void OplogFetcherTest::testSyncSourceChecking(rpc::ReplSetMetadata* replMetadata,
                                               rpc::OplogQueryMetadata* oqMetadata) {
     auto firstEntry = makeNoopOplogEntry(lastFetched);
-    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.opTime.getTerm()}, 200);
-    auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.opTime.getTerm()}, 300);
+    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
+    auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.getTerm()});
     Fetcher::Documents documents{firstEntry, secondEntry, thirdEntry};
 
     BSONObjBuilder bob;
@@ -621,8 +606,7 @@ void OplogFetcherTest::testSyncSourceChecking(rpc::ReplSetMetadata* replMetadata
 
     // Sync source checking happens after we have successfully pushed the operations into
     // the buffer for the next replication phase (eg. applier).
-    // The last fetched optime and hash should be reflected in the shutdown callback
-    // arguments.
+    // The last fetched optime should be reflected in the shutdown callback arguments.
     ASSERT_EQUALS(ErrorCodes::InvalidSyncSource, shutdownState->getStatus());
 }
 
@@ -637,7 +621,7 @@ TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithoutMetadataStopsTheOplogFetche
 }
 
 TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithReplSetMetadataStopsTheOplogFetcher) {
-    rpc::ReplSetMetadata metadata(lastFetched.opTime.getTerm(),
+    rpc::ReplSetMetadata metadata(lastFetched.getTerm(),
                                   {{Seconds(10000), 0}, 1},
                                   {{Seconds(20000), 0}, 1},
                                   1,
@@ -655,7 +639,7 @@ TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithReplSetMetadataStopsTheOplogFe
 
 TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithBothMetadatasStopsTheOplogFetcher) {
     rpc::ReplSetMetadata replMetadata(
-        lastFetched.opTime.getTerm(), OpTime(), OpTime(), 1, OID::gen(), -1, -1);
+        lastFetched.getTerm(), OpTime(), OpTime(), 1, OID::gen(), -1, -1);
     rpc::OplogQueryMetadata oqMetadata(
         {{Seconds(10000), 0}, 1}, {{Seconds(20000), 0}, 1}, rbid, 2, 2);
 
@@ -669,7 +653,7 @@ TEST_F(OplogFetcherTest, FailedSyncSourceCheckWithBothMetadatasStopsTheOplogFetc
 
 TEST_F(OplogFetcherTest,
        FailedSyncSourceCheckWithSyncSourceHavingNoSyncSourceInReplSetMetadataStopsTheOplogFetcher) {
-    rpc::ReplSetMetadata metadata(lastFetched.opTime.getTerm(),
+    rpc::ReplSetMetadata metadata(lastFetched.getTerm(),
                                   {{Seconds(10000), 0}, 1},
                                   {{Seconds(20000), 0}, 1},
                                   1,
@@ -687,7 +671,7 @@ TEST_F(OplogFetcherTest,
 
 TEST_F(OplogFetcherTest,
        FailedSyncSourceCheckWithSyncSourceHavingNoSyncSourceStopsTheOplogFetcher) {
-    rpc::ReplSetMetadata replMetadata(lastFetched.opTime.getTerm(),
+    rpc::ReplSetMetadata replMetadata(lastFetched.getTerm(),
                                       {{Seconds(10000), 0}, 1},
                                       {{Seconds(20000), 0}, 1},
                                       1,
@@ -727,7 +711,7 @@ RemoteCommandRequest OplogFetcherTest::testTwoBatchHandling() {
 
     CursorId cursorId = 22LL;
     auto firstEntry = makeNoopOplogEntry(lastFetched);
-    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.opTime.getTerm()}, 200);
+    auto secondEntry = makeNoopOplogEntry({{Seconds(456), 0}, lastFetched.getTerm()});
 
     auto metadataObj = makeOplogQueryMetadataObject(remoteNewerOpTime, rbid, 2, 2);
     processNetworkResponse(
@@ -739,8 +723,8 @@ RemoteCommandRequest OplogFetcherTest::testTwoBatchHandling() {
     ASSERT_BSONOBJ_EQ(secondEntry, lastEnqueuedDocuments[0]);
 
     // Set cursor ID to 0 in getMore response to indicate no more data available.
-    auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.opTime.getTerm()}, 300);
-    auto fourthEntry = makeNoopOplogEntry({{Seconds(1200), 0}, lastFetched.opTime.getTerm()}, 300);
+    auto thirdEntry = makeNoopOplogEntry({{Seconds(789), 0}, lastFetched.getTerm()});
+    auto fourthEntry = makeNoopOplogEntry({{Seconds(1200), 0}, lastFetched.getTerm()});
     auto request = processNetworkResponse(makeCursorResponse(0, {thirdEntry, fourthEntry}, false));
 
     ASSERT_EQUALS(std::string("getMore"), request.cmdObj.firstElementFieldName());
@@ -771,7 +755,7 @@ TEST_F(
 }
 
 TEST_F(OplogFetcherTest, ValidateDocumentsReturnsNoSuchKeyIfTimestampIsNotFoundInAnyDocument) {
-    auto firstEntry = makeNoopOplogEntry(Seconds(123), 100);
+    auto firstEntry = makeNoopOplogEntry(Seconds(123));
     auto secondEntry = BSON("o" << BSON("msg"
                                         << "oplog entry without optime"));
 
@@ -786,8 +770,8 @@ TEST_F(OplogFetcherTest, ValidateDocumentsReturnsNoSuchKeyIfTimestampIsNotFoundI
 TEST_F(
     OplogFetcherTest,
     ValidateDocumentsReturnsOutOfOrderIfTimestampInFirstEntryIsEqualToLastTimestampAndNotProcessingFirstBatch) {
-    auto firstEntry = makeNoopOplogEntry(Seconds(123), 100);
-    auto secondEntry = makeNoopOplogEntry(Seconds(456), 200);
+    auto firstEntry = makeNoopOplogEntry(Seconds(123));
+    auto secondEntry = makeNoopOplogEntry(Seconds(456));
 
     ASSERT_EQUALS(ErrorCodes::OplogOutOfOrder,
                   OplogFetcher::validateDocuments(
@@ -798,8 +782,8 @@ TEST_F(
 }
 
 TEST_F(OplogFetcherTest, ValidateDocumentsReturnsOutOfOrderIfTimestampInSecondEntryIsBeforeFirst) {
-    auto firstEntry = makeNoopOplogEntry(Seconds(456), 100);
-    auto secondEntry = makeNoopOplogEntry(Seconds(123), 200);
+    auto firstEntry = makeNoopOplogEntry(Seconds(456));
+    auto secondEntry = makeNoopOplogEntry(Seconds(123));
 
     ASSERT_EQUALS(ErrorCodes::OplogOutOfOrder,
                   OplogFetcher::validateDocuments(
@@ -810,9 +794,9 @@ TEST_F(OplogFetcherTest, ValidateDocumentsReturnsOutOfOrderIfTimestampInSecondEn
 }
 
 TEST_F(OplogFetcherTest, ValidateDocumentsReturnsOutOfOrderIfTimestampInThirdEntryIsBeforeSecond) {
-    auto firstEntry = makeNoopOplogEntry(Seconds(123), 100);
-    auto secondEntry = makeNoopOplogEntry(Seconds(789), 200);
-    auto thirdEntry = makeNoopOplogEntry(Seconds(456), 300);
+    auto firstEntry = makeNoopOplogEntry(Seconds(123));
+    auto secondEntry = makeNoopOplogEntry(Seconds(789));
+    auto thirdEntry = makeNoopOplogEntry(Seconds(456));
 
     ASSERT_EQUALS(ErrorCodes::OplogOutOfOrder,
                   OplogFetcher::validateDocuments(
@@ -824,9 +808,9 @@ TEST_F(OplogFetcherTest, ValidateDocumentsReturnsOutOfOrderIfTimestampInThirdEnt
 
 TEST_F(OplogFetcherTest,
        ValidateDocumentsExcludesFirstDocumentInApplyCountAndBytesIfProcessingFirstBatch) {
-    auto firstEntry = makeNoopOplogEntry(Seconds(123), 100);
-    auto secondEntry = makeNoopOplogEntry(Seconds(456), 200);
-    auto thirdEntry = makeNoopOplogEntry(Seconds(789), 300);
+    auto firstEntry = makeNoopOplogEntry(Seconds(123));
+    auto secondEntry = makeNoopOplogEntry(Seconds(456));
+    auto thirdEntry = makeNoopOplogEntry(Seconds(789));
 
     auto info = unittest::assertGet(OplogFetcher::validateDocuments(
         {firstEntry, secondEntry, thirdEntry},
@@ -837,16 +821,14 @@ TEST_F(OplogFetcherTest,
     ASSERT_EQUALS(size_t(firstEntry.objsize() + secondEntry.objsize() + thirdEntry.objsize()),
                   info.networkDocumentBytes);
 
-    ASSERT_EQUALS(300LL, info.lastDocument.value);
-    ASSERT_EQUALS(unittest::assertGet(OpTime::parseFromOplogEntry(thirdEntry)),
-                  info.lastDocument.opTime);
+    ASSERT_EQUALS(unittest::assertGet(OpTime::parseFromOplogEntry(thirdEntry)), info.lastDocument);
 }
 
 TEST_F(OplogFetcherTest,
        ValidateDocumentsIncludesFirstDocumentInApplyCountAndBytesIfNotProcessingFirstBatch) {
-    auto firstEntry = makeNoopOplogEntry(Seconds(123), 100);
-    auto secondEntry = makeNoopOplogEntry(Seconds(456), 200);
-    auto thirdEntry = makeNoopOplogEntry(Seconds(789), 300);
+    auto firstEntry = makeNoopOplogEntry(Seconds(123));
+    auto secondEntry = makeNoopOplogEntry(Seconds(456));
+    auto thirdEntry = makeNoopOplogEntry(Seconds(789));
 
     auto info = unittest::assertGet(OplogFetcher::validateDocuments(
         {firstEntry, secondEntry, thirdEntry}, false, Timestamp(Seconds(100), 0)));
@@ -858,14 +840,12 @@ TEST_F(OplogFetcherTest,
     ASSERT_EQUALS(info.networkDocumentCount, info.toApplyDocumentCount);
     ASSERT_EQUALS(info.networkDocumentBytes, info.toApplyDocumentBytes);
 
-    ASSERT_EQUALS(300LL, info.lastDocument.value);
-    ASSERT_EQUALS(unittest::assertGet(OpTime::parseFromOplogEntry(thirdEntry)),
-                  info.lastDocument.opTime);
+    ASSERT_EQUALS(unittest::assertGet(OpTime::parseFromOplogEntry(thirdEntry)), info.lastDocument);
 }
 
 TEST_F(OplogFetcherTest,
-       ValidateDocumentsReturnsDefaultLastDocumentHashAndOpTimeWhenThereAreNoDocumentsToApply) {
-    auto firstEntry = makeNoopOplogEntry(Seconds(123), 100);
+       ValidateDocumentsReturnsDefaultLastDocumentOpTimeWhenThereAreNoDocumentsToApply) {
+    auto firstEntry = makeNoopOplogEntry(Seconds(123));
 
     auto info = unittest::assertGet(OplogFetcher::validateDocuments(
         {firstEntry},
@@ -878,8 +858,7 @@ TEST_F(OplogFetcherTest,
     ASSERT_EQUALS(0U, info.toApplyDocumentCount);
     ASSERT_EQUALS(0U, info.toApplyDocumentBytes);
 
-    ASSERT_EQUALS(0LL, info.lastDocument.value);
-    ASSERT_EQUALS(OpTime(), info.lastDocument.opTime);
+    ASSERT_EQUALS(OpTime(), info.lastDocument);
 }
 
 TEST_F(OplogFetcherTest,
@@ -900,7 +879,6 @@ TEST_F(OplogFetcherTest,
     ASSERT_EQUALS(0U, info.toApplyDocumentCount);
     ASSERT_EQUALS(0U, info.toApplyDocumentBytes);
 
-    ASSERT_EQUALS(0LL, info.lastDocument.value);
-    ASSERT_EQUALS(OpTime(), info.lastDocument.opTime);
+    ASSERT_EQUALS(OpTime(), info.lastDocument);
 }
 }  // namespace

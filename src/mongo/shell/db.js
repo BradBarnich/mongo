@@ -123,7 +123,7 @@ var DB;
         {
             const session = this.getSession();
 
-            const readPreference = session._serverSession.client.getReadPreference(session);
+            const readPreference = session._getSessionAwareClient().getReadPreference(session);
             if (readPreference !== null) {
                 obj = this._attachReadPreferenceToCommand(obj, readPreference);
 
@@ -505,6 +505,8 @@ var DB;
      * See also: db.cloneDatabase()
      */
     DB.prototype.cloneCollection = function(from, collection, query) {
+        print(
+            "WARNING: db.cloneCollection is deprecated. See http://dochub.mongodb.org/core/clonecollection-deprecation");
         assert(isString(from) && from.length);
         assert(isString(collection) && collection.length);
         collection = this._name + "." + collection;
@@ -595,10 +597,11 @@ var DB;
         print(
             "\tdb.copyDatabase(fromdb, todb, fromhost) - will only function with MongoDB 4.0 and below");
         print("\tdb.createCollection(name, {size: ..., capped: ..., max: ...})");
-        print("\tdb.createView(name, viewOn, [{$operator: {...}}, ...], {viewOptions})");
         print("\tdb.createUser(userDocument)");
+        print("\tdb.createView(name, viewOn, [{$operator: {...}}, ...], {viewOptions})");
         print("\tdb.currentOp() displays currently executing operations in the db");
         print("\tdb.dropDatabase()");
+        print("\tdb.dropUser(username)");
         print("\tdb.eval() - deprecated");
         print("\tdb.fsyncLock() flush data to disk and lock server for backups");
         print("\tdb.fsyncUnlock() unlocks server following a db.fsyncLock()");
@@ -613,7 +616,6 @@ var DB;
         print("\tdb.getMongo() get the server connection object");
         print("\tdb.getMongo().setSlaveOk() allow queries on a replication slave server");
         print("\tdb.getName()");
-        print("\tdb.getPrevError()");
         print("\tdb.getProfilingLevel() - deprecated");
         print("\tdb.getProfilingStatus() - returns if profiling is on and slow threshold");
         print("\tdb.getReplicationInfo()");
@@ -630,22 +632,20 @@ var DB;
         print("\tdb.printReplicationInfo()");
         print("\tdb.printShardingStatus()");
         print("\tdb.printSlaveReplicationInfo()");
-        print("\tdb.dropUser(username)");
         print("\tdb.resetError()");
         print(
             "\tdb.runCommand(cmdObj) run a database command.  if cmdObj is a string, turns it into {cmdObj: 1}");
         print("\tdb.serverStatus()");
         print("\tdb.setLogLevel(level,<component>)");
         print("\tdb.setProfilingLevel(level,slowms) 0=off 1=slow 2=all");
+        print("\tdb.setVerboseShell(flag) display extra information in shell output");
         print(
             "\tdb.setWriteConcern(<write concern doc>) - sets the write concern for writes to the db");
-        print(
-            "\tdb.unsetWriteConcern(<write concern doc>) - unsets the write concern for writes to the db");
-        print("\tdb.setVerboseShell(flag) display extra information in shell output");
         print("\tdb.shutdownServer()");
         print("\tdb.stats()");
+        print(
+            "\tdb.unsetWriteConcern(<write concern doc>) - unsets the write concern for writes to the db");
         print("\tdb.version() current version of the server");
-
         return __magicNoPrint;
     };
 
@@ -846,17 +846,6 @@ var DB;
         return res;
     };
     DB.prototype.getLastErrorCmd = DB.prototype.getLastErrorObj;
-
-    /* Return the last error which has occurred, even if not the very last error.
-
-       Returns:
-        { err : <error message>, nPrev : <how_many_ops_back_occurred>, ok : 1 }
-
-       result.err will be null if no error has occurred.
-     */
-    DB.prototype.getPrevError = function() {
-        return this.runCommand({getpreverror: 1});
-    };
 
     DB.prototype._getCollectionInfosCommand = function(
         filter, nameOnly = false, authorizedCollections = false) {
@@ -1829,7 +1818,7 @@ var DB;
 
         {
             const session = this.getSession();
-            return session._serverSession.client.getWriteConcern(session);
+            return session._getSessionAwareClient().getWriteConcern(session);
         }
     };
 

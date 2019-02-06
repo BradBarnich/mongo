@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,22 +39,35 @@
 namespace mongo {
 
 /**
- * RAII-style class which automatically tracks the operation namespace in CurrentOp and records the
- * operation via Top upon destruction.
+ * RAII-style class which can update the diagnostic state on the operation's CurOp object and record
+ * the operation via Top upon destruction. Can be configured to only update the Top counters if
+ * desired.
  */
 class AutoStatsTracker {
     MONGO_DISALLOW_COPYING(AutoStatsTracker);
 
 public:
     /**
-     * Sets the namespace of the CurOp object associated with 'opCtx' to be 'nss' and starts the
-     * CurOp timer. 'lockType' describes which type of lock is held by this operation, and will be
-     * used for reporting via Top. If 'dbProfilingLevel' is not given, this constructor will acquire
-     * and then drop a database lock in order to determine the database's profiling level.
+     *Describes which diagnostics to update during the lifetime of this object.
+     */
+    enum class LogMode {
+        kUpdateTop,  // Increments the Top counter for this operation type and this namespace upon
+                     // destruction.
+        kUpdateTopAndCurop,  // In addition to incrementing the Top counter, adjusts state on the
+                             // CurOp object associated with the OperationContext. Updates the
+                             // namespace to be 'nss', starts a timer for the operation (if it
+                             // hasn't started already), and figures out and records the profiling
+                             // level of the operation.
+    };
+
+    /**
+     * If 'logMode' is 'kUpdateTopAndCurop', sets up and records state on the CurOp object attached
+     * to 'opCtx', as described above.
      */
     AutoStatsTracker(OperationContext* opCtx,
                      const NamespaceString& nss,
                      Top::LockType lockType,
+                     LogMode logMode,
                      boost::optional<int> dbProfilingLevel,
                      Date_t deadline = Date_t::max());
 
@@ -64,6 +79,7 @@ public:
 private:
     OperationContext* _opCtx;
     Top::LockType _lockType;
+    const NamespaceString _nss;
 };
 
 /**
@@ -141,7 +157,8 @@ public:
         OperationContext* opCtx,
         const NamespaceStringOrUUID& nsOrUUID,
         AutoGetCollection::ViewMode viewMode = AutoGetCollection::ViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max());
+        Date_t deadline = Date_t::max(),
+        AutoStatsTracker::LogMode logMode = AutoStatsTracker::LogMode::kUpdateTopAndCurop);
 
     Database* getDb() const {
         return _autoCollForRead.getDb();

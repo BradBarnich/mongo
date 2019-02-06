@@ -8,28 +8,30 @@
 
     const dbName = "test";
     const collName = "no_error_labels_outside_txn";
-    const rst = new ReplSetTest({name: collName, nodes: 2});
-    const config = rst.getReplSetConfig();
-    config.members[1].priority = 0;
-    rst.startSet();
-    rst.initiate(config);
 
-    const primary = rst.getPrimary();
-    const secondary = rst.getSecondary();
+    // We are testing coordinateCommitTransaction, which requires the nodes to be started with
+    // --shardsvr.
+    const st = new ShardingTest(
+        {config: 1, mongos: 1, shards: {rs0: {nodes: [{}, {rsConfig: {priority: 0}}]}}});
+    const primary = st.rs0.getPrimary();
+    const secondary = st.rs0.getSecondary();
+
     const testDB = primary.getDB(dbName);
     const adminDB = testDB.getSiblingDB("admin");
     const testColl = testDB.getCollection(collName);
 
     const sessionOptions = {causalConsistency: false};
-    let session = secondary.startSession(sessionOptions);
+    let session = primary.startSession(sessionOptions);
     let sessionDb = session.getDatabase(dbName);
     let sessionColl = sessionDb.getCollection(collName);
+    let secondarySession = secondary.startSession(sessionOptions);
+    let secondarySessionDb = secondarySession.getDatabase(dbName);
 
     assert.commandWorked(testDB.createCollection(collName, {writeConcern: {w: "majority"}}));
 
     jsTest.log("Insert inside a transaction on secondary should fail but return error labels");
     let txnNumber = 0;
-    let res = sessionDb.runCommand({
+    let res = secondarySessionDb.runCommand({
         insert: collName,
         documents: [{_id: "insert-1"}],
         readConcern: {level: "snapshot"},
@@ -43,26 +45,12 @@
     jsTest.log("Insert outside a transaction on secondary should fail but not return error labels");
     txnNumber++;
     // Insert as a retryable write.
-    res = sessionDb.runCommand(
+    res = secondarySessionDb.runCommand(
         {insert: collName, documents: [{_id: "insert-1"}], txnNumber: NumberLong(txnNumber)});
 
     assert.commandFailedWithCode(res, ErrorCodes.NotMaster);
     assert(!res.hasOwnProperty("errorLabels"));
-    session.endSession();
-
-    jsTest.log("Write concern errors should not have error labels");
-    // Start a new session on the primary.
-    session = primary.startSession(sessionOptions);
-    sessionDb = session.getDatabase(dbName);
-    sessionColl = sessionDb.getCollection(collName);
-    stopServerReplication(secondary);
-    session.startTransaction({writeConcern: {w: "majority", wtimeout: 1}});
-    assert.commandWorked(sessionColl.insert({_id: "write-with-write-concern"}));
-    res = session.commitTransaction_forTesting();
-    assert.eq(res.writeConcernError.code, ErrorCodes.WriteConcernFailed);
-    assert(!res.hasOwnProperty("code"));
-    assert(!res.hasOwnProperty("errorLabels"));
-    restartServerReplication(secondary);
+    secondarySession.endSession();
 
     jsTest.log("failCommand should be able to return errors with TransientTransactionError");
     assert.commandWorked(testDB.adminCommand({
@@ -84,7 +72,7 @@
     assert(res instanceof WriteCommandError);
     assert(!res.hasOwnProperty("errorLabels"));
     assert.commandWorked(testDB.adminCommand({configureFailPoint: "failCommand", mode: "off"}));
-    session.abortTransaction();
+    session.abortTransaction_forTesting();
 
     jsTest.log("WriteConflict returned by commitTransaction command is TransientTransactionError");
     session.startTransaction();
@@ -100,17 +88,30 @@
     assert.commandWorked(testDB.adminCommand({configureFailPoint: "failCommand", mode: "off"}));
 
     jsTest.log("NotMaster returned by commitTransaction command is not TransientTransactionError");
-    session.startTransaction();
-    assert.commandWorked(sessionColl.insert({_id: "commitTransaction-fail-point"}));
-    assert.commandWorked(testDB.adminCommand({
-        configureFailPoint: "failCommand",
-        mode: "alwaysOn",
-        data: {errorCode: ErrorCodes.NotMaster, failCommands: ["commitTransaction"]}
-    }));
-    res = session.commitTransaction_forTesting();
+    // commitTransaction will attempt to perform a noop write in response to a NoSuchTransaction
+    // error and non-empty writeConcern. This will throw NotMaster.
+    res = secondarySessionDb.adminCommand({
+        commitTransaction: 1,
+        txnNumber: NumberLong(secondarySession.getTxnNumber_forTesting() + 1),
+        autocommit: false,
+        writeConcern: {w: "majority"}
+    });
     assert.commandFailedWithCode(res, ErrorCodes.NotMaster);
     assert(!res.hasOwnProperty("errorLabels"));
-    assert.commandWorked(testDB.adminCommand({configureFailPoint: "failCommand", mode: "off"}));
+
+    jsTest.log(
+        "NotMaster returned by coordinateCommitTransaction command is not TransientTransactionError");
+    // coordinateCommitTransaction will attempt to perform a noop write in response to a
+    // NoSuchTransaction error and non-empty writeConcern. This will throw NotMaster.
+    res = secondarySessionDb.adminCommand({
+        coordinateCommitTransaction: 1,
+        participants: [],
+        txnNumber: NumberLong(secondarySession.getTxnNumber_forTesting() + 1),
+        autocommit: false,
+        writeConcern: {w: "majority"}
+    });
+    assert.commandFailedWithCode(res, ErrorCodes.NotMaster);
+    assert(!res.hasOwnProperty("errorLabels"));
 
     jsTest.log("ShutdownInProgress returned by write commands is TransientTransactionError");
     session.startTransaction();
@@ -124,7 +125,7 @@
     assert(res instanceof WriteCommandError);
     assert.eq(res.errorLabels, ["TransientTransactionError"]);
     assert.commandWorked(testDB.adminCommand({configureFailPoint: "failCommand", mode: "off"}));
-    session.abortTransaction();
+    session.abortTransaction_forTesting();
 
     jsTest.log(
         "ShutdownInProgress returned by commitTransaction command is not TransientTransactionError");
@@ -138,6 +139,29 @@
     res = session.commitTransaction_forTesting();
     assert.commandFailedWithCode(res, ErrorCodes.ShutdownInProgress);
     assert(!res.hasOwnProperty("errorLabels"));
+    assert.commandWorked(testDB.adminCommand({configureFailPoint: "failCommand", mode: "off"}));
+
+    jsTest.log(
+        "ShutdownInProgress returned by coordinateCommitTransaction command is not TransientTransactionError");
+    session.startTransaction();
+    assert.commandWorked(sessionColl.insert({_id: "coordinateCommitTransaction-fail-point"}));
+    assert.commandWorked(testDB.adminCommand({
+        configureFailPoint: "failCommand",
+        mode: "alwaysOn",
+        data: {
+            errorCode: ErrorCodes.ShutdownInProgress,
+            failCommands: ["coordinateCommitTransaction"]
+        }
+    }));
+    res = sessionDb.adminCommand({
+        coordinateCommitTransaction: 1,
+        participants: [],
+        txnNumber: NumberLong(session.getTxnNumber_forTesting()),
+        autocommit: false
+    });
+    assert.commandFailedWithCode(res, ErrorCodes.ShutdownInProgress);
+    assert(!res.hasOwnProperty("errorLabels"));
+    assert.commandWorked(session.abortTransaction_forTesting());
     assert.commandWorked(testDB.adminCommand({configureFailPoint: "failCommand", mode: "off"}));
 
     jsTest.log("LockTimeout should be TransientTransactionError");
@@ -171,12 +195,12 @@
     assert.commandFailedWithCode(res, ErrorCodes.LockTimeout);
     assert(res instanceof WriteCommandError);
     assert.eq(res.errorLabels, ["TransientTransactionError"]);
-    sessionOther.abortTransaction();
-    session.abortTransaction();
+    sessionOther.abortTransaction_forTesting();
+    session.abortTransaction_forTesting();
     thread.join();
     assert.commandWorked(thread.returnData());
 
     session.endSession();
 
-    rst.stopSet();
+    st.stop();
 }());

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -147,7 +149,9 @@ TEST(KVEngineTestHarness, SimpleSorted1) {
     string ident = "abc";
     IndexDescriptor desc(nullptr,
                          "",
-                         BSON("v" << static_cast<int>(IndexDescriptor::kLatestIndexVersion) << "key"
+                         BSON("v" << static_cast<int>(IndexDescriptor::kLatestIndexVersion) << "ns"
+                                  << "mydb.mycoll"
+                                  << "key"
                                   << BSON("a" << 1)));
     unique_ptr<SortedDataInterface> sorted;
     {
@@ -167,6 +171,114 @@ TEST(KVEngineTestHarness, SimpleSorted1) {
     {
         MyOperationContext opCtx(engine);
         ASSERT_EQUALS(1, sorted->numEntries(&opCtx));
+    }
+}
+
+TEST(KVEngineTestHarness, TemporaryRecordStoreSimple) {
+    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+    KVEngine* engine = helper->getEngine();
+    ASSERT(engine);
+
+    string ident = "temptemp";
+    unique_ptr<RecordStore> rs;
+    {
+        MyOperationContext opCtx(engine);
+        rs = engine->makeTemporaryRecordStore(&opCtx, ident);
+        ASSERT(rs);
+    }
+
+    RecordId loc;
+    {
+        MyOperationContext opCtx(engine);
+        WriteUnitOfWork uow(&opCtx);
+        StatusWith<RecordId> res = rs->insertRecord(&opCtx, "abc", 4, Timestamp());
+        ASSERT_OK(res.getStatus());
+        loc = res.getValue();
+        uow.commit();
+    }
+
+    {
+        MyOperationContext opCtx(engine);
+        ASSERT_EQUALS(string("abc"), rs->dataFor(&opCtx, loc).data());
+
+        std::vector<std::string> all = engine->getAllIdents(&opCtx);
+        ASSERT_EQUALS(1U, all.size());
+        ASSERT_EQUALS(ident, all[0]);
+
+        WriteUnitOfWork wuow(&opCtx);
+        ASSERT_OK(engine->dropIdent(&opCtx, ident));
+        wuow.commit();
+    }
+}
+
+TEST(KVEngineTestHarness, AllCommittedTimestamp) {
+    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+    KVEngine* engine = helper->getEngine();
+    if (!engine->supportsDocLocking())
+        return;
+
+    unique_ptr<RecordStore> rs;
+    {
+        MyOperationContext opCtx(engine);
+        WriteUnitOfWork uow(&opCtx);
+        CollectionOptions options;
+        options.capped = true;
+        options.cappedSize = 10240;
+        options.cappedMaxDocs = -1;
+
+        NamespaceString oplogNss("local.oplog.rs");
+        ASSERT_OK(engine->createRecordStore(&opCtx, oplogNss.ns(), "ident", options));
+        rs = engine->getRecordStore(&opCtx, oplogNss.ns(), "ident", options);
+        ASSERT(rs);
+    }
+    {
+        Timestamp t11(1, 1);
+        Timestamp t12(1, 2);
+        Timestamp t21(2, 1);
+
+        auto t11Doc = BSON("ts" << t11);
+        auto t12Doc = BSON("ts" << t12);
+        auto t21Doc = BSON("ts" << t21);
+
+        Timestamp allCommitted = engine->getAllCommittedTimestamp();
+        MyOperationContext opCtx1(engine);
+        WriteUnitOfWork uow1(&opCtx1);
+        ASSERT_EQ(invariant(rs->insertRecord(
+                      &opCtx1, t11Doc.objdata(), t11Doc.objsize(), Timestamp::min())),
+                  RecordId(1, 1));
+
+        Timestamp lastAllCommitted = allCommitted;
+        allCommitted = engine->getAllCommittedTimestamp();
+        ASSERT_GTE(allCommitted, lastAllCommitted);
+        ASSERT_LT(allCommitted, t11);
+
+        MyOperationContext opCtx2(engine);
+        WriteUnitOfWork uow2(&opCtx2);
+        ASSERT_EQ(invariant(rs->insertRecord(
+                      &opCtx2, t21Doc.objdata(), t21Doc.objsize(), Timestamp::min())),
+                  RecordId(2, 1));
+        uow2.commit();
+
+        lastAllCommitted = allCommitted;
+        allCommitted = engine->getAllCommittedTimestamp();
+        ASSERT_GTE(allCommitted, lastAllCommitted);
+        ASSERT_LT(allCommitted, t11);
+
+        ASSERT_EQ(invariant(rs->insertRecord(
+                      &opCtx1, t12Doc.objdata(), t12Doc.objsize(), Timestamp::min())),
+                  RecordId(1, 2));
+
+        lastAllCommitted = allCommitted;
+        allCommitted = engine->getAllCommittedTimestamp();
+        ASSERT_GTE(allCommitted, lastAllCommitted);
+        ASSERT_LT(allCommitted, t11);
+
+        uow1.commit();
+
+        lastAllCommitted = allCommitted;
+        allCommitted = engine->getAllCommittedTimestamp();
+        ASSERT_GTE(allCommitted, lastAllCommitted);
+        ASSERT_LTE(allCommitted, t21);
     }
 }
 
@@ -215,7 +327,6 @@ TEST(KVCatalogTest, Coll1) {
     ASSERT_NOT_EQUALS(ident, catalog->getCollectionIdent("a.b"));
 }
 
-
 TEST(KVCatalogTest, Idx1) {
     unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
@@ -247,13 +358,16 @@ TEST(KVCatalogTest, Idx1) {
 
         BSONCollectionCatalogEntry::MetaData md;
         md.ns = "a.b";
-        md.indexes.push_back(BSONCollectionCatalogEntry::IndexMetaData(BSON("name"
-                                                                            << "foo"),
-                                                                       false,
-                                                                       RecordId(),
-                                                                       false,
-                                                                       KVPrefix::kNotPrefixed,
-                                                                       false));
+
+        BSONCollectionCatalogEntry::IndexMetaData imd;
+        imd.spec = BSON("name"
+                        << "foo");
+        imd.ready = false;
+        imd.head = RecordId();
+        imd.multikey = false;
+        imd.prefix = KVPrefix::kNotPrefixed;
+        imd.isBackgroundSecondaryBuild = false;
+        md.indexes.push_back(imd);
         catalog->putMetaData(&opCtx, "a.b", md);
         uow.commit();
     }
@@ -277,13 +391,16 @@ TEST(KVCatalogTest, Idx1) {
         BSONCollectionCatalogEntry::MetaData md;
         md.ns = "a.b";
         catalog->putMetaData(&opCtx, "a.b", md);  // remove index
-        md.indexes.push_back(BSONCollectionCatalogEntry::IndexMetaData(BSON("name"
-                                                                            << "foo"),
-                                                                       false,
-                                                                       RecordId(),
-                                                                       false,
-                                                                       KVPrefix::kNotPrefixed,
-                                                                       false));
+
+        BSONCollectionCatalogEntry::IndexMetaData imd;
+        imd.spec = BSON("name"
+                        << "foo");
+        imd.ready = false;
+        imd.head = RecordId();
+        imd.multikey = false;
+        imd.prefix = KVPrefix::kNotPrefixed;
+        imd.isBackgroundSecondaryBuild = false;
+        md.indexes.push_back(imd);
         catalog->putMetaData(&opCtx, "a.b", md);
         uow.commit();
     }
@@ -325,13 +442,16 @@ TEST(KVCatalogTest, DirectoryPerDb1) {
 
         BSONCollectionCatalogEntry::MetaData md;
         md.ns = "a.b";
-        md.indexes.push_back(BSONCollectionCatalogEntry::IndexMetaData(BSON("name"
-                                                                            << "foo"),
-                                                                       false,
-                                                                       RecordId(),
-                                                                       false,
-                                                                       KVPrefix::kNotPrefixed,
-                                                                       false));
+
+        BSONCollectionCatalogEntry::IndexMetaData imd;
+        imd.spec = BSON("name"
+                        << "foo");
+        imd.ready = false;
+        imd.head = RecordId();
+        imd.multikey = false;
+        imd.prefix = KVPrefix::kNotPrefixed;
+        imd.isBackgroundSecondaryBuild = false;
+        md.indexes.push_back(imd);
         catalog->putMetaData(&opCtx, "a.b", md);
         ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, "a.b", "foo"), "a/");
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
@@ -370,13 +490,16 @@ TEST(KVCatalogTest, Split1) {
 
         BSONCollectionCatalogEntry::MetaData md;
         md.ns = "a.b";
-        md.indexes.push_back(BSONCollectionCatalogEntry::IndexMetaData(BSON("name"
-                                                                            << "foo"),
-                                                                       false,
-                                                                       RecordId(),
-                                                                       false,
-                                                                       KVPrefix::kNotPrefixed,
-                                                                       false));
+
+        BSONCollectionCatalogEntry::IndexMetaData imd;
+        imd.spec = BSON("name"
+                        << "foo");
+        imd.ready = false;
+        imd.head = RecordId();
+        imd.multikey = false;
+        imd.prefix = KVPrefix::kNotPrefixed;
+        imd.isBackgroundSecondaryBuild = false;
+        md.indexes.push_back(imd);
         catalog->putMetaData(&opCtx, "a.b", md);
         ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, "a.b", "foo"), "index/");
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
@@ -415,13 +538,16 @@ TEST(KVCatalogTest, DirectoryPerAndSplit1) {
 
         BSONCollectionCatalogEntry::MetaData md;
         md.ns = "a.b";
-        md.indexes.push_back(BSONCollectionCatalogEntry::IndexMetaData(BSON("name"
-                                                                            << "foo"),
-                                                                       false,
-                                                                       RecordId(),
-                                                                       false,
-                                                                       KVPrefix::kNotPrefixed,
-                                                                       false));
+
+        BSONCollectionCatalogEntry::IndexMetaData imd;
+        imd.spec = BSON("name"
+                        << "foo");
+        imd.ready = false;
+        imd.head = RecordId();
+        imd.multikey = false;
+        imd.prefix = KVPrefix::kNotPrefixed;
+        imd.isBackgroundSecondaryBuild = false;
+        md.indexes.push_back(imd);
         catalog->putMetaData(&opCtx, "a.b", md);
         ASSERT_STRING_CONTAINS(catalog->getIndexIdent(&opCtx, "a.b", "foo"), "a/index/");
         ASSERT_TRUE(catalog->isUserDataIdent(catalog->getIndexIdent(&opCtx, "a.b", "foo")));
@@ -465,13 +591,16 @@ TEST(KVCatalogTest, RestartForPrefixes) {
 
             BSONCollectionCatalogEntry::MetaData md;
             md.ns = "a.b";
-            md.indexes.push_back(BSONCollectionCatalogEntry::IndexMetaData(BSON("name"
-                                                                                << "foo"),
-                                                                           false,
-                                                                           RecordId(),
-                                                                           false,
-                                                                           fooIndexPrefix,
-                                                                           false));
+
+            BSONCollectionCatalogEntry::IndexMetaData imd;
+            imd.spec = BSON("name"
+                            << "foo");
+            imd.ready = false;
+            imd.head = RecordId();
+            imd.multikey = false;
+            imd.prefix = fooIndexPrefix;
+            imd.isBackgroundSecondaryBuild = false;
+            md.indexes.push_back(imd);
             md.prefix = abCollPrefix;
             catalog->putMetaData(&opCtx, "a.b", md);
             uow.commit();
@@ -494,6 +623,18 @@ TEST(KVCatalogTest, RestartForPrefixes) {
     }
 }
 
+TEST(KVCatalogTest, BackupImplemented) {
+    unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
+    KVEngine* engine = helper->getEngine();
+    ASSERT(engine);
+
+    {
+        MyOperationContext opCtx(engine);
+        ASSERT_OK(engine->beginBackup(&opCtx));
+        engine->endBackup(&opCtx);
+    }
+}
+
 DEATH_TEST(KVCatalogTest, TerminateOnNonNumericIndexVersion, "Fatal Assertion 50942") {
     unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create());
     KVEngine* engine = helper->getEngine();
@@ -504,6 +645,8 @@ DEATH_TEST(KVCatalogTest, TerminateOnNonNumericIndexVersion, "Fatal Assertion 50
                          "",
                          BSON("v"
                               << "1"
+                              << "ns"
+                              << "mydb.mycoll"
                               << "key"
                               << BSON("a" << 1)));
     unique_ptr<SortedDataInterface> sorted;

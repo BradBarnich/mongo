@@ -58,27 +58,35 @@
     assert.eq(res.cursor.firstBatch.length, 1, printjson(res));
     assert.eq(res.cursor.firstBatch[0]._id, "before", printjson(res));
 
-    // A read on the primary at the new cluster time should time out waiting for the cluster time to
-    // be majority committed.
-    primarySession.startTransaction(
-        {readConcern: {level: "snapshot", atClusterTime: clusterTimeAfter}});
-    assert.commandFailedWithCode(primaryDB.runCommand({find: collName, maxTimeMS: 1000}),
-                                 ErrorCodes.MaxTimeMSExpired);
-    primarySession.abortTransaction();
+    // A read on the primary at the new cluster time should succeed because transactions implement
+    // speculative behavior, but the attempt to commit the transaction should time out waiting for
+    // the transaction to be majority committed.
+    primarySession.startTransaction({
+        readConcern: {level: "snapshot", atClusterTime: clusterTimeAfter},
+        writeConcern: {w: "majority", wtimeout: 1000}
+    });
+    res = assert.commandWorked(primaryDB.runCommand({find: collName}));
+    assert.eq(res.cursor.firstBatch.length, 2, printjson(res));
+    assert.commandFailedWithCode(primarySession.commitTransaction_forTesting(),
+                                 ErrorCodes.WriteConcernFailed);
 
+    // A read on the primary at the new cluster time succeeds.
+    primarySession.startTransaction({
+        readConcern: {level: "snapshot", atClusterTime: clusterTimeAfter},
+        writeConcern: {w: "majority"}
+    });
+    res = assert.commandWorked(primaryDB.runCommand({find: collName}));
+    assert.eq(res.cursor.firstBatch.length, 2, printjson(res));
     // Restart replication on one of the secondaries.
     restartServerReplication(secondaryConn1);
-
-    // A read on the primary at the new cluster time now succeeds.
-    primarySession.startTransaction(
-        {readConcern: {level: "snapshot", atClusterTime: clusterTimeAfter}});
-    res = assert.commandWorked(primaryDB.runCommand({find: collName}));
+    // This time the transaction should commit.
     primarySession.commitTransaction();
-    assert.eq(res.cursor.firstBatch.length, 2, printjson(res));
 
     // A read on the lagged secondary at its view of the majority cluster time should not include
     // the write.
     const clusterTimeSecondaryBefore = rst.getReadConcernMajorityOpTimeOrThrow(secondaryConn0).ts;
+    // It is necessary to gossip the cluster time to the secondary to avoid an error.
+    secondarySession.advanceClusterTime(primarySession.getClusterTime());
     secondarySession.startTransaction(
         {readConcern: {level: "snapshot", atClusterTime: clusterTimeSecondaryBefore}});
     res = assert.commandWorked(secondaryDB0.runCommand({find: collName}));
@@ -92,7 +100,7 @@
         {readConcern: {level: "snapshot", atClusterTime: clusterTimeAfter}});
     assert.commandFailedWithCode(secondaryDB0.runCommand({find: collName, maxTimeMS: 1000}),
                                  ErrorCodes.MaxTimeMSExpired);
-    secondarySession.abortTransaction();
+    secondarySession.abortTransaction_forTesting();
 
     // Restart replication on the lagged secondary.
     restartServerReplication(secondaryConn0);
@@ -108,7 +116,7 @@
     primarySession.startTransaction(
         {readConcern: {level: "snapshot", atClusterTime: Timestamp(1, 1)}});
     assert.commandFailedWithCode(primaryDB.runCommand({find: collName}), ErrorCodes.SnapshotTooOld);
-    primarySession.abortTransaction();
+    primarySession.abortTransaction_forTesting();
 
     rst.stopSet();
 }());

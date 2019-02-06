@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -309,8 +311,7 @@ TEST_F(MigrationManagerTest, OneCollectionTwoMigrations) {
     const std::vector<MigrateInfo> migrationRequests{{kShardId1, chunk1}, {kShardId3, chunk2}};
 
     auto future = launchAsync([this, migrationRequests] {
-        ON_BLOCK_EXIT([&] { Client::destroy(); });
-        Client::initThreadIfNotAlready("Test");
+        ThreadClient tc("Test", getGlobalServiceContext());
         auto opCtx = cc().makeOperationContext();
 
         // Scheduling the moveChunk commands requires finding a host to which to send the command.
@@ -372,8 +373,7 @@ TEST_F(MigrationManagerTest, TwoCollectionsTwoMigrationsEach) {
                                                      {kShardId3, chunk2coll2}};
 
     auto future = launchAsync([this, migrationRequests] {
-        ON_BLOCK_EXIT([&] { Client::destroy(); });
-        Client::initThreadIfNotAlready("Test");
+        ThreadClient tc("Test", getGlobalServiceContext());
         auto opCtx = cc().makeOperationContext();
 
         // Scheduling the moveChunk commands requires finding a host to which to send the command.
@@ -427,8 +427,7 @@ TEST_F(MigrationManagerTest, SourceShardNotFound) {
     const std::vector<MigrateInfo> migrationRequests{{kShardId1, chunk1}, {kShardId3, chunk2}};
 
     auto future = launchAsync([this, chunk1, chunk2, migrationRequests] {
-        ON_BLOCK_EXIT([&] { Client::destroy(); });
-        Client::initThreadIfNotAlready("Test");
+        ThreadClient tc("Test", getGlobalServiceContext());
         auto opCtx = cc().makeOperationContext();
 
         // Scheduling a moveChunk command requires finding a host to which to send the command. Set
@@ -474,8 +473,7 @@ TEST_F(MigrationManagerTest, JumboChunkResponseBackwardsCompatibility) {
     const std::vector<MigrateInfo> migrationRequests{{kShardId1, chunk1}};
 
     auto future = launchAsync([this, chunk1, migrationRequests] {
-        ON_BLOCK_EXIT([&] { Client::destroy(); });
-        Client::initThreadIfNotAlready("Test");
+        ThreadClient tc("Test", getGlobalServiceContext());
         auto opCtx = cc().makeOperationContext();
 
         // Scheduling a moveChunk command requires finding a host to which to send the command. Set
@@ -513,8 +511,7 @@ TEST_F(MigrationManagerTest, InterruptMigration) {
         setUpChunk(collName, kKeyPattern.globalMin(), kKeyPattern.globalMax(), kShardId0, version);
 
     auto future = launchAsync([&] {
-        ON_BLOCK_EXIT([&] { Client::destroy(); });
-        Client::initThreadIfNotAlready("Test");
+        ThreadClient tc("Test", getGlobalServiceContext());
         auto opCtx = cc().makeOperationContext();
 
         // Scheduling a moveChunk command requires finding a host to which to send the command. Set
@@ -602,8 +599,7 @@ TEST_F(MigrationManagerTest, RestartMigrationManager) {
     _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle);
 
     auto future = launchAsync([&] {
-        ON_BLOCK_EXIT([&] { Client::destroy(); });
-        Client::initThreadIfNotAlready("Test");
+        ThreadClient tc("Test", getGlobalServiceContext());
         auto opCtx = cc().makeOperationContext();
 
         // Scheduling a moveChunk command requires finding a host to which to send the command. Set
@@ -657,8 +653,7 @@ TEST_F(MigrationManagerTest, MigrationRecovery) {
     _migrationManager->startRecoveryAndAcquireDistLocks(operationContext());
 
     auto future = launchAsync([this] {
-        ON_BLOCK_EXIT([&] { Client::destroy(); });
-        Client::initThreadIfNotAlready("Test");
+        ThreadClient tc("Test", getGlobalServiceContext());
         auto opCtx = cc().makeOperationContext();
 
         // Scheduling the moveChunk commands requires finding hosts to which to send the commands.
@@ -759,8 +754,7 @@ TEST_F(MigrationManagerTest, RemoteCallErrorConversionToOperationFailed) {
         setUpChunk(collName, BSON(kPattern << 49), kKeyPattern.globalMax(), kShardId2, version);
 
     auto future = launchAsync([&] {
-        ON_BLOCK_EXIT([&] { Client::destroy(); });
-        Client::initThreadIfNotAlready("Test");
+        ThreadClient tc("Test", getGlobalServiceContext());
         auto opCtx = cc().makeOperationContext();
 
         // Scheduling the moveChunk commands requires finding a host to which to send the command.

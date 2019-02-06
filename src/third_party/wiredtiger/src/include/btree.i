@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -341,6 +341,8 @@ __wt_cache_dirty_incr(WT_SESSION_IMPL *session, WT_PAGE *page)
 		}
 		(void)__wt_atomic_add64(&cache->pages_dirty_leaf, 1);
 	}
+	(void)__wt_atomic_add64(&btree->bytes_dirty_total, size);
+	(void)__wt_atomic_add64(&cache->bytes_dirty_total, size);
 	(void)__wt_atomic_addsize(&page->modify->bytes_dirty, size);
 }
 
@@ -1046,13 +1048,13 @@ __wt_row_leaf_value_cell(
 		    page, copy, NULL, &kcell, &key, &size) && kcell == NULL)
 			vcell = (WT_CELL *)((uint8_t *)key + size);
 		else {
-			__wt_cell_unpack(kcell, &unpack);
+			__wt_cell_unpack(page, kcell, &unpack);
 			vcell = (WT_CELL *)((uint8_t *)
 			    unpack.cell + __wt_cell_total_len(&unpack));
 		}
 	}
 
-	__wt_cell_unpack(__wt_cell_leaf_value_parse(page, vcell), vpack);
+	__wt_cell_unpack(page, __wt_cell_leaf_value_parse(page, vcell), vpack);
 }
 
 /*
@@ -1089,9 +1091,11 @@ __wt_ref_info(WT_REF *ref, const uint8_t **addrp, size_t *sizep, u_int *typep)
 {
 	WT_ADDR *addr;
 	WT_CELL_UNPACK *unpack, _unpack;
+	WT_PAGE *page;
 
 	addr = ref->addr;
 	unpack = &_unpack;
+	page = ref->home;
 
 	/*
 	 * If NULL, there is no location.
@@ -1105,7 +1109,7 @@ __wt_ref_info(WT_REF *ref, const uint8_t **addrp, size_t *sizep, u_int *typep)
 		*sizep = 0;
 		if (typep != NULL)
 			*typep = 0;
-	} else if (__wt_off_page(ref->home, addr)) {
+	} else if (__wt_off_page(page, addr)) {
 		*addrp = addr->addr;
 		*sizep = addr->size;
 		if (typep != NULL)
@@ -1124,7 +1128,7 @@ __wt_ref_info(WT_REF *ref, const uint8_t **addrp, size_t *sizep, u_int *typep)
 				break;
 			}
 	} else {
-		__wt_cell_unpack((WT_CELL *)addr, unpack);
+		__wt_cell_unpack(page, (WT_CELL *)addr, unpack);
 		*addrp = unpack->data;
 		*sizep = unpack->size;
 		if (typep != NULL)
@@ -1173,9 +1177,8 @@ __wt_page_del_active(WT_SESSION_IMPL *session, WT_REF *ref, bool visible_all)
 		return (true);
 	return (visible_all ?
 	    !__wt_txn_visible_all(session,
-	    page_del->txnid, WT_TIMESTAMP_NULL(&page_del->timestamp)) :
-	    !__wt_txn_visible(session,
-	    page_del->txnid, WT_TIMESTAMP_NULL(&page_del->timestamp)));
+	    page_del->txnid, page_del->timestamp) :
+	    !__wt_txn_visible(session, page_del->txnid, page_del->timestamp));
 }
 
 /*
@@ -1189,10 +1192,10 @@ __wt_page_las_active(WT_SESSION_IMPL *session, WT_REF *ref)
 
 	if ((page_las = ref->page_las) == NULL)
 		return (false);
-	if (!page_las->skew_newest)
+	if (!page_las->skew_newest || page_las->has_prepares)
 		return (true);
 	if (__wt_txn_visible_all(session, page_las->max_txn,
-	    WT_TIMESTAMP_NULL(&page_las->max_timestamp)))
+	    page_las->max_timestamp))
 		return (false);
 
 	return (true);
@@ -1335,9 +1338,9 @@ __wt_leaf_page_can_split(WT_SESSION_IMPL *session, WT_PAGE *page)
 static inline bool
 __wt_page_evict_retry(WT_SESSION_IMPL *session, WT_PAGE *page)
 {
-	WT_DECL_TIMESTAMP(pinned_ts)
 	WT_PAGE_MODIFY *mod;
 	WT_TXN_GLOBAL *txn_global;
+	wt_timestamp_t pinned_ts;
 
 	txn_global = &S2C(session)->txn_global;
 
@@ -1363,14 +1366,12 @@ __wt_page_evict_retry(WT_SESSION_IMPL *session, WT_PAGE *page)
 	    mod->last_eviction_id != __wt_txn_oldest_id(session))
 		return (true);
 
-#ifdef HAVE_TIMESTAMPS
-	if (__wt_timestamp_iszero(&mod->last_eviction_timestamp))
+	if (mod->last_eviction_timestamp == WT_TS_NONE)
 		return (true);
 
 	__wt_txn_pinned_timestamp(session, &pinned_ts);
-	if (__wt_timestamp_cmp(&pinned_ts, &mod->last_eviction_timestamp) > 0)
+	if (pinned_ts > mod->last_eviction_timestamp)
 		return (true);
-#endif
 
 	return (false);
 }
@@ -1457,7 +1458,7 @@ __wt_page_can_evict(WT_SESSION_IMPL *session, WT_REF *ref, bool *inmem_splitp)
 	 * evict, skip it.
 	 */
 	if (!modified && !__wt_txn_visible_all(session,
-	    mod->rec_max_txn, WT_TIMESTAMP_NULL(&mod->rec_max_timestamp)))
+	    mod->rec_max_txn, mod->rec_max_timestamp))
 		return (false);
 
 	return (true);

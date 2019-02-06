@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -35,11 +37,13 @@
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/document_source_project.h"
+#include "mongo/db/pipeline/document_source_sequential_document_cache.h"
 #include "mongo/db/pipeline/document_source_skip.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_query_knobs.h"
 #include "mongo/s/query/document_source_merge_cursors.h"
@@ -107,6 +111,102 @@ void moveFinalUnwindFromShardsToMerger(Pipeline* shardPipe, Pipeline* mergePipe)
            dynamic_cast<DocumentSourceUnwind*>(shardPipe->getSources().back().get())) {
         mergePipe->addInitialSource(shardPipe->popBack());
     }
+}
+
+/**
+ * Returns true if the final stage of the pipeline limits the number of documents it could output
+ * (such as a $limit stage).
+ *
+ * This function is not meant to exhaustively catch every single case where a pipeline might have
+ * some kind of limit. It's only here so that propagateDocLimitsToShards() can avoid adding an
+ * obviously unnecessary $limit to a shard's pipeline.
+ */
+boost::optional<long long> getPipelineLimit(Pipeline* pipeline) {
+    for (auto source_it = pipeline->getSources().rbegin();
+         source_it != pipeline->getSources().rend();
+         ++source_it) {
+        const auto source = source_it->get();
+
+        auto limitStage = dynamic_cast<DocumentSourceLimit*>(source);
+        if (limitStage) {
+            return limitStage->getLimit();
+        }
+
+        auto sortStage = dynamic_cast<DocumentSourceSort*>(source);
+        if (sortStage) {
+            return (sortStage->getLimit() >= 0) ? boost::optional<long long>(sortStage->getLimit())
+                                                : boost::none;
+        }
+
+        auto cursorStage = dynamic_cast<DocumentSourceSort*>(source);
+        if (cursorStage) {
+            return (cursorStage->getLimit() >= 0)
+                ? boost::optional<long long>(cursorStage->getLimit())
+                : boost::none;
+        }
+
+        // If this stage is one that can swap with a $limit stage, then we can look at the previous
+        // stage to see if it includes a limit. Otherwise, we give up trying to find a limit on this
+        // stage's output.
+        if (!source->constraints().canSwapWithLimitAndSample) {
+            break;
+        }
+    }
+
+    return boost::none;
+}
+
+/**
+ * If the merging pipeline includes a $limit stage that creates an upper bound on how many input
+ * documents it needs to compute the aggregation, we can use that as an upper bound on how many
+ * documents each of the shards needs to produce. Propagating that upper bound to the shards (using
+ * a $limit in the shard pipeline) can reduce the number of documents the shards need to process and
+ * transfer over the network (see SERVER-36881).
+ *
+ * If there are $skip stages before the $limit, the skipped documents also contribute to the upper
+ * bound.
+ */
+void propagateDocLimitToShards(Pipeline* shardPipe, Pipeline* mergePipe) {
+    long long numDocumentsNeeded = 0;
+
+    for (auto&& source : mergePipe->getSources()) {
+        auto skipStage = dynamic_cast<DocumentSourceSkip*>(source.get());
+        if (skipStage) {
+            numDocumentsNeeded += skipStage->getSkip();
+            continue;
+        }
+
+        auto limitStage = dynamic_cast<DocumentSourceLimit*>(source.get());
+        if (limitStage) {
+            numDocumentsNeeded += limitStage->getLimit();
+
+            auto existingShardLimit = getPipelineLimit(shardPipe);
+            if (existingShardLimit && *existingShardLimit <= numDocumentsNeeded) {
+                // The sharding pipeline already has a limit that is no greater than the limit we
+                // were going to add, so no changes are necessary.
+                return;
+            }
+
+            auto shardLimit =
+                DocumentSourceLimit::create(mergePipe->getContext(), numDocumentsNeeded);
+            shardPipe->addFinalSource(shardLimit);
+
+            // We have successfully applied a limit to the number of documents we need from each
+            // shard.
+            return;
+        }
+
+        // If there are any stages in the merge pipeline before the $skip and $limit stages, then we
+        // cannot use the $limit to determine an upper bound, unless those stages could be swapped
+        // with the $limit.
+        if (!source->constraints().canSwapWithLimitAndSample) {
+            return;
+        }
+    }
+
+    // We did not find any limit in the merge pipeline that would allow us to set an upper bound on
+    // the number of documents we need from each shard.
+    return;
 }
 
 /**
@@ -348,6 +448,20 @@ boost::optional<ShardedExchangePolicy> walkPipelineBackwardsTrackingShardKey(
     return ShardedExchangePolicy{std::move(exchangeSpec), std::move(consumerShards)};
 }
 
+/**
+ * Non-correlated pipeline caching is only supported locally. When the
+ * DocumentSourceSequentialDocumentCache stage has been moved to the shards pipeline, abandon the
+ * associated local cache.
+ */
+void abandonCacheIfSentToShards(Pipeline* shardsPipeline) {
+    for (auto&& stage : shardsPipeline->getSources()) {
+        if (StringData(stage->getSourceName()) ==
+            DocumentSourceSequentialDocumentCache::kStageName) {
+            static_cast<DocumentSourceSequentialDocumentCache*>(stage.get())->abandonCache();
+        }
+    }
+}
+
 }  // namespace
 
 SplitPipeline splitPipeline(std::unique_ptr<Pipeline, PipelineDeleter> pipeline) {
@@ -363,7 +477,10 @@ SplitPipeline splitPipeline(std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
     // The order in which optimizations are applied can have significant impact on the efficiency of
     // the final pipeline. Be Careful!
     moveFinalUnwindFromShardsToMerger(shardsPipeline.get(), mergePipeline.get());
+    propagateDocLimitToShards(shardsPipeline.get(), mergePipeline.get());
     limitFieldsSentFromShardsToMerger(shardsPipeline.get(), mergePipeline.get());
+
+    abandonCacheIfSentToShards(shardsPipeline.get());
     shardsPipeline->setSplitState(Pipeline::SplitState::kSplitForShards);
     mergePipeline->setSplitState(Pipeline::SplitState::kSplitForMerge);
 
@@ -462,8 +579,8 @@ boost::optional<ShardedExchangePolicy> checkIfEligibleForExchange(OperationConte
         return boost::none;
     }
 
-    const auto routingInfo = uassertStatusOK(
-        grid->catalogCache()->getCollectionRoutingInfo(opCtx, outStage->getOutputNs()));
+    const auto routingInfo =
+        uassertStatusOK(getCollectionRoutingInfoForTxnCmd(opCtx, outStage->getOutputNs()));
     if (!routingInfo.cm()) {
         return boost::none;
     }

@@ -1,39 +1,43 @@
+
 /**
- *    Copyright (C) 2014-2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
@@ -45,6 +49,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -56,12 +61,19 @@ using stdx::make_unique;
 
 namespace {
 
+// Failpoint which causes to hang "listIndexes" cmd after acquiring the DB lock.
+MONGO_FAIL_POINT_DEFINE(hangBeforeListIndexes);
+
 /**
  * Lists the indexes for a given collection.
+ * If the optional 'includeIndexBuilds' field is set to true, returns indexes that are not
+ * ready. Defaults to false.
+ * These not-ready indexes are identified by a 'buildUUID' field in the index spec.
  *
  * Format:
  * {
- *   listIndexes: <collection name>
+ *   listIndexes: <collection name>,
+ *   includeIndexBuilds: <boolean>,
  * }
  *
  * Return format:
@@ -121,8 +133,10 @@ public:
         uassertStatusOK(
             CursorRequest::parseCommandCursorOptions(cmdObj, defaultBatchSize, &batchSize));
 
+        auto includeIndexBuilds = cmdObj["includeIndexBuilds"].trueValue();
+
+        NamespaceString nss;
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
-        NamespaceString cursorNss;
         BSONArrayBuilder firstBatch;
         {
             AutoGetCollectionForReadCommand ctx(opCtx,
@@ -135,22 +149,36 @@ public:
             const CollectionCatalogEntry* cce = collection->getCatalogEntry();
             invariant(cce);
 
-            const auto nss = ctx.getNss();
+            nss = ctx.getNss();
+
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                &hangBeforeListIndexes, opCtx, "hangBeforeListIndexes", []() {}, false, nss);
 
             vector<string> indexNames;
-            writeConflictRetry(opCtx, "listIndexes", nss.ns(), [&indexNames, &cce, &opCtx] {
+            writeConflictRetry(opCtx, "listIndexes", nss.ns(), [&] {
                 indexNames.clear();
-                cce->getReadyIndexes(opCtx, &indexNames);
+                if (includeIndexBuilds) {
+                    cce->getAllIndexes(opCtx, &indexNames);
+                } else {
+                    cce->getReadyIndexes(opCtx, &indexNames);
+                }
             });
 
             auto ws = make_unique<WorkingSet>();
             auto root = make_unique<QueuedDataStage>(opCtx, ws.get());
 
             for (size_t i = 0; i < indexNames.size(); i++) {
-                BSONObj indexSpec = writeConflictRetry(
-                    opCtx, "listIndexes", nss.ns(), [&cce, &opCtx, &indexNames, i] {
-                        return cce->getIndexSpec(opCtx, indexNames[i]);
-                    });
+                auto indexSpec = writeConflictRetry(opCtx, "listIndexes", nss.ns(), [&] {
+                    if (includeIndexBuilds && !cce->isIndexReady(opCtx, indexNames[i])) {
+                        auto spec = cce->getIndexSpec(opCtx, indexNames[i]);
+                        BSONObjBuilder builder(spec);
+                        // TODO(SERVER-37980): Replace with index build UUID.
+                        auto indexBuildUUID = UUID::gen();
+                        indexBuildUUID.appendToBuilder(&builder, "buildUUID"_sd);
+                        return builder.obj();
+                    }
+                    return cce->getIndexSpec(opCtx, indexNames[i]);
+                });
 
                 WorkingSetID id = ws->allocate();
                 WorkingSetMember* member = ws->get(id);
@@ -161,11 +189,8 @@ public:
                 root->pushBack(id);
             }
 
-            cursorNss = NamespaceString::makeListIndexesNSS(dbname, nss.coll());
-            invariant(nss == cursorNss.getTargetNSForListIndexes());
-
             exec = uassertStatusOK(PlanExecutor::make(
-                opCtx, std::move(ws), std::move(root), cursorNss, PlanExecutor::NO_YIELD));
+                opCtx, std::move(ws), std::move(root), nss, PlanExecutor::NO_YIELD));
 
             for (long long objCount = 0; objCount < batchSize; objCount++) {
                 BSONObj next;
@@ -185,7 +210,7 @@ public:
             }
 
             if (exec->isEOF()) {
-                appendCursorResponseObject(0LL, cursorNss.ns(), firstBatch.arr(), &result);
+                appendCursorResponseObject(0LL, nss.ns(), firstBatch.arr(), &result);
                 return true;
             }
 
@@ -197,13 +222,14 @@ public:
         const auto pinnedCursor = CursorManager::getGlobalCursorManager()->registerCursor(
             opCtx,
             {std::move(exec),
-             cursorNss,
+             nss,
              AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-             repl::ReadConcernArgs::get(opCtx).getLevel(),
-             cmdObj});
+             repl::ReadConcernArgs::get(opCtx),
+             cmdObj,
+             ClientCursorParams::LockPolicy::kLocksInternally});
 
         appendCursorResponseObject(
-            pinnedCursor.getCursor()->cursorid(), cursorNss.ns(), firstBatch.arr(), &result);
+            pinnedCursor.getCursor()->cursorid(), nss.ns(), firstBatch.arr(), &result);
 
         return true;
     }

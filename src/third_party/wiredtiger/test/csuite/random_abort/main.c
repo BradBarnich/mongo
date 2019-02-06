@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2018 MongoDB, Inc.
+ * Public Domain 2014-2019 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -81,8 +81,8 @@ thread_run(void *arg)
 	WT_RAND_STATE rnd;
 	WT_SESSION *session;
 	WT_THREAD_DATA *td;
-	uint64_t i;
 	size_t lsize;
+	uint64_t i;
 	char buf[MAX_VAL], kname[64], lgbuf[8];
 	char large[128*1024];
 
@@ -240,8 +240,8 @@ main(int argc, char *argv[])
 	uint64_t absent, count, key, last_key, middle;
 	uint32_t i, nth, timeout;
 	int ch, status, ret;
-	const char *working_dir;
 	char buf[1024], fname[64], kname[64];
+	const char *working_dir;
 	bool fatal, rand_th, rand_time, verify_only;
 
 	(void)testutil_set_progname(argv);
@@ -348,7 +348,7 @@ main(int argc, char *argv[])
 			testutil_check(__wt_snprintf(
 			    buf, sizeof(buf),"%s/%s", home, fname));
 			while (stat(buf, &sb) != 0)
-				sleep(1);
+				testutil_sleep_wait(1, pid);
 			++i;
 		}
 		sleep(timeout);

@@ -40,6 +40,13 @@ selector:
   # TODO SERVER-31198: Remove once retry attempts are always decremented.
   - jstests/core/write_result.js
 
+  # This test makes the assumption that a command is run a certain number of times, but
+  # the retryable writes suite overrides the runCommand to repeat commands.
+  - jstests/core/failcommand_failpoint.js
+
+  # Unacknowledged writes prohibited in an explicit session.
+  - jstests/core/batch_write_command_w0.js
+
 executor:
   archive:
     hooks:
@@ -72,5 +79,4 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
-        numInitialSyncAttempts: 1
     num_nodes: 2

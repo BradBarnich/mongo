@@ -1,23 +1,25 @@
-/*
- *    Copyright (C) 2013 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,7 +41,6 @@
 #include "mongo/bson/json.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
-#include "mongo/db/db.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/server_options.h"
@@ -183,34 +184,6 @@ Status addMongodOptions(moe::OptionSection* options) {
                            "collections within a database into a shared record store.")
         .hidden();
 
-    // Only allow `noIndexBuildRetry` on standalones to quickly access data. Running with
-    // `noIndexBuildRetry` is risky in a live replica set. For example, trying to drop a
-    // collection that did not have its indexes rebuilt results in a crash.
-    general_options
-        .addOptionChaining("noIndexBuildRetry",
-                           "noIndexBuildRetry",
-                           moe::Switch,
-                           "don't retry any index builds that were interrupted by shutdown")
-        .setSources(moe::SourceAllLegacy)
-        .incompatibleWith("replication.replSet")
-        .incompatibleWith("replication.replSetName");
-
-    general_options
-        .addOptionChaining("storage.indexBuildRetry",
-                           "",
-                           moe::Bool,
-                           "don't retry any index builds that were interrupted by shutdown")
-        .setSources(moe::SourceYAMLConfig)
-        .incompatibleWith("replication.replSet")
-        .incompatibleWith("replication.replSetName");
-
-    storage_options
-        .addOptionChaining("noprealloc",
-                           "noprealloc",
-                           moe::Switch,
-                           "disable data file preallocation - will often hurt performance")
-        .setSources(moe::SourceAllLegacy);
-
     storage_options
         .addOptionChaining("storage.syncPeriodSecs",
                            "syncdelay",
@@ -293,13 +266,6 @@ Status addMongodOptions(moe::OptionSection* options) {
     rs_options.addOptionChaining("replication.replSetName", "", moe::String, "arg is <setname>")
         .setSources(moe::SourceYAMLConfig)
         .format("[^/]+", "[replica set name with no \"/\"]");
-
-    rs_options
-        .addOptionChaining("replication.secondaryIndexPrefetch",
-                           "replIndexPrefetch",
-                           moe::String,
-                           "specify index prefetching behavior (if secondary) [none|_id_only|all]")
-        .format("(:?none)|(:?_id_only)|(:?all)", "(none/_id_only/all)");
 
     // `enableMajorityReadConcern` is enabled by default starting in 3.6.
     rs_options
@@ -683,20 +649,6 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
         }
     }
 
-    // "storage.indexBuildRetry" comes from the config file, so override it if
-    // "noIndexBuildRetry" is set since that comes from the command line.
-    if (params->count("noIndexBuildRetry")) {
-        Status ret = params->set("storage.indexBuildRetry",
-                                 moe::Value(!(*params)["noIndexBuildRetry"].as<bool>()));
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("noIndexBuildRetry");
-        if (!ret.isOK()) {
-            return ret;
-        }
-    }
-
     // Ensure that "replication.replSet" logically overrides "replication.replSetName".  We
     // can't canonicalize them as the same option, because they mean slightly different things.
     // "replication.replSet" can include a seed list, while "replication.replSetName" just has
@@ -866,18 +818,10 @@ Status storeMongodOptions(const moe::Environment& params) {
         /* seed list of hosts for the repl set */
         replSettings.setReplSetString(params["replication.replSet"].as<std::string>().c_str());
     }
-    if (params.count("replication.secondaryIndexPrefetch")) {
-        replSettings.setPrefetchIndexMode(
-            params["replication.secondaryIndexPrefetch"].as<std::string>());
-    }
 
     if (params.count("replication.enableMajorityReadConcern")) {
         serverGlobalParams.enableMajorityReadConcern =
             params["replication.enableMajorityReadConcern"].as<bool>();
-    }
-
-    if (params.count("storage.indexBuildRetry")) {
-        serverGlobalParams.indexBuildRetry = params["storage.indexBuildRetry"].as<bool>();
     }
 
     if (params.count("replication.oplogSizeMB")) {

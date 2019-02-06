@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -214,6 +216,14 @@ public:
     }
 
     /**
+     * For sorted tailable cursors, returns the most recent available sort key. This guarantees that
+     * we will never return any future results which precede this key. If no results are ready to be
+     * returned, this method may cause the high water mark to advance to the lowest promised sortkey
+     * received from the shards. Returns an empty BSONObj if no such sort key is available.
+     */
+    BSONObj getHighWaterMark();
+
+    /**
      * Starts shutting down this ARM by canceling all pending requests and scheduling killCursors
      * on all of the unexhausted remotes. Returns a handle to an event that is signaled when this
      * ARM is safe to destroy.
@@ -315,6 +325,18 @@ private:
         const bool _compareWholeSortKey;
     };
 
+    using MinSortKeyRemoteIdPair = std::pair<BSONObj, size_t>;
+
+    class PromisedMinSortKeyComparator {
+    public:
+        PromisedMinSortKeyComparator(BSONObj sort) : _sort(std::move(sort)) {}
+
+        bool operator()(const MinSortKeyRemoteIdPair& lhs, const MinSortKeyRemoteIdPair& rhs) const;
+
+    private:
+        BSONObj _sort;
+    };
+
     enum LifecycleState { kAlive, kKillStarted, kKillComplete };
 
     /**
@@ -403,6 +425,11 @@ private:
      */
     bool _haveOutstandingBatchRequests(WithLock);
 
+    /**
+     * If a promisedMinSortKey has been obtained from all remotes, returns the lowest such key.
+     * Otherwise, returns an empty BSONObj.
+     */
+    BSONObj _getMinPromisedSortKey(WithLock);
 
     /**
      * Schedules a getMore on any remote hosts which we need another batch from.
@@ -415,9 +442,9 @@ private:
     void _scheduleKillCursors(WithLock, OperationContext* opCtx);
 
     /**
-     * Updates 'remote's metadata (e.g. the cursor id) based on information in 'response'.
+     * Updates the given remote's metadata (e.g. the cursor id) based on information in 'response'.
      */
-    void updateRemoteMetadata(RemoteCursorData* remote, const CursorResponse& response);
+    void _updateRemoteMetadata(WithLock, size_t remoteIndex, const CursorResponse& response);
 
     OperationContext* _opCtx;
     executor::TaskExecutor* _executor;
@@ -447,6 +474,13 @@ private:
     bool _eofNext = false;
 
     boost::optional<Milliseconds> _awaitDataTimeout;
+
+    // An ordered set of (promisedMinSortKey, remoteIndex) pairs received from the shards. The first
+    // element in the set will be the lowest sort key across all shards.
+    std::set<MinSortKeyRemoteIdPair, PromisedMinSortKeyComparator> _promisedMinSortKeys;
+
+    // For sorted tailable cursors, records the current high-water-mark sort key. Empty otherwise.
+    BSONObj _highWaterMark;
 
     //
     // Killing

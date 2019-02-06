@@ -16,6 +16,18 @@ var {
         return typeof obj === "object" && obj !== null;
     }
 
+    function isAcknowledged(cmdObj) {
+        if (isNonNullObject(cmdObj.writeConcern)) {
+            const writeConcern = cmdObj.writeConcern;
+            // Intentional use of "==" comparing NumberInt, NumberLong, or plain Number.
+            if (writeConcern.hasOwnProperty("w") && writeConcern.w == 0) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     function SessionOptions(rawOptions = {}) {
         if (!(this instanceof SessionOptions)) {
             return new SessionOptions(rawOptions);
@@ -87,6 +99,17 @@ var {
     const kWireVersionSupportingLogicalSession = 6;
     const kWireVersionSupportingRetryableWrites = 6;
     const kWireVersionSupportingMultiDocumentTransactions = 7;
+
+    function processCommandResponse(driverSession, client, res) {
+        if (res.hasOwnProperty("operationTime")) {
+            driverSession.advanceOperationTime(res.operationTime);
+        }
+
+        if (res.hasOwnProperty("$clusterTime")) {
+            driverSession.advanceClusterTime(res.$clusterTime);
+            client.advanceClusterTime(res.$clusterTime);
+        }
+    }
 
     function SessionAwareClient(client) {
         this.getReadPreference = function getReadPreference(driverSession) {
@@ -208,6 +231,10 @@ var {
         }
 
         function prepareCommandRequest(driverSession, cmdObj) {
+            if (driverSession._isExplicit && !isAcknowledged(cmdObj)) {
+                throw new Error("Unacknowledged writes are prohibited with sessions");
+            }
+
             if (serverSupports(kWireVersionSupportingLogicalSession) &&
                 // Always attach sessionId from explicit sessions.
                 (driverSession._isExplicit ||
@@ -288,17 +315,6 @@ var {
             }
 
             return cmdObj;
-        }
-
-        function processCommandResponse(driverSession, res) {
-            if (res.hasOwnProperty("operationTime")) {
-                driverSession.advanceOperationTime(res.operationTime);
-            }
-
-            if (res.hasOwnProperty("$clusterTime")) {
-                driverSession.advanceClusterTime(res.$clusterTime);
-                client.advanceClusterTime(res.$clusterTime);
-            }
         }
 
         /**
@@ -442,7 +458,7 @@ var {
             const res = runClientFunctionWithRetries(
                 driverSession, cmdObj, client.runCommand, [dbName, cmdObj, options]);
 
-            processCommandResponse(driverSession, res);
+            processCommandResponse(driverSession, client, res);
             return res;
         };
 
@@ -453,7 +469,7 @@ var {
             const res = runClientFunctionWithRetries(
                 driverSession, cmdObj, client.runCommandWithMetadata, [dbName, metadata, cmdObj]);
 
-            processCommandResponse(driverSession, res);
+            processCommandResponse(driverSession, client, res);
             return res;
         };
     }
@@ -486,20 +502,12 @@ var {
     // The server session maintains the state of a transaction, a monotonically increasing txn
     // number, and a transaction's read/write concerns.
     function ServerSession(client) {
-        // The default txnState is `inactive` until we call startTransaction.
-        let _txnState = ServerSession.TransactionStates.kInactive;
-
         let _txnOptions;
 
         // Keep track of the next available statement id of a transaction.
         let _nextStatementId = 0;
-
-        // _txnNumber starts at -1 because when we increment it, the first transaction
-        // and retryable write will both have a txnNumber of 0.
-        let _txnNumber = -1;
         let _lastUsed = new Date();
 
-        this.client = new SessionAwareClient(client);
         if (!serverSupports(kWireVersionSupportingLogicalSession)) {
             throw new DriverSession.UnsupportedError(
                 "Logical Sessions are only supported on server versions 3.6 and greater.");
@@ -511,8 +519,11 @@ var {
                 wireVersion <= client.getMaxWireVersion();
         }
 
+        const hasTxnState = ((name) => this.handle.getTxnState() === name);
+        const setTxnState = ((name) => this.handle.setTxnState(name));
+
         this.isTxnActive = function isTxnActive() {
-            return _txnState === ServerSession.TransactionStates.kActive;
+            return hasTxnState("active");
         };
 
         this.isFirstStatement = function isFirstStatement() {
@@ -524,7 +535,11 @@ var {
         };
 
         this.getTxnNumber = function getTxnNumber() {
-            return _txnNumber;
+            return this.handle.getTxnNumber();
+        };
+
+        this.setTxnNumber_forTesting = function setTxnNumber_forTesting(newTxnNumber) {
+            this.handle.setTxnNumber(newTxnNumber);
         };
 
         this.getTxnOptions = function getTxnOptions() {
@@ -549,7 +564,9 @@ var {
             }
 
             if (!cmdObjUnwrapped.hasOwnProperty("lsid")) {
-                cmdObjUnwrapped.lsid = this.handle.getId();
+                if (isAcknowledged(cmdObjUnwrapped)) {
+                    cmdObjUnwrapped.lsid = this.handle.getId();
+                }
 
                 // We consider the session to still be in use by the client any time the session id
                 // is injected into the command object as part of making a request.
@@ -573,11 +590,8 @@ var {
             }
 
             if (!cmdObjUnwrapped.hasOwnProperty("txnNumber")) {
-                // Since there's no native support for adding NumberLong instances and getting back
-                // another NumberLong instance, converting from a 64-bit floating-point value to a
-                // 64-bit integer value will overflow at 2**53.
-                _txnNumber++;
-                cmdObjUnwrapped.txnNumber = new NumberLong(_txnNumber);
+                this.handle.incrementTxnNumber();
+                cmdObjUnwrapped.txnNumber = this.handle.getTxnNumber();
             }
 
             return cmdObj;
@@ -593,16 +607,12 @@ var {
                 cmdName = Object.keys(cmdObj)[0];
             }
 
-            if (isNonNullObject(cmdObj.writeConcern)) {
-                const writeConcern = cmdObj.writeConcern;
+            if (cmdObj.hasOwnProperty("autocommit")) {
+                return false;
+            }
 
-                // We use bsonWoCompare() in order to handle cases where the "w" field is specified
-                // as a NumberInt() or NumberLong() instance.
-                if (writeConcern.hasOwnProperty("w") &&
-                    bsonWoCompare({_: writeConcern.w}, {_: 0}) === 0) {
-                    // Unacknowledged writes cannot be retried.
-                    return false;
-                }
+            if (!isAcknowledged(cmdObj)) {
+                return false;
             }
 
             if (cmdName === "insert") {
@@ -667,22 +677,21 @@ var {
         this.assignTxnInfo = function assignTxnInfo(cmdObj) {
             // We will want to reset the transaction state to 'inactive' if a normal operation
             // follows a committed or aborted transaction.
-            if ((_txnState === ServerSession.TransactionStates.kAborted) ||
-                (_txnState === ServerSession.TransactionStates.kCommitted &&
-                 Object.keys(cmdObj)[0] !== "commitTransaction")) {
-                _txnState = ServerSession.TransactionStates.kInactive;
+            if ((hasTxnState("aborted")) ||
+                (hasTxnState("committed") && Object.keys(cmdObj)[0] !== "commitTransaction")) {
+                setTxnState("inactive");
             }
 
             // If we're not in an active transaction or performing a retry on commitTransaction,
             // return early.
-            if (_txnState === ServerSession.TransactionStates.kInactive) {
+            if (hasTxnState("inactive")) {
                 return cmdObj;
             }
 
             // If we reconnect to a 3.6 server in the middle of a transaction, we
             // catch it here.
             if (!serverSupports(kWireVersionSupportingMultiDocumentTransactions)) {
-                _txnState = ServerSession.TransactionStates.kInactive;
+                setTxnState("inactive");
                 throw new Error(
                     "Transactions are only supported on server versions 4.0 and greater.");
             }
@@ -699,10 +708,7 @@ var {
             }
 
             if (!cmdObjUnwrapped.hasOwnProperty("txnNumber")) {
-                // Since there's no native support for adding NumberLong instances and getting back
-                // another NumberLong instance, converting from a 64-bit floating-point value to a
-                // 64-bit integer value will overflow at 2**53.
-                cmdObjUnwrapped.txnNumber = new NumberLong(_txnNumber);
+                cmdObjUnwrapped.txnNumber = this.handle.getTxnNumber();
             }
 
             // All operations of a multi-statement transaction must specify autocommit=false.
@@ -741,7 +747,7 @@ var {
         };
 
         this.startTransaction = function startTransaction(txnOptsObj, ignoreActiveTxn) {
-            // If the session is already in a transaction, raise an error. If retryNewTxnNum
+            // If the session is already in a transaction, raise an error. If ignoreActiveTxn
             // is true, don't raise an error. This is to allow multiple threads to try to
             // use the same session in a concurrency workload.
             if (this.isTxnActive() && !ignoreActiveTxn) {
@@ -752,18 +758,18 @@ var {
                     "Transactions are only supported on server versions 4.0 and greater.");
             }
             _txnOptions = new TransactionOptions(txnOptsObj);
-            _txnState = ServerSession.TransactionStates.kActive;
+            setTxnState("active");
             _nextStatementId = 0;
-            _txnNumber++;
+            this.handle.incrementTxnNumber();
         };
 
         this.commitTransaction = function commitTransaction(driverSession) {
             // If the transaction state is already 'aborted' we cannot try to commit it.
-            if (_txnState === ServerSession.TransactionStates.kAborted) {
+            if (hasTxnState("aborted")) {
                 throw new Error("Cannot call commitTransaction after calling abortTransaction.");
             }
             // If the session has no active transaction, raise an error.
-            if (_txnState === ServerSession.TransactionStates.kInactive) {
+            if (hasTxnState("inactive")) {
                 throw new Error("There is no active transaction to commit on this session.");
             }
             // run commitTxn command
@@ -772,15 +778,15 @@ var {
 
         this.abortTransaction = function abortTransaction(driverSession) {
             // If the transaction state is already 'aborted' we cannot try to abort it again.
-            if (_txnState === ServerSession.TransactionStates.kAborted) {
+            if (hasTxnState("aborted")) {
                 throw new Error("Cannot call abortTransaction twice.");
             }
             // We cannot attempt to abort a transaction that has already been committed.
-            if (_txnState === ServerSession.TransactionStates.kCommitted) {
+            if (hasTxnState("committed")) {
                 throw new Error("Cannot call abortTransaction after calling commitTransaction.");
             }
             // If the session has no active transaction, raise an error.
-            if (_txnState === ServerSession.TransactionStates.kInactive) {
+            if (hasTxnState("inactive")) {
                 throw new Error("There is no active transaction to abort on this session.");
             }
             // run abortTxn command
@@ -793,19 +799,20 @@ var {
             // transaction as 'committed' or 'aborted' accordingly.
             if (this.isFirstStatement()) {
                 if (commandName === "commitTransaction") {
-                    _txnState = ServerSession.TransactionStates.kCommitted;
+                    setTxnState("committed");
                 } else {
-                    _txnState = ServerSession.TransactionStates.kAborted;
+                    setTxnState("aborted");
                 }
                 return {"ok": 1};
             }
 
-            let cmd = {[commandName]: 1, txnNumber: NumberLong(_txnNumber)};
+            let cmd = {[commandName]: 1, txnNumber: this.handle.getTxnNumber()};
             // writeConcern should only be specified on commit or abort. If a writeConcern is
             // not specified from the default transaction options, it will be inherited from
             // the session.
-            if (this.client.getWriteConcern(driverSession) !== undefined) {
-                cmd.writeConcern = this.client.getWriteConcern(driverSession);
+            const sessionAwareClient = driverSession._getSessionAwareClient();
+            if (sessionAwareClient.getWriteConcern(driverSession) !== undefined) {
+                cmd.writeConcern = sessionAwareClient.getWriteConcern(driverSession);
             }
             if (_txnOptions.getTxnWriteConcern() !== undefined) {
                 cmd.writeConcern = _txnOptions.getTxnWriteConcern();
@@ -815,31 +822,22 @@ var {
             let res;
             try {
                 // run command against the admin database.
-                res = this.client.runCommand(driverSession, "admin", cmd, 0);
+                res = sessionAwareClient.runCommand(driverSession, "admin", cmd, 0);
             } finally {
                 if (commandName === "commitTransaction") {
-                    _txnState = ServerSession.TransactionStates.kCommitted;
+                    setTxnState("committed");
                 } else {
-                    _txnState = ServerSession.TransactionStates.kAborted;
+                    setTxnState("aborted");
                 }
             }
             return res;
         };
     }
 
-    // TransactionStates represents the state of the current transaction. The default state
-    // is 'inactive' until startTransaction is called and changes the state to 'active'.
-    // Calling abortTransaction or commitTransaction will change the state to 'aborted' or
-    // 'committed' respectively, even on error.
-    ServerSession.TransactionStates = {
-        kActive: 'active',
-        kInactive: 'inactive',
-        kCommitted: 'committed',
-        kAborted: 'aborted',
-    };
-
     function makeDriverSessionConstructor(implMethods, defaultOptions = {}) {
         var driverSessionConstructor = function(client, options = defaultOptions) {
+            const sessionAwareClient = new SessionAwareClient(client);
+
             let _options = options;
             let _hasEnded = false;
 
@@ -859,7 +857,7 @@ var {
             };
 
             this._getSessionAwareClient = function _getSessionAwareClient() {
-                return this._serverSession.client;
+                return sessionAwareClient;
             };
 
             this.getOptions = function getOptions() {
@@ -875,6 +873,10 @@ var {
 
             this.getTxnNumber_forTesting = function getTxnNumber_forTesting() {
                 return this._serverSession.getTxnNumber();
+            };
+
+            this.setTxnNumber_forTesting = function setTxnNumber_forTesting(newTxnNumber) {
+                this._serverSession.setTxnNumber_forTesting(newTxnNumber);
             };
 
             this.getOperationTime = function getOperationTime() {
@@ -967,6 +969,11 @@ var {
             this.abortTransaction_forTesting = function abortTransaction_forTesting() {
                 return this._serverSession.abortTransaction(this);
             };
+
+            this.processCommandResponse_forTesting = function processCommandResponse_forTesting(
+                res) {
+                processCommandResponse(this, client, res);
+            };
         };
 
         // Having a specific Error for when logical sessions aren't supported by the server, allows
@@ -1035,8 +1042,6 @@ var {
             {
               createServerSession: function createServerSession(client) {
                   return {
-                      client: new SessionAwareClient(client),
-
                       injectSessionId: function injectSessionId(cmdObj) {
                           return cmdObj;
                       },

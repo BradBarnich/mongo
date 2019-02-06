@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -87,6 +89,14 @@ Status createCollection(OperationContext* opCtx,
             !options["capped"].trueValue() || options["size"].isNumber() ||
                 options.hasField("$nExtents"));
 
+    CollectionOptions collectionOptions;
+    {
+        Status status = collectionOptions.parse(options, kind);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
     return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
         Lock::DBLock dbXLock(opCtx, nss.db(), MODE_X);
         const bool shardVersionCheck = true;
@@ -94,13 +104,7 @@ Status createCollection(OperationContext* opCtx,
         if (opCtx->writesAreReplicated() &&
             !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
             return Status(ErrorCodes::NotMaster,
-                          str::stream() << "Not primary while creating collection " << nss.ns());
-        }
-
-        CollectionOptions collectionOptions;
-        Status status = collectionOptions.parse(options, kind);
-        if (!status.isOK()) {
-            return status;
+                          str::stream() << "Not primary while creating collection " << nss);
         }
 
         if (collectionOptions.isView()) {
@@ -115,9 +119,8 @@ Status createCollection(OperationContext* opCtx,
 
         // Create collection.
         const bool createDefaultIndexes = true;
-        status = Database::userCreateNS(
-            opCtx, ctx.db(), nss.ns(), std::move(collectionOptions), createDefaultIndexes, idIndex);
-
+        Status status =
+            ctx.db()->userCreateNS(opCtx, nss, collectionOptions, createDefaultIndexes, idIndex);
         if (!status.isOK()) {
             return status;
         }
@@ -150,8 +153,8 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
     const NamespaceString newCollName(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
     auto newCmd = cmdObj;
 
-    auto* const serviceContext = opCtx->getServiceContext();
-    auto* const db = DatabaseHolder::getDatabaseHolder().get(opCtx, dbName);
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto* const db = databaseHolder->getDb(opCtx, dbName);
 
     // If a UUID is given, see if we need to rename a collection out of the way, and whether the
     // collection already exists under a different name. If so, rename it into place. As this is
@@ -174,7 +177,8 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
 
                 auto& catalog = UUIDCatalog::get(opCtx);
                 const auto currentName = catalog.lookupNSSByUUID(uuid);
-                OpObserver* const opObserver = serviceContext->getOpObserver();
+                auto serviceContext = opCtx->getServiceContext();
+                auto opObserver = serviceContext->getOpObserver();
                 if (currentName == newCollName)
                     return Result(Status::OK());
 
@@ -207,7 +211,7 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                             str::stream() << "Cannot generate temporary "
                                              "collection namespace for applyOps "
                                              "create command: collection: "
-                                          << newCollName.ns()));
+                                          << newCollName));
                     }
                     const auto& tmpName = tmpNameResult.getValue();
                     // It is ok to log this because this doesn't happen very frequently.
@@ -223,6 +227,7 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                                    tmpName,
                                                    futureColl->uuid(),
                                                    /*dropTargetUUID*/ {},
+                                                   /*numRecords*/ 0U,
                                                    stayTemp);
                 }
 
@@ -230,9 +235,7 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                 // name, just rename it to 'newCollName'.
                 if (catalog.lookupCollectionByUUID(uuid)) {
                     uassert(40655,
-                            str::stream() << "Invalid name " << redact(newCollName.ns())
-                                          << " for UUID "
-                                          << uuid.toString(),
+                            str::stream() << "Invalid name " << newCollName << " for UUID " << uuid,
                             currentName.db() == newCollName.db());
                     Status status =
                         db->renameCollection(opCtx, currentName.ns(), newCollName.ns(), stayTemp);
@@ -243,6 +246,7 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                                    newCollName,
                                                    uuid,
                                                    /*dropTargetUUID*/ {},
+                                                   /*numRecords*/ 0U,
                                                    stayTemp);
 
                     wunit.commit();

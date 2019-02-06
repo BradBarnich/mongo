@@ -1,25 +1,27 @@
 // wiredtiger_util_test.cpp
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -42,6 +44,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/system_clock_source.h"
 
 namespace mongo {
 
@@ -55,6 +58,7 @@ public:
         ss << "create,";
         ss << extraStrings;
         string config = ss.str();
+        _fastClockSource = stdx::make_unique<SystemClockSource>();
         int ret = wiredtiger_open(dbpath.toString().c_str(), NULL, config.c_str(), &_conn);
         ASSERT_OK(wtRCToStatus(ret));
         ASSERT(_conn);
@@ -65,9 +69,13 @@ public:
     WT_CONNECTION* getConnection() const {
         return _conn;
     }
+    ClockSource* getClockSource() {
+        return _fastClockSource.get();
+    }
 
 private:
     WT_CONNECTION* _conn;
+    std::unique_ptr<ClockSource> _fastClockSource;
 };
 
 class WiredTigerUtilHarnessHelper {
@@ -75,7 +83,7 @@ public:
     WiredTigerUtilHarnessHelper(StringData extraStrings)
         : _dbpath("wt_test"),
           _connection(_dbpath.path(), extraStrings),
-          _sessionCache(_connection.getConnection()) {}
+          _sessionCache(_connection.getConnection(), _connection.getClockSource()) {}
 
 
     WiredTigerSessionCache* getSessionCache() {
@@ -184,7 +192,7 @@ TEST_F(WiredTigerUtilMetadataTest, GetApplicationMetadataDuplicateKeys) {
     StatusWith<BSONObj> result =
         WiredTigerUtil::getApplicationMetadata(getOperationContext(), getURI());
     ASSERT_NOT_OK(result.getStatus());
-    ASSERT_EQUALS(ErrorCodes::DuplicateKey, result.getStatus().code());
+    ASSERT_EQUALS(50998, result.getStatus().code());
 }
 
 TEST_F(WiredTigerUtilMetadataTest, GetApplicationMetadataTypes) {

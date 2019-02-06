@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,6 +38,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/run_aggregate.h"
 #include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
@@ -49,6 +52,7 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/log.h"
@@ -121,6 +125,13 @@ public:
             return true;
         }
 
+        bool allowsSpeculativeMajorityReads() const override {
+            // Find queries are only allowed to use speculative behavior if the 'allowsSpeculative'
+            // flag is passed. The find command will check for this flag internally and fail if
+            // necessary.
+            return true;
+        }
+
         NamespaceString ns() const override {
             // TODO get the ns from the parsed QueryRequest.
             return NamespaceString(CommandHelpers::parseNsFromCommand(_dbName, _request.body));
@@ -143,11 +154,11 @@ public:
         void explain(OperationContext* opCtx,
                      ExplainOptions::Verbosity verbosity,
                      rpc::ReplyBuilderInterface* result) override {
-            // Acquire locks and resolve possible UUID. The RAII object is optional, because in the
-            // case of a view, the locks need to be released.
+            // Acquire locks. The RAII object is optional, because in the case of a view, the locks
+            // need to be released.
             boost::optional<AutoGetCollectionForReadCommand> ctx;
             ctx.emplace(opCtx,
-                        CommandHelpers::parseNsOrUUID(_dbName, _request.body),
+                        CommandHelpers::parseNsCollectionRequired(_dbName, _request.body),
                         AutoGetCollection::ViewMode::kViewsPermitted);
             const auto nss = ctx->getNss();
 
@@ -218,6 +229,8 @@ public:
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) {
             // Although it is a command, a find command gets counted as a query.
             globalOpCounters.gotQuery();
+            ServerReadConcernMetrics::get(opCtx)->recordReadConcern(
+                repl::ReadConcernArgs::get(opCtx));
 
             // Parse the command BSON to a QueryRequest.
             const bool isExplain = false;
@@ -227,12 +240,24 @@ public:
                 _request.body,
                 isExplain));
 
+            // Only allow speculative majority for internal commands that specify the correct flag.
+            uassert(ErrorCodes::ReadConcernMajorityNotEnabled,
+                    "Majority read concern is not enabled.",
+                    !(repl::ReadConcernArgs::get(opCtx).isSpeculativeMajority() &&
+                      !qr->allowSpeculativeMajorityRead()));
+
             auto replCoord = repl::ReplicationCoordinator::get(opCtx);
             const auto txnParticipant = TransactionParticipant::get(opCtx);
             uassert(ErrorCodes::InvalidOptions,
                     "It is illegal to open a tailable cursor in a transaction",
                     !txnParticipant ||
                         !(txnParticipant->inMultiDocumentTransaction() && qr->isTailable()));
+
+            uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                    "The 'readOnce' option is not supported within a transaction.",
+                    !txnParticipant ||
+                        !txnParticipant->inActiveOrKilledMultiDocumentTransaction() ||
+                        !qr->isReadOnce());
 
             // Validate term before acquiring locks, if provided.
             if (auto term = qr->getReplicationTerm()) {
@@ -296,6 +321,12 @@ public:
 
             Collection* const collection = ctx->getCollection();
 
+            if (cq->getQueryRequest().isReadOnce()) {
+                // The readOnce option causes any storage-layer cursors created during plan
+                // execution to assume read data will not be needed again and need not be cached.
+                opCtx->recoveryUnit()->setReadOnce(true);
+            }
+
             // Get the execution plan for the query.
             auto exec = uassertStatusOK(getExecutorFind(opCtx, collection, nss, std::move(cq)));
 
@@ -315,8 +346,12 @@ public:
                 return;
             }
 
-            CurOpFailpointHelpers::waitWhileFailPointEnabled(
-                &waitInFindBeforeMakingBatch, opCtx, "waitInFindBeforeMakingBatch");
+            CurOpFailpointHelpers::waitWhileFailPointEnabled(&waitInFindBeforeMakingBatch,
+                                                             opCtx,
+                                                             "waitInFindBeforeMakingBatch",
+                                                             []() {},
+                                                             false,
+                                                             nss);
 
             const QueryRequest& originalQR = exec->getCanonicalQuery()->getQueryRequest();
 
@@ -341,11 +376,11 @@ public:
             }
 
             // Throw an assertion if query execution fails for any reason.
-            if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
+            if (PlanExecutor::FAILURE == state) {
                 firstBatch.abandon();
-                error() << "Plan executor error during find command: "
-                        << PlanExecutor::statestr(state)
-                        << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
+                LOG(1) << "Plan executor error during find command: "
+                       << PlanExecutor::statestr(state)
+                       << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
                 uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
                     "Executor error during find command"));
@@ -361,13 +396,15 @@ public:
             if (shouldSaveCursor(opCtx, collection, state, exec.get())) {
                 // Create a ClientCursor containing this plan executor and register it with the
                 // cursor manager.
-                ClientCursorPin pinnedCursor = collection->getCursorManager()->registerCursor(
-                    opCtx,
-                    {std::move(exec),
-                     nss,
-                     AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-                     repl::ReadConcernArgs::get(opCtx).getLevel(),
-                     _request.body});
+                ClientCursorPin pinnedCursor =
+                    CursorManager::getGlobalCursorManager()->registerCursor(
+                        opCtx,
+                        {std::move(exec),
+                         nss,
+                         AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                         repl::ReadConcernArgs::get(opCtx),
+                         _request.body,
+                         ClientCursorParams::LockPolicy::kLockExternally});
                 cursorId = pinnedCursor.getCursor()->cursorid();
 
                 invariant(!exec);

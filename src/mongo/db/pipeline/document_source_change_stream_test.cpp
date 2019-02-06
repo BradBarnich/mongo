@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -88,8 +90,8 @@ struct MockMongoInterface final : public StubMongoProcessInterface {
 
     MockMongoInterface(std::vector<FieldPath> fields) : _fields(std::move(fields)) {}
 
-    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(
-        OperationContext*, NamespaceStringOrUUID) const final {
+    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFieldsForHostedCollection(
+        OperationContext*, const NamespaceString&, UUID) const final {
         return {_fields, false};
     }
 
@@ -354,7 +356,7 @@ TEST_F(ChangeStreamStageTest, ShouldRejectBothStartAtOperationTimeAndResumeAfter
     auto expCtx = getExpCtx();
 
     // Need to put the collection in the UUID catalog so the resume token is valid.
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(expCtx->opCtx).onCreateCollection(expCtx->opCtx, &collection, testUuid());
 
     ASSERT_THROWS_CODE(
@@ -374,7 +376,7 @@ TEST_F(ChangeStreamStageTest, ShouldRejectBothStartAfterAndResumeAfterOptions) {
     auto expCtx = getExpCtx();
 
     // Need to put the collection in the UUID catalog so the resume token is valid.
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(expCtx->opCtx).onCreateCollection(expCtx->opCtx, &collection, testUuid());
 
     ASSERT_THROWS_CODE(
@@ -394,7 +396,7 @@ TEST_F(ChangeStreamStageTest, ShouldRejectBothStartAtOperationTimeAndStartAfterO
     auto expCtx = getExpCtx();
 
     // Need to put the collection in the UUID catalog so the resume token is valid.
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(expCtx->opCtx).onCreateCollection(expCtx->opCtx, &collection, testUuid());
 
     ASSERT_THROWS_CODE(
@@ -414,7 +416,7 @@ TEST_F(ChangeStreamStageTest, ShouldRejectResumeAfterWithResumeTokenMissingUUID)
     auto expCtx = getExpCtx();
 
     // Need to put the collection in the UUID catalog so the resume token is valid.
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(expCtx->opCtx).onCreateCollection(expCtx->opCtx, &collection, testUuid());
 
     ASSERT_THROWS_CODE(
@@ -1064,7 +1066,7 @@ TEST_F(ChangeStreamStageTest, DocumentKeyShouldIncludeShardKeyFromResumeToken) {
     const auto opTime = repl::OpTime(ts, term);
     const auto uuid = testUuid();
 
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(getExpCtx()->opCtx).onCreateCollection(getExpCtx()->opCtx, &collection, uuid);
 
     BSONObj o2 = BSON("_id" << 1 << "shardKey" << 2);
@@ -1089,16 +1091,18 @@ TEST_F(ChangeStreamStageTest, DocumentKeyShouldIncludeShardKeyFromResumeToken) {
     };
     // Although the chunk manager and sharding catalog are not aware of the shard key in this test,
     // the expectation is for the $changeStream stage to infer the shard key from the resume token.
-    checkTransformation(insertEntry,
-                        expectedInsert,
-                        {{"_id"}},  // Mock the 'collectDocumentKeyFields' response.
-                        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)));
+    checkTransformation(
+        insertEntry,
+        expectedInsert,
+        {{"_id"}},  // Mock the 'collectDocumentKeyFieldsForHostedCollection' response.
+        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)));
 
     // Verify the same behavior with resuming using 'startAfter'.
-    checkTransformation(insertEntry,
-                        expectedInsert,
-                        {{"_id"}},  // Mock the 'collectDocumentKeyFields' response.
-                        BSON("$changeStream" << BSON("startAfter" << resumeToken)));
+    checkTransformation(
+        insertEntry,
+        expectedInsert,
+        {{"_id"}},  // Mock the 'collectDocumentKeyFieldsForHostedCollection' response.
+        BSON("$changeStream" << BSON("startAfter" << resumeToken)));
 }
 
 TEST_F(ChangeStreamStageTest, DocumentKeyShouldNotIncludeShardKeyFieldsIfNotPresentInOplogEntry) {
@@ -1107,7 +1111,7 @@ TEST_F(ChangeStreamStageTest, DocumentKeyShouldNotIncludeShardKeyFieldsIfNotPres
     const auto opTime = repl::OpTime(ts, term);
     const auto uuid = testUuid();
 
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(getExpCtx()->opCtx).onCreateCollection(getExpCtx()->opCtx, &collection, uuid);
 
     BSONObj o2 = BSON("_id" << 1 << "shardKey" << 2);
@@ -1131,23 +1135,25 @@ TEST_F(ChangeStreamStageTest, DocumentKeyShouldNotIncludeShardKeyFieldsIfNotPres
         {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
         {DSChangeStream::kDocumentKeyField, D{{"_id", 2}}},
     };
-    checkTransformation(insertEntry,
-                        expectedInsert,
-                        {{"_id"}},  // Mock the 'collectDocumentKeyFields' response.
-                        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)));
+    checkTransformation(
+        insertEntry,
+        expectedInsert,
+        {{"_id"}},  // Mock the 'collectDocumentKeyFieldsForHostedCollection' response.
+        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)));
 
     // Verify the same behavior with resuming using 'startAfter'.
-    checkTransformation(insertEntry,
-                        expectedInsert,
-                        {{"_id"}},  // Mock the 'collectDocumentKeyFields' response.
-                        BSON("$changeStream" << BSON("startAfter" << resumeToken)));
+    checkTransformation(
+        insertEntry,
+        expectedInsert,
+        {{"_id"}},  // Mock the 'collectDocumentKeyFieldsForHostedCollection' response.
+        BSON("$changeStream" << BSON("startAfter" << resumeToken)));
 }
 
 TEST_F(ChangeStreamStageTest, ResumeAfterFailsIfResumeTokenDoesNotContainUUID) {
     const Timestamp ts(3, 45);
     const auto uuid = testUuid();
 
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(getExpCtx()->opCtx).onCreateCollection(getExpCtx()->opCtx, &collection, uuid);
 
     // Create a resume token from only the timestamp.
@@ -1200,7 +1206,7 @@ TEST_F(ChangeStreamStageTest, ResumeAfterWithTokenFromInvalidateShouldFail) {
     auto expCtx = getExpCtx();
 
     // Need to put the collection in the UUID catalog so the resume token is valid.
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(expCtx->opCtx).onCreateCollection(expCtx->opCtx, &collection, testUuid());
 
     const auto resumeTokenInvalidate =
@@ -1217,6 +1223,81 @@ TEST_F(ChangeStreamStageTest, ResumeAfterWithTokenFromInvalidateShouldFail) {
                            expCtx),
                        AssertionException,
                        ErrorCodes::InvalidResumeToken);
+}
+
+TEST_F(ChangeStreamStageTest, UsesResumeTokenAsSortKeyIfNeedsMergeIsFalse) {
+    auto insert = makeOplogEntry(OpTypeEnum::kInsert,           // op type
+                                 nss,                           // namespace
+                                 BSON("x" << 2 << "_id" << 1),  // o
+                                 testUuid(),                    // uuid
+                                 boost::none,                   // fromMigrate
+                                 boost::none);                  // o2
+
+    auto stages = makeStages(insert.toBSON(), kDefaultSpec);
+
+    getExpCtx()->mongoProcessInterface =
+        std::make_unique<MockMongoInterface>(std::vector<FieldPath>{{"x"}, {"_id"}});
+
+    getExpCtx()->mergeByPBRT = false;
+    getExpCtx()->needsMerge = false;
+
+    auto next = stages.back()->getNext();
+
+    auto expectedSortKey =
+        makeResumeToken(kDefaultTs, testUuid(), BSON("x" << 2 << "_id" << 1)).toBson();
+
+    ASSERT_TRUE(next.isAdvanced());
+    ASSERT_BSONOBJ_EQ(next.releaseDocument().getSortKeyMetaField(), expectedSortKey);
+}
+
+TEST_F(ChangeStreamStageTest, UsesResumeTokenAsSortKeyIfMergeByPBRTIsTrue) {
+    auto insert = makeOplogEntry(OpTypeEnum::kInsert,           // op type
+                                 nss,                           // namespace
+                                 BSON("x" << 2 << "_id" << 1),  // o
+                                 testUuid(),                    // uuid
+                                 boost::none,                   // fromMigrate
+                                 boost::none);                  // o2
+
+    auto stages = makeStages(insert.toBSON(), kDefaultSpec);
+
+    getExpCtx()->mongoProcessInterface =
+        std::make_unique<MockMongoInterface>(std::vector<FieldPath>{{"x"}, {"_id"}});
+
+    getExpCtx()->mergeByPBRT = true;
+    getExpCtx()->needsMerge = true;
+
+    auto next = stages.back()->getNext();
+
+    auto expectedSortKey =
+        makeResumeToken(kDefaultTs, testUuid(), BSON("x" << 2 << "_id" << 1)).toBson();
+
+    ASSERT_TRUE(next.isAdvanced());
+    ASSERT_BSONOBJ_EQ(next.releaseDocument().getSortKeyMetaField(), expectedSortKey);
+}
+
+TEST_F(ChangeStreamStageTest, UsesOldSortKeyFormatIfMergeByPBRTIsFalse) {
+    auto insert = makeOplogEntry(OpTypeEnum::kInsert,           // op type
+                                 nss,                           // namespace
+                                 BSON("x" << 2 << "_id" << 1),  // o
+                                 testUuid(),                    // uuid
+                                 boost::none,                   // fromMigrate
+                                 boost::none);                  // o2
+
+    auto stages = makeStages(insert.toBSON(), kDefaultSpec);
+
+    getExpCtx()->mongoProcessInterface =
+        std::make_unique<MockMongoInterface>(std::vector<FieldPath>{{"x"}, {"_id"}});
+
+    getExpCtx()->mergeByPBRT = false;
+    getExpCtx()->needsMerge = true;
+
+    auto next = stages.back()->getNext();
+
+    auto expectedSortKey =
+        BSON("" << kDefaultTs << "" << testUuid() << "" << BSON("x" << 2 << "_id" << 1));
+
+    ASSERT_TRUE(next.isAdvanced());
+    ASSERT_BSONOBJ_EQ(next.releaseDocument().getSortKeyMetaField(), expectedSortKey);
 }
 
 //
@@ -1537,7 +1618,7 @@ TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldIncludeShardKeyFromResumeToken)
     const auto opTime = repl::OpTime(ts, term);
     const auto uuid = testUuid();
 
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(getExpCtx()->opCtx).onCreateCollection(getExpCtx()->opCtx, &collection, uuid);
 
     BSONObj o2 = BSON("_id" << 1 << "shardKey" << 2);
@@ -1560,10 +1641,11 @@ TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldIncludeShardKeyFromResumeToken)
         {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
         {DSChangeStream::kDocumentKeyField, D{{"_id", 2}, {"shardKey", 3}}},
     };
-    checkTransformation(insertEntry,
-                        expectedInsert,
-                        {{"_id"}},  // Mock the 'collectDocumentKeyFields' response.
-                        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)));
+    checkTransformation(
+        insertEntry,
+        expectedInsert,
+        {{"_id"}},  // Mock the 'collectDocumentKeyFieldsForHostedCollection' response.
+        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)));
 }
 
 TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldNotIncludeShardKeyFieldsIfNotPresentInOplogEntry) {
@@ -1572,7 +1654,7 @@ TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldNotIncludeShardKeyFieldsIfNotPr
     const auto opTime = repl::OpTime(ts, term);
     const auto uuid = testUuid();
 
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(getExpCtx()->opCtx).onCreateCollection(getExpCtx()->opCtx, &collection, uuid);
 
     BSONObj o2 = BSON("_id" << 1 << "shardKey" << 2);
@@ -1596,10 +1678,11 @@ TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldNotIncludeShardKeyFieldsIfNotPr
         {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
         {DSChangeStream::kDocumentKeyField, D{{"_id", 2}}},
     };
-    checkTransformation(insertEntry,
-                        expectedInsert,
-                        {{"_id"}},  // Mock the 'collectDocumentKeyFields' response.
-                        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)));
+    checkTransformation(
+        insertEntry,
+        expectedInsert,
+        {{"_id"}},  // Mock the 'collectDocumentKeyFieldsForHostedCollection' response.
+        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)));
 }
 
 TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldNotIncludeShardKeyIfResumeTokenDoesntContainUUID) {
@@ -1608,7 +1691,7 @@ TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldNotIncludeShardKeyIfResumeToken
     const auto opTime = repl::OpTime(ts, term);
     const auto uuid = testUuid();
 
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(getExpCtx()->opCtx).onCreateCollection(getExpCtx()->opCtx, &collection, uuid);
 
     // Create a resume token from only the timestamp.
@@ -1633,17 +1716,18 @@ TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldNotIncludeShardKeyIfResumeToken
         {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
         {DSChangeStream::kDocumentKeyField, D{{"_id", 2}}},
     };
-    checkTransformation(insertEntry,
-                        expectedInsert,
-                        {{"_id"}},  // Mock the 'collectDocumentKeyFields' response.
-                        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)));
+    checkTransformation(
+        insertEntry,
+        expectedInsert,
+        {{"_id"}},  // Mock the 'collectDocumentKeyFieldsForHostedCollection' response.
+        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)));
 }
 
 TEST_F(ChangeStreamStageDBTest, ResumeAfterWithTokenFromInvalidateShouldFail) {
     auto expCtx = getExpCtx();
 
     // Need to put the collection in the UUID catalog so the resume token is valid.
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(expCtx->opCtx).onCreateCollection(expCtx->opCtx, &collection, testUuid());
 
     const auto resumeTokenInvalidate =
@@ -1664,7 +1748,7 @@ TEST_F(ChangeStreamStageDBTest, ResumeAfterWithTokenFromInvalidateShouldFail) {
 TEST_F(ChangeStreamStageDBTest, ResumeAfterWithTokenFromDropDatabase) {
     const auto uuid = testUuid();
 
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(getExpCtx()->opCtx).onCreateCollection(getExpCtx()->opCtx, &collection, uuid);
 
     // Create a resume token from only the timestamp, similar to a 'dropDatabase' entry.
@@ -1682,17 +1766,18 @@ TEST_F(ChangeStreamStageDBTest, ResumeAfterWithTokenFromDropDatabase) {
         {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
         {DSChangeStream::kDocumentKeyField, D{{"_id", 2}}},
     };
-    checkTransformation(insertEntry,
-                        expectedInsert,
-                        {{"_id"}},  // Mock the 'collectDocumentKeyFields' response.
-                        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)));
+    checkTransformation(
+        insertEntry,
+        expectedInsert,
+        {{"_id"}},  // Mock the 'collectDocumentKeyFieldsForHostedCollection' response.
+        BSON("$changeStream" << BSON("resumeAfter" << resumeToken)));
 }
 
 
 TEST_F(ChangeStreamStageDBTest, StartAfterSucceedsEvenIfResumeTokenDoesNotContainUUID) {
     const auto uuid = testUuid();
 
-    Collection collection(stdx::make_unique<CollectionMock>(nss));
+    CollectionMock collection(nss);
     UUIDCatalog::get(getExpCtx()->opCtx).onCreateCollection(getExpCtx()->opCtx, &collection, uuid);
 
     // Create a resume token from only the timestamp, similar to a 'dropDatabase' entry.
@@ -1709,10 +1794,11 @@ TEST_F(ChangeStreamStageDBTest, StartAfterSucceedsEvenIfResumeTokenDoesNotContai
         {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
         {DSChangeStream::kDocumentKeyField, D{{"_id", 2}}},
     };
-    checkTransformation(insertEntry,
-                        expectedInsert,
-                        {{"_id"}},  // Mock the 'collectDocumentKeyFields' response.
-                        BSON("$changeStream" << BSON("startAfter" << resumeToken)));
+    checkTransformation(
+        insertEntry,
+        expectedInsert,
+        {{"_id"}},  // Mock the 'collectDocumentKeyFieldsForHostedCollection' response.
+        BSON("$changeStream" << BSON("startAfter" << resumeToken)));
 }
 
 }  // namespace

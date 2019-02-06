@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,7 +35,6 @@
 
 #include <vector>
 
-#include "mongo/db/concurrency/replication_lock_manager_manipulator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/compiler.h"
@@ -68,10 +68,6 @@ public:
 
     void recordWaitTime(LockerId id, ResourceId resId, LockMode mode, uint64_t waitMicros) {
         _get(id).recordWaitTime(resId, mode, waitMicros);
-    }
-
-    void recordDeadlock(ResourceId resId, LockMode mode) {
-        _get(resId).recordDeadlock(resId, mode);
     }
 
     void report(SingleThreadedLockStats* outStats) const {
@@ -113,27 +109,17 @@ LockManager globalLockManager;
 const ResourceId resourceIdGlobal = ResourceId(RESOURCE_GLOBAL, ResourceId::SINGLETON_GLOBAL);
 
 // How often (in millis) to check for deadlock if a lock has not been granted for some time
-const Milliseconds DeadlockTimeout = Milliseconds(500);
+const Milliseconds MaxWaitTime = Milliseconds(500);
 
 // Dispenses unique LockerId identifiers
-AtomicUInt64 idCounter(0);
+AtomicWord<unsigned long long> idCounter(0);
 
 // Partitioned global lock statistics, so we don't hit the same bucket
 PartitionedInstanceWideLockStats globalStats;
 
-// When this is set, lock acquisitions for the global resource go into the TemporaryRequestQueue
-// stored in this decoration instead of letting the LockManager look up and put the requests into
-// the true global resource state.
-OperationContext::Decoration<LockManager::TemporaryResourceQueue*> globalResourceShadow =
-    OperationContext::declareDecoration<LockManager::TemporaryResourceQueue*>();
-
 }  // namespace
 
 bool LockerImpl::_shouldDelayUnlock(ResourceId resId, LockMode mode) const {
-    if (_prepareModeForLockYields) {
-        return false;
-    }
-
     switch (resId.getType()) {
         case RESOURCE_MUTEX:
             return false;
@@ -182,6 +168,14 @@ bool LockerImpl::isReadLocked() const {
     return isLockHeldForMode(resourceIdGlobal, MODE_IS);
 }
 
+bool LockerImpl::isRSTLExclusive() const {
+    return getLockMode(resourceIdReplicationStateTransitionLock) == MODE_X;
+}
+
+bool LockerImpl::isRSTLLocked() const {
+    return getLockMode(resourceIdReplicationStateTransitionLock) != MODE_NONE;
+}
+
 void LockerImpl::dump() const {
     StringBuilder ss;
     ss << "Locker id " << _id << " status: ";
@@ -222,10 +216,16 @@ LockResult CondVarLockGrantNotification::wait(Milliseconds timeout) {
 LockResult CondVarLockGrantNotification::wait(OperationContext* opCtx, Milliseconds timeout) {
     invariant(opCtx);
     stdx::unique_lock<stdx::mutex> lock(_mutex);
-    return opCtx->waitForConditionOrInterruptFor(
-               _cond, lock, timeout, [this] { return _result != LOCK_INVALID; })
-        ? _result
-        : LOCK_TIMEOUT;
+    if (opCtx->waitForConditionOrInterruptFor(
+            _cond, lock, timeout, [this] { return _result != LOCK_INVALID; })) {
+        // Because waitForConditionOrInterruptFor evaluates the predicate before checking for
+        // interrupt, it is possible that a killed operation can acquire a lock if the request is
+        // granted quickly. For that reason, it is necessary to check if the operation has been
+        // killed at least once before accepting the lock grant.
+        opCtx->checkForInterrupt();
+        return _result;
+    }
+    return LOCK_TIMEOUT;
 }
 
 void CondVarLockGrantNotification::notify(ResourceId resId, LockResult result) {
@@ -274,8 +274,7 @@ LockerImpl::~LockerImpl() {
     invariant(!inAWriteUnitOfWork());
     invariant(_numResourcesToUnlockAtEndUnitOfWork == 0);
     invariant(_requests.empty());
-    invariant(_modeForTicket == MODE_NONE,
-              str::stream() << "_modeForTicket found: " << _modeForTicket);
+    invariant(_modeForTicket == MODE_NONE);
 
     // Reset the locking statistics so the object can be reused
     _stats.reset();
@@ -336,7 +335,7 @@ LockResult LockerImpl::_acquireTicket(OperationContext* opCtx, LockMode mode, Da
         }
 
         // If the ticket wait is interrupted, restore the state of the client.
-        auto restoreStateOnErrorGuard = MakeGuard([&] { _clientState.store(kInactive); });
+        auto restoreStateOnErrorGuard = makeGuard([&] { _clientState.store(kInactive); });
 
         OperationContext* interruptible = _uninterruptibleLocksRequested ? nullptr : opCtx;
         if (deadline == Date_t::max()) {
@@ -344,7 +343,7 @@ LockResult LockerImpl::_acquireTicket(OperationContext* opCtx, LockMode mode, Da
         } else if (!holder->waitForTicketUntil(interruptible, deadline)) {
             return LOCK_TIMEOUT;
         }
-        restoreStateOnErrorGuard.Dismiss();
+        restoreStateOnErrorGuard.dismiss();
     }
     _clientState.store(reader ? kActiveReader : kActiveWriter);
     return LOCK_OK;
@@ -361,7 +360,7 @@ LockResult LockerImpl::_lockGlobalBegin(OperationContext* opCtx, LockMode mode, 
     }
 
     LockMode actualLockMode = mode;
-    if (opCtx && opCtx->getServiceContext()) {
+    if (opCtx) {
         auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
         if (storageEngine && !storageEngine->supportsDBLocking()) {
             actualLockMode = isSharedLockMode(mode) ? MODE_S : MODE_X;
@@ -371,15 +370,13 @@ LockResult LockerImpl::_lockGlobalBegin(OperationContext* opCtx, LockMode mode, 
     if (result == LOCK_OK)
         return LOCK_OK;
 
-    // Currently, deadlock detection does not happen inline with lock acquisition so the only
-    // unsuccessful result that the lock manager would return is LOCK_WAITING.
-    invariant(result == LOCK_WAITING, str::stream() << "Unexpected lock result: " << result);
+    invariant(result == LOCK_WAITING);
 
     return result;
 }
 
 LockResult LockerImpl::lockGlobalComplete(OperationContext* opCtx, Date_t deadline) {
-    return lockComplete(opCtx, resourceIdGlobal, getLockMode(resourceIdGlobal), deadline, false);
+    return lockComplete(opCtx, resourceIdGlobal, getLockMode(resourceIdGlobal), deadline);
 }
 
 bool LockerImpl::unlockGlobal() {
@@ -432,8 +429,44 @@ void LockerImpl::endWriteUnitOfWork() {
     }
 }
 
-LockResult LockerImpl::lock(
-    OperationContext* opCtx, ResourceId resId, LockMode mode, Date_t deadline, bool checkDeadlock) {
+bool LockerImpl::releaseWriteUnitOfWork(LockSnapshot* stateOut) {
+    // Only the global WUOW can be released.
+    invariant(_wuowNestingLevel == 1);
+    --_wuowNestingLevel;
+    invariant(!isGlobalLockedRecursively());
+
+    // All locks should be pending to unlock.
+    invariant(_requests.size() == _numResourcesToUnlockAtEndUnitOfWork);
+    for (auto it = _requests.begin(); it; it.next()) {
+        // No converted lock so we don't need to unlock more than once.
+        invariant(it->unlockPending == 1);
+    }
+    _numResourcesToUnlockAtEndUnitOfWork = 0;
+
+    return saveLockStateAndUnlock(stateOut);
+}
+
+void LockerImpl::restoreWriteUnitOfWork(OperationContext* opCtx,
+                                        const LockSnapshot& stateToRestore) {
+    if (stateToRestore.globalMode != MODE_NONE) {
+        restoreLockState(opCtx, stateToRestore);
+    }
+
+    invariant(_numResourcesToUnlockAtEndUnitOfWork == 0);
+    for (auto it = _requests.begin(); it; it.next()) {
+        invariant(_shouldDelayUnlock(it.key(), (it->mode)));
+        invariant(it->unlockPending == 0);
+        it->unlockPending++;
+    }
+    _numResourcesToUnlockAtEndUnitOfWork = static_cast<unsigned>(_requests.size());
+
+    beginWriteUnitOfWork();
+}
+
+LockResult LockerImpl::lock(OperationContext* opCtx,
+                            ResourceId resId,
+                            LockMode mode,
+                            Date_t deadline) {
 
     const LockResult result = lockBegin(opCtx, resId, mode);
 
@@ -441,11 +474,9 @@ LockResult LockerImpl::lock(
     if (result == LOCK_OK)
         return LOCK_OK;
 
-    // Currently, deadlock detection does not happen inline with lock acquisition so the only
-    // unsuccessful result that the lock manager would return is LOCK_WAITING.
     invariant(result == LOCK_WAITING);
 
-    return lockComplete(opCtx, resId, mode, deadline, checkDeadlock);
+    return lockComplete(opCtx, resId, mode, deadline);
 }
 
 void LockerImpl::downgrade(ResourceId resId, LockMode newMode) {
@@ -455,6 +486,11 @@ void LockerImpl::downgrade(ResourceId resId, LockMode newMode) {
 
 bool LockerImpl::unlock(ResourceId resId) {
     LockRequestsMap::Iterator it = _requests.find(resId);
+
+    // Don't attempt to unlock twice. This can happen when an interrupted global lock is destructed.
+    if (it.finished())
+        return false;
+
     if (inAWriteUnitOfWork() && _shouldDelayUnlock(it.key(), (it->mode))) {
         if (!it->unlockPending) {
             _numResourcesToUnlockAtEndUnitOfWork++;
@@ -467,10 +503,27 @@ bool LockerImpl::unlock(ResourceId resId) {
         return false;
     }
 
-    // Don't attempt to unlock twice. This can happen when an interrupted global lock is destructed.
-    if (it.finished())
-        return false;
     return _unlockImpl(&it);
+}
+
+bool LockerImpl::unlockRSTLforPrepare() {
+    auto rstlRequest = _requests.find(resourceIdReplicationStateTransitionLock);
+
+    // Don't attempt to unlock twice. This can happen when an interrupted global lock is destructed.
+    if (!rstlRequest)
+        return false;
+
+    // If the RSTL is 'unlockPending' and we are fully unlocking it, then we do not want to
+    // attempt to unlock the RSTL when the WUOW ends, since it will already be unlocked.
+    if (rstlRequest->unlockPending) {
+        _numResourcesToUnlockAtEndUnitOfWork--;
+    }
+
+    // Reset the recursiveCount to 1 so that we fully unlock the RSTL. Since it will be fully
+    // unlocked, any future unlocks will be noops anyways.
+    rstlRequest->recursiveCount = 1;
+
+    return _unlockImpl(&rstlRequest);
 }
 
 LockMode LockerImpl::getLockMode(ResourceId resId) const {
@@ -591,18 +644,9 @@ boost::optional<Locker::LockerInfo> LockerImpl::getLockerInfo(
     return std::move(lockerInfo);
 }
 
-bool LockerImpl::saveLockStateAndUnlockForPrepare(Locker::LockSnapshot* stateOut) {
-    invariant(!_prepareModeForLockYields);
-    _prepareModeForLockYields = true;
-    ON_BLOCK_EXIT([&] { _prepareModeForLockYields = false; });
-    return saveLockStateAndUnlock(stateOut);
-}
-
 bool LockerImpl::saveLockStateAndUnlock(Locker::LockSnapshot* stateOut) {
-    // We shouldn't be saving and restoring lock state from inside a WriteUnitOfWork, excepting the
-    // special behavior for saving/restoring locks for prepared transactions during repl state
-    // transitions.
-    invariant(!inAWriteUnitOfWork() || _prepareModeForLockYields);
+    // We shouldn't be saving and restoring lock state from inside a WriteUnitOfWork.
+    invariant(!inAWriteUnitOfWork());
 
     // Clear out whatever is in stateOut.
     stateOut->locks.clear();
@@ -619,10 +663,12 @@ bool LockerImpl::saveLockStateAndUnlock(Locker::LockSnapshot* stateOut) {
         return false;
     }
 
-    // If the global lock has been acquired more than once, we're probably somewhere in a
+    // If the global lock or RSTL has been acquired more than once, we're probably somewhere in a
     // DBDirectClient call.  It's not safe to release and reacquire locks -- the context using
     // the DBDirectClient is probably not prepared for lock release.
-    if (globalRequest->recursiveCount > 1) {
+    LockRequestsMap::Iterator rstlRequest =
+        _requests.find(resourceIdReplicationStateTransitionLock);
+    if (globalRequest->recursiveCount > 1 || (rstlRequest && rstlRequest->recursiveCount > 1)) {
         return false;
     }
 
@@ -639,7 +685,8 @@ bool LockerImpl::saveLockStateAndUnlock(Locker::LockSnapshot* stateOut) {
 
         // We should never have to save and restore metadata locks.
         invariant(RESOURCE_DATABASE == resId.getType() || RESOURCE_COLLECTION == resId.getType() ||
-                  (RESOURCE_GLOBAL == resId.getType() && isSharedLockMode(it->mode)));
+                  (RESOURCE_GLOBAL == resId.getType() && isSharedLockMode(it->mode)) ||
+                  (resourceIdReplicationStateTransitionLock == resId && it->mode == MODE_IX));
 
         // And, stuff the info into the out parameter.
         OneLock info;
@@ -659,15 +706,20 @@ bool LockerImpl::saveLockStateAndUnlock(Locker::LockSnapshot* stateOut) {
 }
 
 void LockerImpl::restoreLockState(OperationContext* opCtx, const Locker::LockSnapshot& state) {
-    // We shouldn't be saving and restoring lock state from inside a WriteUnitOfWork, excepting the
-    // special behavior for saving/restoring locks for prepared transactions during repl state
-    // transitions.
-    invariant(!inAWriteUnitOfWork() || _prepareModeForLockYields);
+    // We shouldn't be saving and restoring lock state from inside a WriteUnitOfWork.
+    invariant(!inAWriteUnitOfWork());
     invariant(_modeForTicket == MODE_NONE);
 
     std::vector<OneLock>::const_iterator it = state.locks.begin();
-    // If we locked the PBWM, it must be locked before the resourceIdGlobal resource.
+    // If we locked the PBWM, it must be locked before the resourceIdGlobal and
+    // resourceIdReplicationStateTransitionLock resources.
     if (it != state.locks.end() && it->resourceId == resourceIdParallelBatchWriterMode) {
+        invariant(LOCK_OK == lock(opCtx, it->resourceId, it->mode));
+        it++;
+    }
+
+    // If we locked the RSTL, it must be locked before the resourceIdGlobal resource.
+    if (it != state.locks.end() && it->resourceId == resourceIdReplicationStateTransitionLock) {
         invariant(LOCK_OK == lock(opCtx, it->resourceId, it->mode));
         it++;
     }
@@ -677,47 +729,6 @@ void LockerImpl::restoreLockState(OperationContext* opCtx, const Locker::LockSna
         invariant(LOCK_OK == lock(it->resourceId, it->mode));
     }
     invariant(_modeForTicket != MODE_NONE);
-}
-
-void LockerImpl::restoreLockStateWithTemporaryGlobalResource(
-    OperationContext* opCtx,
-    const LockSnapshot& state,
-    LockManager::TemporaryResourceQueue* tempGlobalResource) {
-    invariant(tempGlobalResource->getResourceId().getType() == ResourceType::RESOURCE_GLOBAL);
-    invariant(globalResourceShadow(opCtx) == nullptr);
-    invariant(!_prepareModeForLockYields);
-
-    globalResourceShadow(opCtx) = tempGlobalResource;
-    _prepareModeForLockYields = true;
-    ON_BLOCK_EXIT([&] {
-        globalResourceShadow(opCtx) = nullptr;
-        _prepareModeForLockYields = false;
-    });
-
-    restoreLockState(opCtx, state);
-}
-
-void LockerImpl::replaceGlobalLockStateWithTemporaryGlobalResource(
-    LockManager::TemporaryResourceQueue* tempGlobalResource) {
-    invariant(tempGlobalResource->getResourceId().getType() == ResourceType::RESOURCE_GLOBAL);
-
-    // Transfer the LockRequests from tempGlobalResource into the true resource for the global lock
-    // that is managed by the LockManager.  This also removes the existing MODE_X LockRequest from
-    // the granted list for the true global resource, but we still need to delete that LockRequest
-    // and remove it from this Locker's _requests list.
-    ReplicationLockManagerManipulator(&globalLockManager)
-        .replaceGlobalLocksWithLocksFromTemporaryGlobalResource(resourceIdGlobal,
-                                                                tempGlobalResource);
-
-    // Release the ticket that this Locker was holding for the global X lock.
-    invariant(_modeForTicket == MODE_X);
-    _releaseTicket();
-    _modeForTicket = MODE_NONE;
-
-    // Now fully delete the LockRequest.
-    auto it = _requests.find(resourceIdGlobal);
-    scoped_spinlock scopedLock(_lock);
-    it.remove();
 }
 
 LockResult LockerImpl::lockBegin(OperationContext* opCtx, ResourceId resId, LockMode mode) {
@@ -775,21 +786,8 @@ LockResult LockerImpl::lockBegin(OperationContext* opCtx, ResourceId resId, Lock
     // otherwise we might reset state if the lock becomes granted very fast.
     _notify.clear();
 
-    LockResult result{LockResult::LOCK_INVALID};
-    if (resId == resourceIdGlobal && opCtx && globalResourceShadow(opCtx)) {
-        // If we're trying to lock the global resource and we have a temporary global resource
-        // installed, use the temporary resource instead of letting the LockManager look up the
-        // true resource for the global lock.
-        invariant(isNew);
-        ReplicationLockManagerManipulator(&globalLockManager)
-            .lockUncontestedTemporaryGlobalResource(globalResourceShadow(opCtx), request, mode);
-        // lockUncontestedTemporaryGlobalResource can't fail.
-        result = LockResult::LOCK_OK;
-    } else {
-        // Normal case using the true global lock head.
-        result = isNew ? globalLockManager.lock(resId, request, mode)
-                       : globalLockManager.convert(resId, request, mode);
-    }
+    LockResult result = isNew ? globalLockManager.lock(resId, request, mode)
+                              : globalLockManager.convert(resId, request, mode);
 
     if (result == LOCK_WAITING) {
         globalStats.recordWait(_id, resId, mode);
@@ -809,14 +807,16 @@ LockResult LockerImpl::lockBegin(OperationContext* opCtx, ResourceId resId, Lock
     return result;
 }
 
-LockResult LockerImpl::lockComplete(
-    OperationContext* opCtx, ResourceId resId, LockMode mode, Date_t deadline, bool checkDeadlock) {
+LockResult LockerImpl::lockComplete(OperationContext* opCtx,
+                                    ResourceId resId,
+                                    LockMode mode,
+                                    Date_t deadline) {
 
     LockResult result;
     Milliseconds timeout;
     if (deadline == Date_t::max()) {
         timeout = Milliseconds::max();
-    } else if (deadline == Date_t::min()) {
+    } else if (deadline <= Date_t()) {
         timeout = Milliseconds(0);
     } else {
         timeout = deadline - Date_t::now();
@@ -829,14 +829,13 @@ LockResult LockerImpl::lockComplete(
         timeout = std::min(timeout, _maxLockTimeout.get());
     }
 
-    // Don't go sleeping without bound in order to be able to report long waits or wake up for
-    // deadlock detection.
-    Milliseconds waitTime = std::min(timeout, DeadlockTimeout);
+    // Don't go sleeping without bound in order to be able to report long waits.
+    Milliseconds waitTime = std::min(timeout, MaxWaitTime);
     const uint64_t startOfTotalWaitTime = curTimeMicros64();
     uint64_t startOfCurrentWaitTime = startOfTotalWaitTime;
 
     // Clean up the state on any failed lock attempts.
-    auto unlockOnErrorGuard = MakeGuard([&] {
+    auto unlockOnErrorGuard = makeGuard([&] {
         LockRequestsMap::Iterator it = _requests.find(resId);
         _unlockImpl(&it);
     });
@@ -864,19 +863,6 @@ LockResult LockerImpl::lockComplete(
         if (result == LOCK_OK)
             break;
 
-        if (checkDeadlock) {
-            DeadlockDetector wfg(globalLockManager, this);
-            if (wfg.check().hasCycle()) {
-                warning() << "Deadlock found: " << wfg.toString();
-
-                globalStats.recordDeadlock(resId, mode);
-                _stats.recordDeadlock(resId, mode);
-
-                result = LOCK_DEADLOCK;
-                break;
-            }
-        }
-
         // If infinite timeout was requested, just keep waiting
         if (timeout == Milliseconds::max()) {
             continue;
@@ -884,7 +870,7 @@ LockResult LockerImpl::lockComplete(
 
         const auto totalBlockTime = duration_cast<Milliseconds>(
             Microseconds(int64_t(curTimeMicros - startOfTotalWaitTime)));
-        waitTime = (totalBlockTime < timeout) ? std::min(timeout - totalBlockTime, DeadlockTimeout)
+        waitTime = (totalBlockTime < timeout) ? std::min(timeout - totalBlockTime, MaxWaitTime)
                                               : Milliseconds(0);
 
         if (waitTime == Milliseconds(0)) {
@@ -906,9 +892,18 @@ LockResult LockerImpl::lockComplete(
     // lock was still granted after all, but we don't try to take advantage of that and will return
     // a timeout.
     if (result == LOCK_OK) {
-        unlockOnErrorGuard.Dismiss();
+        unlockOnErrorGuard.dismiss();
     }
     return result;
+}
+
+LockResult LockerImpl::lockRSTLBegin(OperationContext* opCtx) {
+    invariant(!opCtx->lockState()->isLocked());
+    return lockBegin(opCtx, resourceIdReplicationStateTransitionLock, MODE_X);
+}
+
+LockResult LockerImpl::lockRSTLComplete(OperationContext* opCtx, Date_t deadline) {
+    return lockComplete(opCtx, resourceIdReplicationStateTransitionLock, MODE_X, deadline);
 }
 
 void LockerImpl::releaseTicket() {
@@ -997,5 +992,7 @@ const ResourceId resourceIdOplog = ResourceId(RESOURCE_COLLECTION, StringData("l
 const ResourceId resourceIdAdminDB = ResourceId(RESOURCE_DATABASE, StringData("admin"));
 const ResourceId resourceIdParallelBatchWriterMode =
     ResourceId(RESOURCE_GLOBAL, ResourceId::SINGLETON_PARALLEL_BATCH_WRITER_MODE);
+const ResourceId resourceIdReplicationStateTransitionLock =
+    ResourceId(RESOURCE_GLOBAL, ResourceId::SINGLETON_REPLICATION_STATE_TRANSITION_LOCK);
 
 }  // namespace mongo

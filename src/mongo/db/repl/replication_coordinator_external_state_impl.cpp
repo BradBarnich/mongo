@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -52,10 +53,10 @@
 #include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_sessions_local.h"
+#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/repair_database.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/isself.h"
@@ -78,9 +79,10 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/system_index.h"
+#include "mongo/db/transaction_coordinator_service.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -95,7 +97,6 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/service_entry_point.h"
-#include "mongo/transport/session.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
@@ -192,9 +193,9 @@ auto makeTaskExecutor(ServiceContext* service, const std::string& poolName) {
  * Schedules a task using the executor. This task is always run unless the task executor is shutting
  * down.
  */
-void scheduleWork(executor::TaskExecutor* executor,
-                  const executor::TaskExecutor::CallbackFn& work) {
-    auto cbh = executor->scheduleWork([work](const executor::TaskExecutor::CallbackArgs& args) {
+void scheduleWork(executor::TaskExecutor* executor, executor::TaskExecutor::CallbackFn work) {
+    auto cbh = executor->scheduleWork([work = std::move(work)](
+        const executor::TaskExecutor::CallbackArgs& args) {
         if (args.status == ErrorCodes::CallbackCanceled) {
             return;
         }
@@ -382,10 +383,15 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
     _oplogApplierTaskExecutor->shutdown();
 
     _oplogApplierTaskExecutor->join();
-    _taskExecutor->join();
     lk.unlock();
 
     // Perform additional shutdown steps below that must be done outside _threadMutex.
+
+    // We must wait for _taskExecutor outside of _threadMutex, since _taskExecutor is used to run
+    // the dropPendingCollectionReaper, which takes database locks. It is safe to access
+    // _taskExecutor outside of _threadMutex because once _startedThreads is set to true, the
+    // _taskExecutor pointer never changes.
+    _taskExecutor->join();
 
     if (_replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx).isNull() &&
         loadLastOpTime(opCtx) ==
@@ -475,7 +481,7 @@ void ReplicationCoordinatorExternalStateImpl::onDrainComplete(OperationContext* 
 }
 
 OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isW());
+    invariant(opCtx->lockState()->isRSTLExclusive());
 
     // Clear the appliedThrough marker so on startup we'll use the top of the oplog. This must be
     // done before we add anything to our oplog.
@@ -489,6 +495,9 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
         opCtx, lastAppliedOpTime.getTimestamp());
 
     writeConflictRetry(opCtx, "logging transition to primary to oplog", "local.oplog.rs", [&] {
+        // Writes to the oplog only require a Global intent lock.
+        Lock::GlobalLock globalLock(opCtx, MODE_IX);
+
         WriteUnitOfWork wuow(opCtx);
         opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(
             opCtx,
@@ -499,7 +508,14 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     const auto opTimeToReturn = fassert(28665, loadLastOpTime(opCtx));
 
     _shardingOnTransitionToPrimaryHook(opCtx);
+
+    // This has to go before reaquiring locks for prepared transactions, otherwise this can be
+    // blocked by prepared transactions.
     _dropAllTempCollections(opCtx);
+
+    MongoDSessionCatalog::onStepUp(opCtx);
+
+    notifyFreeMonitoringOnTransitionToPrimary();
 
     // It is only necessary to check the system indexes on the first transition to master.
     // On subsequent transitions to master the indexes will have already been created.
@@ -621,6 +637,10 @@ void ReplicationCoordinatorExternalStateImpl::setGlobalTimestamp(ServiceContext*
     setNewTimestamp(ctx, newTime);
 }
 
+Timestamp ReplicationCoordinatorExternalStateImpl::getGlobalTimestamp(ServiceContext* service) {
+    return LogicalClock::get(service)->getClusterTime().asTimestamp();
+}
+
 bool ReplicationCoordinatorExternalStateImpl::oplogExists(OperationContext* opCtx) {
     AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
     return oplog.getCollection() != nullptr;
@@ -685,10 +705,12 @@ void ReplicationCoordinatorExternalStateImpl::closeConnections() {
 void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         Balancer::get(_service)->interruptBalancer();
+        TransactionCoordinatorService::get(_service)->onStepDown();
     } else if (ShardingState::get(_service)->enabled()) {
         ChunkSplitter::get(_service).onStepDown();
         CatalogCacheLoader::get(_service).onStepDown();
         PeriodicBalancerConfigRefresher::get(_service).onStepDown();
+        TransactionCoordinatorService::get(_service)->onStepDown();
     }
 
     if (auto validator = LogicalTimeValidator::get(_service)) {
@@ -749,6 +771,8 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         if (auto validator = LogicalTimeValidator::get(_service)) {
             validator->enableKeyGenerator(opCtx, true);
         }
+
+        TransactionCoordinatorService::get(_service)->onStepUp(opCtx);
     } else if (ShardingState::get(opCtx)->enabled()) {
         Status status = ShardingStateRecovery::recover(opCtx);
 
@@ -773,15 +797,12 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         CatalogCacheLoader::get(_service).onStepUp();
         ChunkSplitter::get(_service).onStepUp();
         PeriodicBalancerConfigRefresher::get(_service).onStepUp(_service);
+        TransactionCoordinatorService::get(_service)->onStepUp(opCtx);
     } else {  // unsharded
         if (auto validator = LogicalTimeValidator::get(_service)) {
             validator->enableKeyGenerator(opCtx, true);
         }
     }
-
-    SessionCatalog::get(_service)->onStepUp(opCtx);
-
-    notifyFreeMonitoringOnTransitionToPrimary();
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {
@@ -806,6 +827,10 @@ void ReplicationCoordinatorExternalStateImpl::startProducerIfStopped() {
 }
 
 void ReplicationCoordinatorExternalStateImpl::_dropAllTempCollections(OperationContext* opCtx) {
+    // Acquire the GlobalLock in mode IS to conflict with database drops which acquire the
+    // GlobalLock in mode X.
+    Lock::GlobalLock lk(opCtx, MODE_IS);
+
     std::vector<std::string> dbNames;
     StorageEngine* storageEngine = _service->getStorageEngine();
     storageEngine->listDatabases(&dbNames);
@@ -816,12 +841,9 @@ void ReplicationCoordinatorExternalStateImpl::_dropAllTempCollections(OperationC
         if (*it == "local")
             continue;
         LOG(2) << "Removing temporary collections from " << *it;
-        Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, *it);
-        // Since we must be holding the global lock during this function, if listDatabases
-        // returned this dbname, we should be able to get a reference to it - it can't have
-        // been dropped.
-        invariant(db, str::stream() << "Unable to get reference to database " << *it);
-        db->clearTmpCollections(opCtx);
+        AutoGetDb autoDb(opCtx, *it, MODE_X);
+        invariant(autoDb.getDb(), str::stream() << "Unable to get reference to database " << *it);
+        autoDb.getDb()->clearTmpCollections(opCtx);
     }
 }
 

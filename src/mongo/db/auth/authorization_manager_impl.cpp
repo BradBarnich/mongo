@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -44,6 +46,7 @@
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/address_restriction.h"
+#include "mongo/db/auth/authorization_manager_impl_parameters_gen.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authorization_session_impl.h"
 #include "mongo/db/auth/authz_manager_external_state.h"
@@ -51,12 +54,11 @@
 #include "mongo/db/auth/privilege_parser.h"
 #include "mongo/db/auth/role_graph.h"
 #include "mongo/db/auth/sasl_options.h"
-#include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/user.h"
 #include "mongo/db/auth/user_document_parser.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/auth/user_name_hash.h"
+
 #include "mongo/db/global_settings.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/mongod_options.h"
@@ -72,10 +74,10 @@
 namespace mongo {
 namespace {
 
+using std::back_inserter;
 using std::begin;
 using std::end;
 using std::endl;
-using std::back_inserter;
 using std::string;
 using std::vector;
 
@@ -112,15 +114,9 @@ MONGO_INITIALIZER_GENERAL(SetupInternalSecurityUser,
     return exceptionToStatus();
 }
 
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(authorizationManagerCacheSize, int, 100);
-
-class PinnedUserSetParameter final : public ServerParameter {
+class PinnedUserSetParameter {
 public:
-    PinnedUserSetParameter()
-        : ServerParameter(
-              ServerParameterSet::getGlobal(), "authorizationManagerPinnedUsers", true, true) {}
-
-    void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name) override {
+    void append(OperationContext* opCtx, BSONObjBuilder& b, const std::string& name) const {
         BSONArrayBuilder sub(b.subarrayStart(name));
         for (const auto& username : _userNames) {
             BSONObjBuilder nameObj(sub.subobjStart());
@@ -129,7 +125,7 @@ public:
         }
     }
 
-    Status set(const BSONElement& newValueElement) override {
+    Status set(const BSONElement& newValueElement) {
         if (newValueElement.type() == String) {
             return setFromString(newValueElement.valuestrsafe());
         } else if (newValueElement.type() == Array) {
@@ -145,7 +141,7 @@ public:
             }
 
             stdx::unique_lock<stdx::mutex> lk(_mutex);
-            std::swap(_userNames, out);
+            _userNames = std::move(out);
             auto authzManager = _authzManager;
             if (!authzManager) {
                 return Status::OK();
@@ -161,7 +157,7 @@ public:
         }
     }
 
-    Status setFromString(const std::string& str) override {
+    Status setFromString(const std::string& str) {
         std::vector<std::string> strList;
         splitStringDelim(str, &strList, ',');
 
@@ -184,9 +180,10 @@ public:
             return Status::OK();
         }
 
-        stdx::unique_lock<stdx::mutex> lk(_mutex);
-        std::swap(out, _userNames);
-        lk.unlock();
+        {
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            _userNames = std::move(out);
+        }
 
         authzManager->invalidateUserCache(Client::getCurrent()->getOperationContext());
         return Status::OK();
@@ -214,13 +211,28 @@ private:
     }
     stdx::mutex _mutex;
     std::vector<UserName> _userNames;
-    AuthorizationManager* _authzManager;
+    AuthorizationManager* _authzManager = nullptr;
 } authorizationManagerPinnedUsers;
 
 const auto inUserManagementCommandsFlag = OperationContext::declareDecoration<bool>();
 
 }  // namespace
 
+int authorizationManagerCacheSize;
+
+void AuthorizationManagerPinnedUsersServerParameter::append(OperationContext* opCtx,
+                                                            BSONObjBuilder& out,
+                                                            const std::string& name) {
+    return authorizationManagerPinnedUsers.append(opCtx, out, name);
+}
+
+Status AuthorizationManagerPinnedUsersServerParameter::set(const BSONElement& newValue) {
+    return authorizationManagerPinnedUsers.set(newValue);
+}
+
+Status AuthorizationManagerPinnedUsersServerParameter::setFromString(const std::string& str) {
+    return authorizationManagerPinnedUsers.setFromString(str);
+}
 
 MONGO_REGISTER_SHIM(AuthorizationManager::create)()->std::unique_ptr<AuthorizationManager> {
     return std::make_unique<AuthorizationManagerImpl>();
@@ -417,22 +429,19 @@ bool AuthorizationManagerImpl::isAuthEnabled() const {
 }
 
 bool AuthorizationManagerImpl::hasAnyPrivilegeDocuments(OperationContext* opCtx) {
-    stdx::unique_lock<stdx::mutex> lk(_privilegeDocsExistMutex);
-    if (_privilegeDocsExist) {
+    if (_privilegeDocsExist.load()) {
         // If we know that a user exists, don't re-check.
         return true;
     }
 
-    lk.unlock();
     auto stateLk = _externalState->lock(opCtx);
     bool privDocsExist = _externalState->hasAnyPrivilegeDocuments(opCtx);
-    lk.lock();
 
     if (privDocsExist) {
-        _privilegeDocsExist = true;
+        _privilegeDocsExist.store(true);
     }
 
-    return _privilegeDocsExist;
+    return _privilegeDocsExist.load();
 }
 
 Status AuthorizationManagerImpl::_initializeUserFromPrivilegeDocument(User* user,
@@ -540,14 +549,6 @@ StatusWith<UserHandle> AuthorizationManagerImpl::acquireUser(OperationContext* o
     // Otherwise make sure we have the locks we need and check whether and wait on another
     // thread is fetching into the cache
     CacheGuard guard(opCtx, this);
-
-    auto pinnedIt =
-        std::find_if(_pinnedUsers.begin(), _pinnedUsers.end(), [&](const auto& userHandle) {
-            return (userHandle->getName() == userName);
-        });
-    if (pinnedIt != _pinnedUsers.end()) {
-        return *pinnedIt;
-    }
 
     while ((boost::none == (cachedUser = _userCache.get(userName))) &&
            guard.otherUpdateInFetchPhase()) {

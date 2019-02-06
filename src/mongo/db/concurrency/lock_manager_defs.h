@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,7 +36,6 @@
 #include "mongo/base/static_assert.h"
 #include "mongo/base/string_data.h"
 #include "mongo/config.h"
-#include "mongo/platform/hash_namespace.h"
 
 namespace mongo {
 
@@ -128,15 +128,6 @@ enum LockResult {
     LOCK_TIMEOUT,
 
     /**
-     * The lock request was not granted because it would result in a deadlock. No changes to
-     * the state of the Locker would be made if this value is returned (i.e., it will not be
-     * killed due to deadlock). It is up to the caller to decide how to recover from this
-     * return value - could be either release some locks and try again, or just bail with an
-     * error and have some upper code handle it.
-     */
-    LOCK_DEADLOCK,
-
-    /**
      * This is used as an initializer value. Should never be returned.
      */
     LOCK_INVALID
@@ -196,6 +187,7 @@ public:
     enum SingletonHashIds {
         SINGLETON_INVALID = 0,
         SINGLETON_PARALLEL_BATCH_WRITER_MODE,
+        SINGLETON_REPLICATION_STATE_TRANSITION_LOCK,
         SINGLETON_GLOBAL,
     };
 
@@ -226,6 +218,11 @@ public:
     }
 
     std::string toString() const;
+
+    template <typename H>
+    friend H AbslHashValue(H h, const ResourceId& resource) {
+        return H::combine(std::move(h), resource._fullHash);
+    }
 
 private:
     /**
@@ -271,6 +268,13 @@ extern const ResourceId resourceIdAdminDB;
 // lock.
 // TODO: Merge this with resourceIdGlobal
 extern const ResourceId resourceIdParallelBatchWriterMode;
+
+// Hardcoded resource id for the ReplicationStateTransitionLock (RSTL). We use the same resource
+// type as resourceIdGlobal. This will also ensure the waits are reported as global, which is
+// appropriate. This lock is acquired in mode X for any replication state transition and is acquired
+// by all other reads and writes in mode IX. This lock is acquired after the PBWM but before the
+// resourceIdGlobal.
+extern const ResourceId resourceIdReplicationStateTransitionLock;
 
 /**
  * Interface on which granted lock requests will be notified. See the contract for the notify
@@ -459,13 +463,3 @@ struct LockRequest {
 const char* lockRequestStatusName(LockRequest::Status status);
 
 }  // namespace mongo
-
-
-MONGO_HASH_NAMESPACE_START
-template <>
-struct hash<mongo::ResourceId> {
-    size_t operator()(const mongo::ResourceId& resource) const {
-        return resource;
-    }
-};
-MONGO_HASH_NAMESPACE_END

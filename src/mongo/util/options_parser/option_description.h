@@ -1,28 +1,31 @@
-/* Copyright 2013 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -99,6 +102,12 @@ public:
      * Make this option hidden so it does not appear in command line help
      */
     OptionDescription& hidden();
+
+    /*
+     * Mark this option as sensitive so that attempts by a client to read this setting
+     * will only return a placeholder value rather than the real setting.
+     */
+    OptionDescription& redact();
 
     /*
      * Add a default value for this option if it is not specified
@@ -214,6 +223,7 @@ public:
                                // (required by boost)
     std::string _description;  // Description of option printed in help output
     bool _isVisible;           // Visible in help output
+    bool _redact = false;      // Value should not be exposed to inquiry
     Value _default;            // Value if option is not specified
     Value _implicit;           // Value if option is specified with no argument
     bool _isComposing;         // Aggregate values from different sources instead of overriding
@@ -239,6 +249,50 @@ public:
 
     // Canonicalizer method.
     Canonicalize_t _canonicalize;
+};
+
+template <OptionType T>
+struct OptionTypeMap;
+
+template <>
+struct OptionTypeMap<StringVector> {
+    using type = std::vector<std::string>;
+};
+template <>
+struct OptionTypeMap<StringMap> {
+    using type = std::vector<std::string>;
+};
+template <>
+struct OptionTypeMap<Bool> {
+    using type = bool;
+};
+template <>
+struct OptionTypeMap<Double> {
+    using type = double;
+};
+template <>
+struct OptionTypeMap<Int> {
+    using type = int;
+};
+template <>
+struct OptionTypeMap<Long> {
+    using type = long;
+};
+template <>
+struct OptionTypeMap<String> {
+    using type = std::string;
+};
+template <>
+struct OptionTypeMap<UnsignedLongLong> {
+    using type = unsigned long long;
+};
+template <>
+struct OptionTypeMap<Unsigned> {
+    using type = unsigned;
+};
+template <>
+struct OptionTypeMap<Switch> {
+    using type = bool;
 };
 
 }  // namespace optionenvironment

@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -46,28 +48,26 @@ const Database::Decoration<DatabaseShardingState> DatabaseShardingState::get =
 
 DatabaseShardingState::DatabaseShardingState() = default;
 
-void DatabaseShardingState::enterCriticalSectionCatchUpPhase(OperationContext* opCtx) {
+void DatabaseShardingState::enterCriticalSectionCatchUpPhase(OperationContext* opCtx, DSSLock&) {
     invariant(opCtx->lockState()->isDbLockedForMode(get.owner(this)->name(), MODE_X));
     _critSec.enterCriticalSectionCatchUpPhase();
-    // TODO (SERVER-33313): call CursorManager::invalidateAll() on all collections in this database
-    // with 'fromMovePrimary=true' and a predicate to only invalidate the cursor if the opCtx on its
-    // PlanExecutor has a client dbVersion.
 }
 
-void DatabaseShardingState::enterCriticalSectionCommitPhase(OperationContext* opCtx) {
+void DatabaseShardingState::enterCriticalSectionCommitPhase(OperationContext* opCtx, DSSLock&) {
     invariant(opCtx->lockState()->isDbLockedForMode(get.owner(this)->name(), MODE_X));
     _critSec.enterCriticalSectionCommitPhase();
 }
 
 void DatabaseShardingState::exitCriticalSection(OperationContext* opCtx,
-                                                boost::optional<DatabaseVersion> newDbVersion) {
-    invariant(opCtx->lockState()->isDbLockedForMode(get.owner(this)->name(), MODE_X));
+                                                boost::optional<DatabaseVersion> newDbVersion,
+                                                DSSLock&) {
+    invariant(opCtx->lockState()->isDbLockedForMode(get.owner(this)->name(), MODE_IX));
     _critSec.exitCriticalSection();
     _dbVersion = newDbVersion;
 }
 
-boost::optional<DatabaseVersion> DatabaseShardingState::getDbVersion(
-    OperationContext* opCtx) const {
+boost::optional<DatabaseVersion> DatabaseShardingState::getDbVersion(OperationContext* opCtx,
+                                                                     DSSLock&) const {
     if (!opCtx->lockState()->isDbLockedForMode(get.owner(this)->name(), MODE_X)) {
         invariant(opCtx->lockState()->isDbLockedForMode(get.owner(this)->name(), MODE_IS));
     }
@@ -75,14 +75,15 @@ boost::optional<DatabaseVersion> DatabaseShardingState::getDbVersion(
 }
 
 void DatabaseShardingState::setDbVersion(OperationContext* opCtx,
-                                         boost::optional<DatabaseVersion> newDbVersion) {
+                                         boost::optional<DatabaseVersion> newDbVersion,
+                                         DSSLock&) {
     invariant(opCtx->lockState()->isDbLockedForMode(get.owner(this)->name(), MODE_X));
     log() << "setting this node's cached database version for " << get.owner(this)->name() << " to "
           << (newDbVersion ? newDbVersion->toBSON() : BSONObj());
     _dbVersion = newDbVersion;
 }
 
-void DatabaseShardingState::checkDbVersion(OperationContext* opCtx) const {
+void DatabaseShardingState::checkDbVersion(OperationContext* opCtx, DSSLock&) const {
     invariant(opCtx->lockState()->isLocked());
     const auto dbName = get.owner(this)->name();
 
@@ -110,12 +111,13 @@ void DatabaseShardingState::checkDbVersion(OperationContext* opCtx) const {
             databaseVersion::equal(*clientDbVersion, *_dbVersion));
 }
 
-MovePrimarySourceManager* DatabaseShardingState::getMovePrimarySourceManager() {
+MovePrimarySourceManager* DatabaseShardingState::getMovePrimarySourceManager(DSSLock&) {
     return _sourceMgr;
 }
 
 void DatabaseShardingState::setMovePrimarySourceManager(OperationContext* opCtx,
-                                                        MovePrimarySourceManager* sourceMgr) {
+                                                        MovePrimarySourceManager* sourceMgr,
+                                                        DSSLock&) {
     invariant(opCtx->lockState()->isDbLockedForMode(get.owner(this)->name(), MODE_X));
     invariant(sourceMgr);
     invariant(!_sourceMgr);
@@ -123,8 +125,8 @@ void DatabaseShardingState::setMovePrimarySourceManager(OperationContext* opCtx,
     _sourceMgr = sourceMgr;
 }
 
-void DatabaseShardingState::clearMovePrimarySourceManager(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isDbLockedForMode(get.owner(this)->name(), MODE_X));
+void DatabaseShardingState::clearMovePrimarySourceManager(OperationContext* opCtx, DSSLock&) {
+    invariant(opCtx->lockState()->isDbLockedForMode(get.owner(this)->name(), MODE_IX));
     _sourceMgr = nullptr;
 }
 

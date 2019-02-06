@@ -1,30 +1,33 @@
 // assert_util.cpp
 
-/*    Copyright 2009 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
@@ -58,11 +61,11 @@ AssertionCount assertionCount;
 AssertionCount::AssertionCount() : regular(0), warning(0), msg(0), user(0), rollovers(0) {}
 
 void AssertionCount::rollover() {
-    rollovers++;
-    regular = 0;
-    warning = 0;
-    msg = 0;
-    user = 0;
+    rollovers.fetchAndAdd(1);
+    regular.store(0);
+    warning.store(0);
+    msg.store(0);
+    user.store(0);
 }
 
 void AssertionCount::condrollover(int newvalue) {
@@ -71,7 +74,7 @@ void AssertionCount::condrollover(int newvalue) {
         rollover();
 }
 
-AtomicBool DBException::traceExceptions(false);
+AtomicWord<bool> DBException::traceExceptions(false);
 
 void DBException::traceIfNeeded(const DBException& e) {
     if (traceExceptions.load()) {
@@ -81,7 +84,7 @@ void DBException::traceIfNeeded(const DBException& e) {
 }
 
 NOINLINE_DECL void verifyFailed(const char* expr, const char* file, unsigned line) {
-    assertionCount.condrollover(++assertionCount.regular);
+    assertionCount.condrollover(assertionCount.regular.addAndFetch(1));
     error() << "Assertion failure " << expr << ' ' << file << ' ' << std::dec << line << std::endl;
     logContext();
     std::stringstream temp;
@@ -177,13 +180,13 @@ MONGO_COMPILER_NORETURN void fassertFailedWithStatusNoTraceWithLocation(int msgi
 }
 
 NOINLINE_DECL void uassertedWithLocation(const Status& status, const char* file, unsigned line) {
-    assertionCount.condrollover(++assertionCount.user);
+    assertionCount.condrollover(assertionCount.user.addAndFetch(1));
     LOG(1) << "User Assertion: " << redact(status) << ' ' << file << ' ' << std::dec << line;
     error_details::throwExceptionForStatus(status);
 }
 
 NOINLINE_DECL void msgassertedWithLocation(const Status& status, const char* file, unsigned line) {
-    assertionCount.condrollover(++assertionCount.msg);
+    assertionCount.condrollover(assertionCount.msg.addAndFetch(1));
     error() << "Assertion: " << redact(status) << ' ' << file << ' ' << std::dec << line;
     error_details::throwExceptionForStatus(status);
 }

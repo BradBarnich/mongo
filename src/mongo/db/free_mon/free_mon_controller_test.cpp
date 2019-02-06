@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
@@ -248,7 +250,7 @@ public:
             pf.promise.setFrom(doRegister(req));
         } else {
             auto swSchedule =
-                _threadPool->scheduleWork([ sharedPromise = pf.promise.share(), req, this ](
+                _threadPool->scheduleWork([ sharedPromise = std::move(pf.promise), req, this ](
                     const executor::TaskExecutor::CallbackArgs& cbArgs) mutable {
 
                     sharedPromise.setWith([&] { return doRegister(req); });
@@ -295,7 +297,7 @@ public:
             pf.promise.setFrom(doMetrics(req));
         } else {
             auto swSchedule =
-                _threadPool->scheduleWork([ sharedPromise = pf.promise.share(), req, this ](
+                _threadPool->scheduleWork([ sharedPromise = std::move(pf.promise), req, this ](
                     const executor::TaskExecutor::CallbackArgs& cbArgs) mutable {
 
                     sharedPromise.setWith([&] { return doMetrics(req); });
@@ -362,8 +364,8 @@ public:
 
 
 private:
-    AtomicInt32 _registers;
-    AtomicInt32 _metrics;
+    AtomicWord<int> _registers;
+    AtomicWord<int> _metrics;
 
     executor::ThreadPoolTaskExecutor* _threadPool;
 
@@ -938,7 +940,9 @@ TEST_F(FreeMonControllerTest, TestRegister) {
 
     controller.start(RegistrationType::DoNotRegister);
 
-    ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
+    auto optionalStatus = controller->registerServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
 
     controller->turnCrankForTest(Turner().registerCommand());
 
@@ -958,7 +962,9 @@ TEST_F(FreeMonControllerTest, TestRegisterTimeout) {
 
     controller.start(RegistrationType::DoNotRegister);
 
-    ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
+    auto optionalStatus = controller->registerServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
     controller->turnCrankForTest(Turner().registerCommand(2));
 
     ASSERT_TRUE(FreeMonStorage::read(_opCtx.get()).get().getState() == StorageStateEnum::pending);
@@ -975,7 +981,9 @@ TEST_F(FreeMonControllerTest, TestRegisterFail) {
 
     controller.start(RegistrationType::DoNotRegister);
 
-    ASSERT_NOT_OK(controller->registerServerCommand(duration_cast<Milliseconds>(Seconds(15))));
+    auto optionalStatus = controller->registerServerCommand(Seconds(15));
+    ASSERT(optionalStatus);
+    ASSERT_NOT_OK(*optionalStatus);
 
     ASSERT_TRUE(FreeMonStorage::read(_opCtx.get()).get().getState() == StorageStateEnum::disabled);
     ASSERT_EQ(controller.network->getRegistersCalls(), 1);
@@ -992,7 +1000,9 @@ TEST_F(FreeMonControllerTest, TestRegisterHalts) {
 
     controller.start(RegistrationType::DoNotRegister);
 
-    ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
+    auto optionalStatus = controller->registerServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
     controller->turnCrankForTest(Turner().registerCommand());
 
     ASSERT_TRUE(FreeMonStorage::read(_opCtx.get()).get().getState() == StorageStateEnum::disabled);
@@ -1092,7 +1102,9 @@ TEST_F(FreeMonControllerTest, TestMetricsWithDisabledStorageThenRegister) {
     controller.start(RegistrationType::RegisterAfterOnTransitionToPrimary);
     controller->turnCrankForTest(Turner().registerServer().metricsSend().collect(4));
 
-    ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
+    auto optionalStatus = controller->registerServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
 
     controller->turnCrankForTest(Turner().registerCommand().metricsSend().collect(2).metricsSend());
 
@@ -1113,19 +1125,25 @@ TEST_F(FreeMonControllerTest, TestMetricsWithDisabledStorageThenRegisterAndRereg
     controller.start(RegistrationType::RegisterAfterOnTransitionToPrimary);
     controller->turnCrankForTest(Turner().registerServer().metricsSend().collect(4));
 
-    ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
+    auto optionalStatus = controller->registerServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
 
     controller->turnCrankForTest(Turner().registerCommand().collect(2).metricsSend());
 
     ASSERT_TRUE(FreeMonStorage::read(_opCtx.get())->getState() == StorageStateEnum::enabled);
 
-    ASSERT_OK(controller->unregisterServerCommand(Milliseconds::min()));
+    optionalStatus = controller->unregisterServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
 
     controller->turnCrankForTest(Turner().unRegisterCommand().collect(3));
 
     ASSERT_TRUE(FreeMonStorage::read(_opCtx.get())->getState() == StorageStateEnum::disabled);
 
-    ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
+    optionalStatus = controller->registerServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
 
     controller->turnCrankForTest(Turner().registerCommand().metricsSend().collect(2).metricsSend());
 
@@ -1146,7 +1164,9 @@ TEST_F(FreeMonControllerTest, TestMetricsUnregisterCancelsRegister) {
 
     controller.start(RegistrationType::DoNotRegister);
 
-    ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
+    auto optionalStatus = controller->registerServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
     controller->turnCrankForTest(Turner().registerCommand(2));
 
     ASSERT_TRUE(FreeMonStorage::read(_opCtx.get()).get().getState() == StorageStateEnum::pending);
@@ -1154,7 +1174,9 @@ TEST_F(FreeMonControllerTest, TestMetricsUnregisterCancelsRegister) {
     ASSERT_GTE(controller.network->getRegistersCalls(), 2);
     ASSERT_GTE(controller.registerCollector->count(), 2UL);
 
-    ASSERT_OK(controller->unregisterServerCommand(Milliseconds::min()));
+    optionalStatus = controller->unregisterServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
 
     controller->turnCrankForTest(Turner().unRegisterCommand());
 
@@ -1239,7 +1261,9 @@ TEST_F(FreeMonControllerTest, TestPreRegistrationMetricBatching) {
 
     controller->turnCrankForTest(Turner().registerServer().collect(4));
 
-    ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
+    auto optionalStatus = controller->registerServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
 
     controller->turnCrankForTest(Turner().registerCommand().metricsSend());
 
@@ -1261,7 +1285,9 @@ TEST_F(FreeMonControllerTest, TestResendRegistration) {
 
     controller.start(RegistrationType::RegisterAfterOnTransitionToPrimary);
 
-    ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
+    auto optionalStatus = controller->registerServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
 
     controller->turnCrankForTest(Turner().registerServer().registerCommand().collect(2));
 
@@ -1443,7 +1469,9 @@ TEST_F(FreeMonControllerRSTest, StepdownDuringRegistration) {
 
     controller.start(RegistrationType::RegisterAfterOnTransitionToPrimary);
 
-    ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
+    auto optionalStatus = controller->registerServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
 
     controller->turnCrankForTest(Turner().registerServer() + 1);
 
@@ -1469,7 +1497,9 @@ TEST_F(FreeMonControllerRSTest, StepdownDuringMetricsSend) {
 
     controller.start(RegistrationType::RegisterAfterOnTransitionToPrimary);
 
-    ASSERT_OK(controller->registerServerCommand(Milliseconds::min()));
+    auto optionalStatus = controller->registerServerCommand(Milliseconds::min());
+    ASSERT(optionalStatus);
+    ASSERT_OK(*optionalStatus);
 
     controller->turnCrankForTest(Turner().registerServer().registerCommand().collect());
 

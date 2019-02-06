@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2012-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -42,6 +44,7 @@
 #include "mongo/db/commands/find_and_modify_common.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/delete.h"
 #include "mongo/db/exec/update.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/lasterror.h"
@@ -52,7 +55,6 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
-#include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/ops/write_ops_retryability.h"
 #include "mongo/db/query/explain.h"
@@ -64,7 +66,6 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/retryable_writes_stats.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
@@ -73,32 +74,6 @@
 
 namespace mongo {
 namespace {
-
-const UpdateStats* getUpdateStats(const PlanExecutor* exec) {
-    // The stats may refer to an update stage, or a projection stage wrapping an update stage.
-    if (StageType::STAGE_PROJECTION == exec->getRootStage()->stageType()) {
-        invariant(exec->getRootStage()->getChildren().size() == 1U);
-        invariant(StageType::STAGE_UPDATE == exec->getRootStage()->child()->stageType());
-        const SpecificStats* stats = exec->getRootStage()->child()->getSpecificStats();
-        return static_cast<const UpdateStats*>(stats);
-    } else {
-        invariant(StageType::STAGE_UPDATE == exec->getRootStage()->stageType());
-        return static_cast<const UpdateStats*>(exec->getRootStage()->getSpecificStats());
-    }
-}
-
-const DeleteStats* getDeleteStats(const PlanExecutor* exec) {
-    // The stats may refer to a delete stage, or a projection stage wrapping a delete stage.
-    if (StageType::STAGE_PROJECTION == exec->getRootStage()->stageType()) {
-        invariant(exec->getRootStage()->getChildren().size() == 1U);
-        invariant(StageType::STAGE_DELETE == exec->getRootStage()->child()->stageType());
-        const SpecificStats* stats = exec->getRootStage()->child()->getSpecificStats();
-        return static_cast<const DeleteStats*>(stats);
-    } else {
-        invariant(StageType::STAGE_DELETE == exec->getRootStage()->stageType());
-        return static_cast<const DeleteStats*>(exec->getRootStage()->getSpecificStats());
-    }
-}
 
 /**
  * If the operation succeeded, then Status::OK() is returned, possibly with a document value
@@ -117,7 +92,7 @@ boost::optional<BSONObj> advanceExecutor(OperationContext* opCtx,
         return {std::move(value)};
     }
 
-    if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
+    if (PlanExecutor::FAILURE == state) {
         error() << "Plan executor error during findAndModify: " << PlanExecutor::statestr(state)
                 << ", stats: " << redact(Explain::getWinningPlanStats(exec));
 
@@ -133,7 +108,6 @@ boost::optional<BSONObj> advanceExecutor(OperationContext* opCtx,
 void makeUpdateRequest(const OperationContext* opCtx,
                        const FindAndModifyRequest& args,
                        bool explain,
-                       UpdateLifecycleImpl* updateLifecycle,
                        UpdateRequest* requestOut) {
     requestOut->setQuery(args.getQuery());
     requestOut->setProj(args.getFields());
@@ -146,7 +120,6 @@ void makeUpdateRequest(const OperationContext* opCtx,
                                                      : UpdateRequest::RETURN_OLD);
     requestOut->setMulti(false);
     requestOut->setExplain(explain);
-    requestOut->setLifecycle(updateLifecycle);
 
     const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     requestOut->setYieldPolicy(readConcernArgs.getLevel() ==
@@ -179,9 +152,9 @@ void appendCommandResponse(const PlanExecutor* exec,
                            const boost::optional<BSONObj>& value,
                            BSONObjBuilder* result) {
     if (isRemove) {
-        find_and_modify::serializeRemove(getDeleteStats(exec)->docsDeleted, value, result);
+        find_and_modify::serializeRemove(DeleteStage::getNumDeleted(*exec), value, result);
     } else {
-        const auto updateStats = getUpdateStats(exec);
+        const auto updateStats = UpdateStage::getUpdateStats(exec);
 
         // Note we have to use the objInserted from the stats here, rather than 'value' because the
         // _id field could have been excluded by a projection.
@@ -293,9 +266,8 @@ public:
             Explain::explainStages(exec.get(), collection, verbosity, &bodyBuilder);
         } else {
             UpdateRequest request(nsString);
-            UpdateLifecycleImpl updateLifecycle(nsString);
             const bool isExplain = true;
-            makeUpdateRequest(opCtx, args, isExplain, &updateLifecycle, &request);
+            makeUpdateRequest(opCtx, args, isExplain, &request);
 
             ParsedUpdate parsedUpdate(opCtx, &request);
             uassertStatusOK(parsedUpdate.parseRequest());
@@ -353,8 +325,7 @@ public:
         const auto stmtId = 0;
         if (opCtx->getTxnNumber() && !inTransaction) {
             const auto txnParticipant = TransactionParticipant::get(opCtx);
-            if (auto entry =
-                    txnParticipant->checkStatementExecuted(opCtx, *opCtx->getTxnNumber(), stmtId)) {
+            if (auto entry = txnParticipant->checkStatementExecuted(stmtId)) {
                 RetryableWritesStats::get(opCtx)->incrementRetriedCommandsCount();
                 RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
                 parseOplogEntryForFindAndModify(opCtx, args, *entry, &result);
@@ -420,7 +391,7 @@ public:
                 opDebug->setPlanSummaryMetrics(summaryStats);
 
                 // Fill out OpDebug with the number of deleted docs.
-                opDebug->additiveMetrics.ndeleted = getDeleteStats(exec.get())->docsDeleted;
+                opDebug->additiveMetrics.ndeleted = DeleteStage::getNumDeleted(*exec);
 
                 if (curOp->shouldDBProfile()) {
                     BSONObjBuilder execStatsBob;
@@ -432,9 +403,8 @@ public:
                 appendCommandResponse(exec.get(), args.isRemove(), docFound, &result);
             } else {
                 UpdateRequest request(nsString);
-                UpdateLifecycleImpl updateLifecycle(nsString);
                 const bool isExplain = false;
-                makeUpdateRequest(opCtx, args, isExplain, &updateLifecycle, &request);
+                makeUpdateRequest(opCtx, args, isExplain, &request);
 
                 if (opCtx->getTxnNumber()) {
                     request.setStmtId(stmtId);
@@ -487,8 +457,8 @@ public:
                         CollectionOptions collectionOptions;
                         uassertStatusOK(collectionOptions.parse(
                             BSONObj(), CollectionOptions::ParseKind::parseForCommand));
-                        uassertStatusOK(Database::userCreateNS(
-                            opCtx, autoDb->getDb(), nsString.ns(), collectionOptions));
+                        auto db = autoDb->getDb();
+                        uassertStatusOK(db->userCreateNS(opCtx, nsString, collectionOptions));
                         wuow.commit();
 
                         collection = autoDb->getDb()->getCollection(opCtx, nsString);
@@ -515,7 +485,8 @@ public:
                 if (collection) {
                     collection->infoCache()->notifyOfQuery(opCtx, summaryStats.indexesUsed);
                 }
-                UpdateStage::recordUpdateStatsInOpDebug(getUpdateStats(exec.get()), opDebug);
+                UpdateStage::recordUpdateStatsInOpDebug(UpdateStage::getUpdateStats(exec.get()),
+                                                        opDebug);
                 opDebug->setPlanSummaryMetrics(summaryStats);
 
                 if (curOp->shouldDBProfile()) {

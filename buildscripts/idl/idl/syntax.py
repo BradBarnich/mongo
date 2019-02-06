@@ -1,16 +1,29 @@
-# Copyright (C) 2017 MongoDB Inc.
+# Copyright (C) 2018-present MongoDB, Inc.
 #
-# This program is free software: you can redistribute it and/or  modify
-# it under the terms of the GNU Affero General Public License, version 3,
-# as published by the Free Software Foundation.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# Server Side Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 #
 """
 IDL Parser Syntax classes.
@@ -54,6 +67,8 @@ class IDLSpec(object):
         self.symbols = SymbolTable()  # type: SymbolTable
         self.globals = None  # type: Optional[Global]
         self.imports = None  # type: Optional[Import]
+        self.server_parameters = []  # type: List[ServerParameter]
+        self.configs = []  # type: List[ConfigOption]
 
 
 def parse_array_type(name):
@@ -89,7 +104,7 @@ class SymbolTable(object):
     """
     IDL Symbol Table.
 
-    - Contains all information to resolve commands, enums, structs, and types.
+    - Contains all information to resolve commands, enums, structs, types, and server parameters.
     - Checks for duplicate names across the union of (commands, enums, types, structs)
     """
 
@@ -217,6 +232,8 @@ class Global(common.SourceLocation):
         """Construct a Global."""
         self.cpp_namespace = None  # type: unicode
         self.cpp_includes = []  # type: List[unicode]
+        self.configs = None  # type: ConfigGlobal
+
         super(Global, self).__init__(file_name, line, column)
 
 
@@ -278,10 +295,10 @@ class Validator(common.SourceLocation):
         """Construct a Validator."""
         # Don't lint gt/lt as bad attibute names.
         # pylint: disable=C0103
-        self.gt = None  # type: unicode
-        self.lt = None  # type: unicode
-        self.gte = None  # type: unicode
-        self.lte = None  # type: unicode
+        self.gt = None  # type: Expression
+        self.lt = None  # type: Expression
+        self.gte = None  # type: Expression
+        self.lte = None  # type: Expression
         self.callback = None  # type: unicode
 
         super(Validator, self).__init__(file_name, line, column)
@@ -441,3 +458,121 @@ class Enum(common.SourceLocation):
         self.cpp_namespace = None  # type: unicode
 
         super(Enum, self).__init__(file_name, line, column)
+
+
+class Condition(common.SourceLocation):
+    """Condition(s) for a ServerParameter or ConfigOption."""
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct a Condition."""
+        self.expr = None  # type: unicode
+        self.constexpr = None  # type: unicode
+        self.preprocessor = None  # type: unicode
+
+        super(Condition, self).__init__(file_name, line, column)
+
+
+class Expression(common.SourceLocation):
+    """Description of a valid C++ expression."""
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct an Expression."""
+
+        self.literal = None  # type: unicode
+        self.expr = None  # type: unicode
+        self.is_constexpr = True  # type: bool
+
+        super(Expression, self).__init__(file_name, line, column)
+
+
+class ServerParameterClass(common.SourceLocation):
+    """ServerParameter as C++ class specialization."""
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct a ServerParameterClass."""
+
+        self.name = None  # type: unicode
+        self.data = None  # type: unicode
+        self.override_ctor = False  # type: bool
+        self.override_set = False  # type: bool
+
+        super(ServerParameterClass, self).__init__(file_name, line, column)
+
+
+class ServerParameter(common.SourceLocation):
+    """IDL ServerParameter information."""
+
+    # pylint: disable=too-many-instance-attributes
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct a ServerParameter."""
+        self.name = None  # type: unicode
+        self.set_at = None  # type: List[unicode]
+        self.description = None  # type: unicode
+        self.cpp_vartype = None  # type: unicode
+        self.cpp_varname = None  # type: unicode
+        self.cpp_class = None  # type: ServerParameterClass
+        self.condition = None  # type: Condition
+        self.deprecated_name = []  # type: List[unicode]
+        self.redact = False  # type: bool
+        self.test_only = False  # type: bool
+        self.default = None  # type: Expression
+
+        # Only valid if cpp_varname is specified.
+        self.validator = None  # type: Validator
+        self.on_update = None  # type: unicode
+
+        super(ServerParameter, self).__init__(file_name, line, column)
+
+
+class ConfigGlobal(common.SourceLocation):
+    """Global values to apply to all ConfigOptions."""
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct a ConfigGlobal."""
+        self.section = None  # type: unicode
+        self.source = []  # type: List[unicode]
+        self.initializer_name = None  # type: unicode
+
+        super(ConfigGlobal, self).__init__(file_name, line, column)
+
+
+class ConfigOption(common.SourceLocation):
+    """Runtime configuration setting definition."""
+
+    # pylint: disable=too-many-instance-attributes
+
+    def __init__(self, file_name, line, column):
+        # type: (unicode, int, int) -> None
+        """Construct a ConfigOption."""
+        self.name = None  # type: unicode
+        self.deprecated_name = []  # type: List[unicode]
+        self.short_name = None  # type: unicode
+        self.single_name = None  # type: unicode
+        self.deprecated_short_name = []  # type: List[unicode]
+
+        self.description = None  # type: unicode
+        self.section = None  # type: unicode
+        self.arg_vartype = None  # type: unicode
+        self.cpp_vartype = None  # type: unicode
+        self.cpp_varname = None  # type: unicode
+        self.condition = None  # type: Condition
+
+        self.conflicts = []  # type: List[unicode]
+        self.requires = []  # type: List[unicode]
+        self.hidden = False  # type: bool
+        self.redact = False  # type: bool
+        self.default = None  # type: Expression
+        self.implicit = None  # type: Expression
+        self.source = []  # type: List[unicode]
+
+        self.duplicate_behavior = None  # type: unicode
+        self.positional = None  # type unicode
+        self.validator = None  # type: Validator
+
+        super(ConfigOption, self).__init__(file_name, line, column)

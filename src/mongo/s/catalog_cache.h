@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -205,6 +207,15 @@ public:
     void onStaleShardVersion(CachedCollectionRoutingInfo&&);
 
     /**
+     * Throws a StaleConfigException if this catalog cache does not have an entry for the given
+     * namespace, or if the entry for the given namespace does not have the same epoch as
+     * 'targetCollectionVersion'. Does not perform any refresh logic. Ignores everything except the
+     * epoch of 'targetCollectionVersion' when performing the check, but needs the entire target
+     * version to throw a StaleConfigException.
+     */
+    void checkEpochOrThrow(const NamespaceString& nss, ChunkVersion targetCollectionVersion) const;
+
+    /**
      * Non-blocking method, which indiscriminately causes the database entry for the specified
      * database to be refreshed the next time getDatabase is called.
      */
@@ -215,6 +226,12 @@ public:
      * namespace to be refreshed the next time getCollectionRoutingInfo is called.
      */
     void invalidateShardedCollection(const NamespaceString& nss);
+
+    /**
+     * Non-blocking method, which removes the entire specified collection from the cache (resulting
+     * in full refresh on subsequent access)
+     */
+    void purgeCollection(const NamespaceString& nss);
 
     /**
      * Non-blocking method, which removes the entire specified database (including its collections)
@@ -336,28 +353,28 @@ private:
     struct Stats {
         // Counts how many times threads hit stale config exception (which is what triggers metadata
         // refreshes)
-        AtomicInt64 countStaleConfigErrors{0};
+        AtomicWord<long long> countStaleConfigErrors{0};
 
         // Cumulative, always-increasing counter of how much time threads waiting for refresh
         // combined
-        AtomicInt64 totalRefreshWaitTimeMicros{0};
+        AtomicWord<long long> totalRefreshWaitTimeMicros{0};
 
         // Tracks how many incremental refreshes are waiting to complete currently
-        AtomicInt64 numActiveIncrementalRefreshes{0};
+        AtomicWord<long long> numActiveIncrementalRefreshes{0};
 
         // Cumulative, always-increasing counter of how many incremental refreshes have been kicked
         // off
-        AtomicInt64 countIncrementalRefreshesStarted{0};
+        AtomicWord<long long> countIncrementalRefreshesStarted{0};
 
         // Tracks how many full refreshes are waiting to complete currently
-        AtomicInt64 numActiveFullRefreshes{0};
+        AtomicWord<long long> numActiveFullRefreshes{0};
 
         // Cumulative, always-increasing counter of how many full refreshes have been kicked off
-        AtomicInt64 countFullRefreshesStarted{0};
+        AtomicWord<long long> countFullRefreshesStarted{0};
 
         // Cumulative, always-increasing counter of how many full or incremental refreshes failed
         // for whatever reason
-        AtomicInt64 countFailedRefreshes{0};
+        AtomicWord<long long> countFailedRefreshes{0};
 
         /**
          * Reports the accumulated statistics for serverStatus.

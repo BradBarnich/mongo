@@ -24,19 +24,11 @@ selector:
   # TODO SERVER-35217: Attempting to kill a session while multiple transactions have been started on
   # the server may lead to deadlock.
   - jstests/core/txns/kill_sessions_kills_transaction.js
-  # TODO (SERVER-35865): Unblacklist when we correctly write and apply 'commitTransaction' oplog
-  # entries.
-  - jstests/core/txns/commit_prepared_transaction.js
-  - jstests/core/txns/disallow_operations_on_prepared_transaction.js
-  - jstests/core/txns/ensure_active_txn_for_prepare_transaction.js
-  - jstests/core/txns/timestamped_reads_wait_for_prepare_oplog_visibility.js
-  - jstests/core/txns/prepare_requires_fcv42.js
 
 executor:
   archive:
     hooks:
       - CheckReplDBHash
-      - CheckReplDBHashInBackground
       - CheckReplOplogs
       - ValidateCollections
   config:
@@ -47,7 +39,7 @@ executor:
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're
   # validating the entire contents of the collection.
-  - class: CheckReplDBHashInBackground
+  # TODO SERVER-39321: Re-enable and archive the CheckReplDBHashInBackground hook.
   - class: CheckReplOplogs
   - class: CheckReplDBHash
   - class: ValidateCollections
@@ -58,13 +50,11 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
-        numInitialSyncAttempts: 1
+        # TODO SERVER-39321: Remove the following block now that SERVER-35377 has been resolved.
+        #
         # When running tests that intentionally trigger a DuplicateKeyError, we somehow end up
         # performing an atClusterTime read in the CheckReplDBHashInBackground hook based on an
         # operationTime that is greater than anything in the oplog. The periodic no-op writer must
         # be enabled to ensure that we eventually reach the clusterTime we are waiting for.
-        #
-        # TODO SERVER-35156: Remove the following line to disable the periodic no-op writer.
         writePeriodicNoops: 1
-        failpoint.skipShardingPartsOfPrepareTransaction: "{mode:'alwaysOn'}"
     num_nodes: 2

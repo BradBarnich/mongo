@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,7 +40,6 @@
 #include "mongo/base/string_data.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
-#include "mongo/platform/hash_namespace.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/transport/baton.h"
@@ -92,7 +93,7 @@ public:
      * the callback was canceled for any reason (including shutdown).  Otherwise, it should have
      * Status::OK().
      */
-    using CallbackFn = stdx::function<void(const CallbackArgs&)>;
+    using CallbackFn = unique_function<void(const CallbackArgs&)>;
 
     /**
      * Type of a callback from a request to run a command on a remote MongoDB node.
@@ -173,8 +174,7 @@ public:
      *
      * May be called by client threads or callbacks running in the executor.
      */
-    virtual StatusWith<CallbackHandle> onEvent(const EventHandle& event,
-                                               const CallbackFn& work) = 0;
+    virtual StatusWith<CallbackHandle> onEvent(const EventHandle& event, CallbackFn work) = 0;
 
     /**
      * Blocks the calling thread until "event" is signaled. Also returns if the event is never
@@ -207,7 +207,7 @@ public:
      * Contract: Implementations should guarantee that callback should be called *after* doing any
      * processing related to the callback.
      */
-    virtual StatusWith<CallbackHandle> scheduleWork(const CallbackFn& work) = 0;
+    virtual StatusWith<CallbackHandle> scheduleWork(CallbackFn work) = 0;
 
     /**
      * Schedules "work" to be run by the executor no sooner than "when".
@@ -222,7 +222,7 @@ public:
      * Contract: Implementations should guarantee that callback should be called *after* doing any
      * processing related to the callback.
      */
-    virtual StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, const CallbackFn& work) = 0;
+    virtual StatusWith<CallbackHandle> scheduleWorkAt(Date_t when, CallbackFn work) = 0;
 
     /**
      * Schedules "cb" to be run by the executor with the result of executing the remote command
@@ -239,7 +239,7 @@ public:
     virtual StatusWith<CallbackHandle> scheduleRemoteCommand(
         const RemoteCommandRequest& request,
         const RemoteCommandCallbackFn& cb,
-        const transport::BatonHandle& baton = nullptr) = 0;
+        const BatonHandle& baton = nullptr) = 0;
 
     /**
      * If the callback referenced by "cbHandle" hasn't already executed, marks it as
@@ -334,12 +334,13 @@ public:
         return isValid();
     }
 
-    std::size_t hash() const {
-        return std::hash<decltype(_callback)>()(_callback);
-    }
-
     bool isCanceled() const {
         return getCallback()->isCanceled();
+    }
+
+    template <typename H>
+    friend H AbslHashValue(H h, const CallbackHandle& handle) {
+        return H::combine(std::move(h), handle._callback);
     }
 
 private:
@@ -444,13 +445,3 @@ struct TaskExecutor::RemoteCommandCallbackArgs {
 
 }  // namespace executor
 }  // namespace mongo
-
-// Provide a specialization for hash<CallbackHandle> so it can easily be stored in unordered_set.
-MONGO_HASH_NAMESPACE_START
-template <>
-struct hash<::mongo::executor::TaskExecutor::CallbackHandle> {
-    size_t operator()(const ::mongo::executor::TaskExecutor::CallbackHandle& x) const {
-        return x.hash();
-    }
-};
-MONGO_HASH_NAMESPACE_END

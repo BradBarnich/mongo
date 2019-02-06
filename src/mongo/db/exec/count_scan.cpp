@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -73,25 +75,30 @@ const char* CountScan::kStageType = "COUNT_SCAN";
 // the CountScanParams rather than resolving them via the IndexDescriptor, since these may differ
 // from the descriptor's contents.
 CountScan::CountScan(OperationContext* opCtx, CountScanParams params, WorkingSet* workingSet)
-    : PlanStage(kStageType, opCtx),
+    : RequiresIndexStage(kStageType, opCtx, params.indexDescriptor),
       _workingSet(workingSet),
-      _iam(params.accessMethod),
+      _keyPattern(std::move(params.keyPattern)),
       _shouldDedup(params.isMultiKey),
-      _params(std::move(params)) {
-    _specificStats.indexName = _params.name;
-    _specificStats.keyPattern = _params.keyPattern;
-    _specificStats.isMultiKey = _params.isMultiKey;
-    _specificStats.multiKeyPaths = _params.multikeyPaths;
-    _specificStats.isUnique = _params.isUnique;
-    _specificStats.isSparse = _params.isSparse;
-    _specificStats.isPartial = _params.isPartial;
-    _specificStats.indexVersion = static_cast<int>(_params.version);
-    _specificStats.collation = _params.collation.getOwned();
+      _startKey(std::move(params.startKey)),
+      _startKeyInclusive(params.startKeyInclusive),
+      _endKey(std::move(params.endKey)),
+      _endKeyInclusive(params.endKeyInclusive) {
+    _specificStats.indexName = params.name;
+    _specificStats.keyPattern = _keyPattern;
+    _specificStats.isMultiKey = params.isMultiKey;
+    _specificStats.multiKeyPaths = params.multikeyPaths;
+    _specificStats.isUnique = params.indexDescriptor->unique();
+    _specificStats.isSparse = params.indexDescriptor->isSparse();
+    _specificStats.isPartial = params.indexDescriptor->isPartial();
+    _specificStats.indexVersion = static_cast<int>(params.indexDescriptor->version());
+    _specificStats.collation = params.indexDescriptor->infoObj()
+                                   .getObjectField(IndexDescriptor::kCollationFieldName)
+                                   .getOwned();
 
     // endKey must be after startKey in index order since we only do forward scans.
-    dassert(_params.startKey.woCompare(_params.endKey,
-                                       Ordering::make(_params.keyPattern),
-                                       /*compareFieldNames*/ false) <= 0);
+    dassert(_startKey.woCompare(_endKey,
+                                Ordering::make(_keyPattern),
+                                /*compareFieldNames*/ false) <= 0);
 }
 
 PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
@@ -106,10 +113,10 @@ PlanStage::StageState CountScan::doWork(WorkingSetID* out) {
 
         if (needInit) {
             // First call to work().  Perform cursor init.
-            _cursor = _iam->newCursor(getOpCtx());
-            _cursor->setEndPosition(_params.endKey, _params.endKeyInclusive);
+            _cursor = indexAccessMethod()->newCursor(getOpCtx());
+            _cursor->setEndPosition(_endKey, _endKeyInclusive);
 
-            entry = _cursor->seek(_params.startKey, _params.startKeyInclusive, kWantLoc);
+            entry = _cursor->seek(_startKey, _startKeyInclusive, kWantLoc);
         } else {
             entry = _cursor->next(kWantLoc);
         }
@@ -145,12 +152,12 @@ bool CountScan::isEOF() {
     return _commonStats.isEOF;
 }
 
-void CountScan::doSaveState() {
+void CountScan::doSaveStateRequiresIndex() {
     if (_cursor)
         _cursor->save();
 }
 
-void CountScan::doRestoreState() {
+void CountScan::doRestoreStateRequiresIndex() {
     if (_cursor)
         _cursor->restore();
 }
@@ -171,10 +178,10 @@ unique_ptr<PlanStageStats> CountScan::getStats() {
     unique_ptr<CountScanStats> countStats = make_unique<CountScanStats>(_specificStats);
     countStats->keyPattern = _specificStats.keyPattern.getOwned();
 
-    countStats->startKey = replaceBSONFieldNames(_params.startKey, countStats->keyPattern);
-    countStats->startKeyInclusive = _params.startKeyInclusive;
-    countStats->endKey = replaceBSONFieldNames(_params.endKey, countStats->keyPattern);
-    countStats->endKeyInclusive = _params.endKeyInclusive;
+    countStats->startKey = replaceBSONFieldNames(_startKey, countStats->keyPattern);
+    countStats->startKeyInclusive = _startKeyInclusive;
+    countStats->endKey = replaceBSONFieldNames(_endKey, countStats->keyPattern);
+    countStats->endKeyInclusive = _endKeyInclusive;
 
     ret->specific = std::move(countStats);
 

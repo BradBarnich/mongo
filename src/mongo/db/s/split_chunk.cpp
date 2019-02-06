@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -94,16 +96,17 @@ bool checkIfSingleDoc(OperationContext* opCtx,
  */
 bool checkMetadataForSuccessfulSplitChunk(OperationContext* opCtx,
                                           const NamespaceString& nss,
+                                          const OID& epoch,
                                           const ChunkRange& chunkRange,
                                           const std::vector<BSONObj>& splitKeys) {
     const auto metadataAfterSplit = [&] {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
+        return CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
     }();
 
     uassert(ErrorCodes::StaleEpoch,
-            str::stream() << "Collection " << nss.ns() << " became unsharded",
-            metadataAfterSplit->isSharded());
+            str::stream() << "Collection " << nss.ns() << " changed since split start",
+            metadataAfterSplit->getCollVersion().epoch() == epoch);
 
     auto newChunkBounds(splitKeys);
     auto startKey = chunkRange.getMin();
@@ -133,13 +136,12 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
                                                    const std::string& shardName,
                                                    const OID& expectedCollectionEpoch) {
     //
-    // Lock the collection's metadata and get highest version for the current shard
     // TODO(SERVER-25086): Remove distLock acquisition from split chunk
     //
     const std::string whyMessage(
         str::stream() << "splitting chunk " << chunkRange.toString() << " in " << nss.toString());
     auto scopedDistLock = Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
-        opCtx, nss.ns(), whyMessage, DistLockManager::kSingleLockAttemptTimeout);
+        opCtx, nss.ns(), whyMessage, DistLockManager::kDefaultLockTimeout);
     if (!scopedDistLock.isOK()) {
         return scopedDistLock.getStatus().withContext(
             str::stream() << "could not acquire collection lock for " << nss.toString()
@@ -206,7 +208,8 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
     if (!commandStatus.isOK() || !writeConcernStatus.isOK()) {
         forceShardFilteringMetadataRefresh(opCtx, nss);
 
-        if (checkMetadataForSuccessfulSplitChunk(opCtx, nss, chunkRange, splitKeys)) {
+        if (checkMetadataForSuccessfulSplitChunk(
+                opCtx, nss, expectedCollectionEpoch, chunkRange, splitKeys)) {
             // Split was committed.
         } else if (!commandStatus.isOK()) {
             return commandStatus;
@@ -226,7 +229,7 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
 
     // Allow multiKey based on the invariant that shard keys must be single-valued. Therefore,
     // any multi-key index prefixed by shard key cannot be multikey over the shard key fields.
-    IndexDescriptor* idx =
+    const IndexDescriptor* idx =
         collection->getIndexCatalog()->findShardKeyPrefixedIndex(opCtx, keyPatternObj, false);
     if (!idx) {
         return boost::optional<ChunkRange>(boost::none);

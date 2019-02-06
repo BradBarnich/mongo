@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 /**
@@ -46,7 +48,6 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/service_context.h"
@@ -127,11 +128,10 @@ public:
         WorkingSet ws;
 
         CollectionScanParams params;
-        params.collection = collection;
         params.direction = CollectionScanParams::FORWARD;
         params.tailable = false;
 
-        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, params, &ws, NULL));
+        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, collection, params, &ws, NULL));
         while (!scan->isEOF()) {
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state = scan->work(&id);
@@ -149,11 +149,10 @@ public:
         WorkingSet ws;
 
         CollectionScanParams params;
-        params.collection = collection;
         params.direction = direction;
         params.tailable = false;
 
-        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, params, &ws, NULL));
+        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, collection, params, &ws, NULL));
         while (!scan->isEOF()) {
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state = scan->work(&id);
@@ -201,13 +200,12 @@ public:
             const CollatorInterface* collator = nullptr;
             UpdateDriver driver(new ExpressionContext(&_opCtx, collator));
             Collection* collection = ctx.getCollection();
+            ASSERT(collection);
 
             // Collection should be empty.
             ASSERT_EQUALS(0U, count(BSONObj()));
 
             UpdateRequest request(nss);
-            UpdateLifecycleImpl updateLifecycle(nss);
-            request.setLifecycle(&updateLifecycle);
 
             // Update is the upsert {_id: 0, x: 1}, {$set: {y: 2}}.
             BSONObj query = fromjson("{_id: 0, x: 1}");
@@ -273,14 +271,13 @@ public:
             UpdateDriver driver(new ExpressionContext(&_opCtx, collator));
             Database* db = ctx.db();
             Collection* coll = db->getCollection(&_opCtx, nss);
+            ASSERT(coll);
 
             // Get the RecordIds that would be returned by an in-order scan.
             vector<RecordId> recordIds;
             getRecordIds(coll, CollectionScanParams::FORWARD, &recordIds);
 
             UpdateRequest request(nss);
-            UpdateLifecycleImpl updateLifecycle(nss);
-            request.setLifecycle(&updateLifecycle);
 
             // Update is a multi-update that sets 'bar' to 3 in every document
             // where foo is less than 5.
@@ -298,7 +295,6 @@ public:
 
             // Configure the scan.
             CollectionScanParams collScanParams;
-            collScanParams.collection = coll;
             collScanParams.direction = CollectionScanParams::FORWARD;
             collScanParams.tailable = false;
 
@@ -308,7 +304,8 @@ public:
             updateParams.canonicalQuery = cq.get();
 
             auto ws = make_unique<WorkingSet>();
-            auto cs = make_unique<CollectionScan>(&_opCtx, collScanParams, ws.get(), cq->root());
+            auto cs =
+                make_unique<CollectionScan>(&_opCtx, coll, collScanParams, ws.get(), cq->root());
 
             auto updateStage =
                 make_unique<UpdateStage>(&_opCtx, updateParams, ws.get(), coll, cs.release());
@@ -325,11 +322,11 @@ public:
             }
 
             // Remove recordIds[targetDocIndex];
-            updateStage->saveState();
+            static_cast<PlanStage*>(updateStage.get())->saveState();
             BSONObj targetDoc = coll->docFor(&_opCtx, recordIds[targetDocIndex]).value();
             ASSERT(!targetDoc.isEmpty());
             remove(targetDoc);
-            updateStage->restoreState();
+            static_cast<PlanStage*>(updateStage.get())->restoreState();
 
             // Do the remaining updates.
             while (!updateStage->isEOF()) {
@@ -382,7 +379,7 @@ public:
         dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         OpDebug* opDebug = &CurOp::get(_opCtx)->debug();
         Collection* coll = ctx.getCollection();
-        UpdateLifecycleImpl updateLifecycle(nss);
+        ASSERT(coll);
         UpdateRequest request(nss);
         const CollatorInterface* collator = nullptr;
         UpdateDriver driver(new ExpressionContext(&_opCtx, collator));
@@ -401,7 +398,6 @@ public:
         request.setSort(BSONObj());
         request.setMulti(false);
         request.setReturnDocs(UpdateRequest::RETURN_OLD);
-        request.setLifecycle(&updateLifecycle);
 
         const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
 
@@ -473,7 +469,7 @@ public:
         dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         OpDebug* opDebug = &CurOp::get(_opCtx)->debug();
         Collection* coll = ctx.getCollection();
-        UpdateLifecycleImpl updateLifecycle(nss);
+        ASSERT(coll);
         UpdateRequest request(nss);
         const CollatorInterface* collator = nullptr;
         UpdateDriver driver(new ExpressionContext(&_opCtx, collator));
@@ -492,7 +488,6 @@ public:
         request.setSort(BSONObj());
         request.setMulti(false);
         request.setReturnDocs(UpdateRequest::RETURN_NEW);
-        request.setLifecycle(&updateLifecycle);
 
         const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
 

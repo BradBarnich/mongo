@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -1230,8 +1230,18 @@ __log_newfile(WT_SESSION_IMPL *session, bool conn_open, bool *created)
 	WT_ASSERT(session, F_ISSET(session, WT_SESSION_LOCKED_SLOT));
 	for (yield_cnt = 0; log->log_close_fh != NULL;) {
 		WT_STAT_CONN_INCR(session, log_close_yields);
+		/*
+		 * Processing slots will conditionally signal the file close
+		 * server thread. But if we've tried a while, signal the
+		 * thread directly here.
+		 */
 		__wt_log_wrlsn(session, NULL);
-		if (++yield_cnt > 10000)
+		if (++yield_cnt % WT_THOUSAND == 0) {
+			__wt_spin_unlock(session, &log->log_slot_lock);
+			__wt_cond_signal(session, conn->log_file_cond);
+			__wt_spin_lock(session, &log->log_slot_lock);
+		}
+		if (++yield_cnt > WT_THOUSAND * 10)
 			return (__wt_set_return(session, EBUSY));
 		__wt_yield();
 	}
@@ -1338,6 +1348,7 @@ __log_newfile(WT_SESSION_IMPL *session, bool conn_open, bool *created)
 		log->write_lsn = end_lsn;
 		log->write_start_lsn = end_lsn;
 	}
+	log->dirty_lsn = log->alloc_lsn;
 	if (created != NULL)
 		*created = create_log;
 	return (0);
@@ -2043,7 +2054,7 @@ __wt_log_release(WT_SESSION_IMPL *session, WT_LOGSLOT *slot, bool *freep)
 	 * responsible for freeing the slot in that case.  Otherwise the
 	 * worker thread will free it.
 	 */
-	if (!F_ISSET(slot, WT_SLOT_FLUSH | WT_SLOT_SYNC | WT_SLOT_SYNC_DIR)) {
+	if (!F_ISSET(slot, WT_SLOT_FLUSH | WT_SLOT_SYNC_FLAGS)) {
 		if (freep != NULL)
 			*freep = 0;
 		slot->slot_state = WT_LOG_SLOT_WRITTEN;
@@ -2079,6 +2090,16 @@ __wt_log_release(WT_SESSION_IMPL *session, WT_LOGSLOT *slot, bool *freep)
 	 */
 	if (F_ISSET(slot, WT_SLOT_CLOSEFH))
 		__wt_cond_signal(session, conn->log_file_cond);
+
+	if (F_ISSET(slot, WT_SLOT_SYNC_DIRTY) && !F_ISSET(slot, WT_SLOT_SYNC) &&
+	    (ret = __wt_fsync(session, log->log_fh, false)) != 0) {
+		/*
+		 * Ignore ENOTSUP, but don't try again.
+		 */
+		if (ret != ENOTSUP)
+			WT_ERR(ret);
+		conn->log_dirty_max = 0;
+	}
 
 	/*
 	 * Try to consolidate calls to fsync to wait less.  Acquire a spin lock
@@ -2501,6 +2522,8 @@ advance:
 			 * the first pass through recovery.  In the second pass
 			 * where we truncate the log, this is where it should
 			 * end.
+			 * Continue processing where possible, so remember any
+			 * error returns, but don't skip to the error handler.
 			 */
 			if (log != NULL)
 				log->trunc_lsn = rd_lsn;
@@ -2537,7 +2560,7 @@ advance:
 				 * must be salvaged.
 				 */
 				need_salvage = true;
-				WT_ERR(__log_salvage_message(session,
+				WT_TRET(__log_salvage_message(session,
 				    log_fh->name, ", bad checksum",
 				    rd_lsn.l.offset));
 			} else {
@@ -2546,11 +2569,11 @@ advance:
 				 * that the header is corrupt.  Make a sanity
 				 * check of the log record header.
 				 */
-				WT_ERR(__log_record_verify(session, log_fh,
+				WT_TRET(__log_record_verify(session, log_fh,
 				    rd_lsn.l.offset, logrec, &corrupt));
 				if (corrupt) {
 					need_salvage = true;
-					WT_ERR(__log_salvage_message(session,
+					WT_TRET(__log_salvage_message(session,
 					    log_fh->name, "", rd_lsn.l.offset));
 				}
 			}
@@ -2603,7 +2626,8 @@ advance:
 		__wt_verbose(session, WT_VERB_LOG,
 		    "End of recovery truncate end of log %" PRIu32 "/%" PRIu32,
 		    rd_lsn.l.file, rd_lsn.l.offset);
-		WT_ERR(__log_truncate(session, &rd_lsn, false, false));
+		/* Preserve prior error and fall through to error handling. */
+		WT_TRET(__log_truncate(session, &rd_lsn, false, false));
 	}
 
 err:	WT_STAT_CONN_INCR(session, log_scans);
@@ -2623,7 +2647,7 @@ err:	WT_STAT_CONN_INCR(session, log_scans);
 	 * an error recovery is likely going to fail.  Try to provide
 	 * a helpful failure message.
 	 */
-	if (ret != 0 && firstrecord) {
+	if (ret != 0 && firstrecord && LF_ISSET(WT_LOGSCAN_RECOVER)) {
 		__wt_errx(session,
 		    "WiredTiger is unable to read the recovery log.");
 		__wt_errx(session, "This may be due to the log"

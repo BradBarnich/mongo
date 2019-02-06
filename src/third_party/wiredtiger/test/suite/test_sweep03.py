@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2018 MongoDB, Inc.
+# Public Domain 2014-2019 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -57,7 +57,7 @@ class test_sweep03(wttest.WiredTigerTestCase, suite_subprocess):
     scenarios = make_scenarios(types)
 
     # Wait for the sweep server to run - let it run twice, since the statistic
-    # is incrememented at the start of a sweep and the test relies on sweep
+    # is incremented at the start of a sweep and the test relies on sweep
     # completing it's work.
     def wait_for_sweep(self, baseline):
         # Check regularly for up to 5 seconds total.

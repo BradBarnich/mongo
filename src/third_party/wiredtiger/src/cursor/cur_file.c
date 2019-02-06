@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2018 MongoDB, Inc.
+ * Copyright (c) 2014-2019 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -603,8 +603,11 @@ __curfile_reopen(WT_CURSOR *cursor, bool check_only)
 	 * handle.
 	 */
 	if (ret == 0) {
+		/* Assert a valid tree (we didn't race with eviction). */
+		WT_ASSERT(session, dhandle->type == WT_DHANDLE_TYPE_BTREE);
 		WT_ASSERT(session,
-		    dhandle->type == WT_DHANDLE_TYPE_BTREE);
+		    ((WT_BTREE *)dhandle->handle)->root.page != NULL);
+
 		cbt->btree = dhandle->handle;
 		cursor->internal_uri = cbt->btree->dhandle->name;
 		cursor->key_format = cbt->btree->key_format;

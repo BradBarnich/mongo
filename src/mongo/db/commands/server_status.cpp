@@ -1,30 +1,31 @@
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 
@@ -47,6 +48,10 @@ using std::endl;
 using std::map;
 using std::string;
 using std::stringstream;
+
+namespace {
+constexpr auto kTimingSection = "timing"_sd;
+}  // namespace
 
 class CmdServerStatus : public BasicCommand {
 public:
@@ -152,13 +157,24 @@ public:
         if (runElapsed > Milliseconds(1000)) {
             BSONObj t = timeBuilder.obj();
             log() << "serverStatus was very slow: " << t;
-            result.append("timing", t);
+
+            bool include_timing = true;
+            const auto& elem = cmdObj[kTimingSection];
+            if (!elem.eoo()) {
+                include_timing = elem.trueValue();
+            }
+
+            if (include_timing) {
+                result.append(kTimingSection, t);
+            }
         }
 
         return true;
     }
 
     void addSection(ServerStatusSection* section) {
+        // Disallow adding a section named "timing" as it is reserved for the server status command.
+        dassert(section->getSectionName() != kTimingSection);
         verify(!_runCalled);
         _sections[section->getSectionName()] = section;
     }
@@ -212,11 +228,13 @@ namespace {
 class ExtraInfo : public ServerStatusSection {
 public:
     ExtraInfo() : ServerStatusSection("extra_info") {}
-    virtual bool includeByDefault() const {
+
+    bool includeByDefault() const override {
         return true;
     }
 
-    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
         BSONObjBuilder bb;
 
         bb.append("note", "fields vary by platform");
@@ -228,21 +246,22 @@ public:
 
 } extraInfo;
 
-
 class Asserts : public ServerStatusSection {
 public:
     Asserts() : ServerStatusSection("asserts") {}
-    virtual bool includeByDefault() const {
+
+    bool includeByDefault() const override {
         return true;
     }
 
-    BSONObj generateSection(OperationContext* opCtx, const BSONElement& configElement) const {
+    BSONObj generateSection(OperationContext* opCtx,
+                            const BSONElement& configElement) const override {
         BSONObjBuilder asserts;
-        asserts.append("regular", assertionCount.regular);
-        asserts.append("warning", assertionCount.warning);
-        asserts.append("msg", assertionCount.msg);
-        asserts.append("user", assertionCount.user);
-        asserts.append("rollovers", assertionCount.rollovers);
+        asserts.append("regular", assertionCount.regular.loadRelaxed());
+        asserts.append("warning", assertionCount.warning.loadRelaxed());
+        asserts.append("msg", assertionCount.msg.loadRelaxed());
+        asserts.append("user", assertionCount.user.loadRelaxed());
+        asserts.append("rollovers", assertionCount.rollovers.loadRelaxed());
         return asserts.obj();
     }
 

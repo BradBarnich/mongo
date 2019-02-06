@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -150,6 +152,11 @@ BSONObj ClusterCursorManager::PinnedCursor::getOriginatingCommand() const {
 std::size_t ClusterCursorManager::PinnedCursor::getNumRemotes() const {
     invariant(_cursor);
     return _cursor->getNumRemotes();
+}
+
+BSONObj ClusterCursorManager::PinnedCursor::getPostBatchResumeToken() const {
+    invariant(_cursor);
+    return _cursor->getPostBatchResumeToken();
 }
 
 CursorId ClusterCursorManager::PinnedCursor::getCursorId() const {
@@ -428,7 +435,7 @@ void ClusterCursorManager::killOperationUsingCursor(WithLock, CursorEntry* entry
     // Interrupt any operation currently using the cursor.
     OperationContext* opUsingCursor = entry->getOperationUsingCursor();
     stdx::lock_guard<Client> lk(*opUsingCursor->getClient());
-    opUsingCursor->getServiceContext()->killOperation(opUsingCursor, ErrorCodes::CursorKilled);
+    opUsingCursor->getServiceContext()->killOperation(lk, opUsingCursor, ErrorCodes::CursorKilled);
 
     // Don't delete the cursor, as an operation is using it. It will be cleaned up when the
     // operation is done.
@@ -485,7 +492,7 @@ std::size_t ClusterCursorManager::killMortalCursorsInactiveSince(OperationContex
             !entry.getOperationUsingCursor() && entry.getLastActive() <= cutoff;
 
         if (res) {
-            log() << "Marking cursor id " << cursorId << " for deletion, idle since "
+            log() << "Cursor id " << cursorId << " timed out, idle since "
                   << entry.getLastActive().toString();
         }
 
@@ -536,7 +543,7 @@ std::size_t ClusterCursorManager::killCursorsSatisfying(
             cursorsToDestroy.push_back(entry.releaseCursor(nullptr));
 
             // Destroy the entry and set the iterator to the next element.
-            cursorIdEntryIt = entryMap.erase(cursorIdEntryIt);
+            entryMap.erase(cursorIdEntryIt++);
         }
 
         if (entryMap.empty()) {
@@ -666,9 +673,10 @@ std::pair<Status, int> ClusterCursorManager::killCursorsWithMatchingSessions(
         uassertStatusOK(mgr.killCursor(opCtx, getNamespaceForCursorId(id).get(), id));
     };
 
-    auto visitor = makeKillSessionsCursorManagerVisitor(opCtx, matcher, std::move(eraser));
-    visitor(*this);
-    return std::make_pair(visitor.getStatus(), visitor.getCursorsKilled());
+    auto bySessionCursorKiller = makeKillCursorsBySessionAdaptor(opCtx, matcher, std::move(eraser));
+    bySessionCursorKiller(*this);
+    return std::make_pair(bySessionCursorKiller.getStatus(),
+                          bySessionCursorKiller.getCursorsKilled());
 }
 
 stdx::unordered_set<CursorId> ClusterCursorManager::getCursorsForSession(
@@ -733,7 +741,7 @@ auto ClusterCursorManager::eraseContainer(NssToCursorContainerMap::iterator it)
     // with this namespace.
     size_t numDeleted = _cursorIdPrefixToNamespaceMap.erase(container.containerPrefix);
     invariant(numDeleted == 1);
-    it = _namespaceToContainerMap.erase(it);
+    _namespaceToContainerMap.erase(it++);
     invariant(_namespaceToContainerMap.size() == _cursorIdPrefixToNamespaceMap.size());
     return it;
 }

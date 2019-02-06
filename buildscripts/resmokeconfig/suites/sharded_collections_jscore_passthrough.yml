@@ -4,8 +4,9 @@ selector:
   roots:
   - jstests/core/**/*.js
   exclude_files:
-  # In MongoDB 4.0, transactions are not supported in sharded clusters.
+  # These tests run in the jscore_txn passthrough suites.
   - jstests/core/txns/**/*.js
+  
   # The following tests fail because a certain command or functionality is not supported by
   # mongos. This command or functionality is placed in a comment next to the failing test.
   - jstests/core/apitest_db.js  # serverStatus output doesn't have storageEngine.
@@ -87,12 +88,6 @@ selector:
   - jstests/core/index_multikey.js
   - jstests/core/optimized_match_explain.js
   - jstests/core/sort_array.js
-  # TODO: SERVER-16605
-  - jstests/core/mr_index.js
-  - jstests/core/mr1.js
-  - jstests/core/mr3.js
-  - jstests/core/mr4.js
-  - jstests/core/mr5.js
   exclude_with_any_tags:
   - assumes_against_mongod_not_mongos
   # Tests tagged with the following will fail because they assume collections are not sharded.
@@ -125,4 +120,3 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
-        numInitialSyncAttempts: 1

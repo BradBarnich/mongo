@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -41,7 +43,7 @@ namespace mongo {
 /**
  * RAII-style class, which acquires a lock on the specified database in the requested mode and
  * obtains a reference to the database. Used as a shortcut for calls to
- * DatabaseHolder::getDatabaseHolder().get().
+ * DatabaseHolder::get(opCtx)->get().
  *
  * Use this when you want to do a database-level operation, like read a list of all collections, or
  * drop a collection.
@@ -136,11 +138,11 @@ public:
     }
 
 private:
+    AutoGetDb _autoDb;
+
     // If the object was instantiated with a UUID, contains the resolved namespace, otherwise it is
     // the same as the input namespace string
     NamespaceString _resolvedNss;
-
-    AutoGetDb _autoDb;
 
     // This field is boost::optional, because in the case of lookup by UUID, the collection lock
     // might need to be relocked for the correct namespace
@@ -153,7 +155,7 @@ private:
 /**
  * RAII-style class, which acquires a lock on the specified database in the requested mode and
  * obtains a reference to the database, creating it was non-existing. Used as a shortcut for
- * calls to DatabaseHolder::getDatabaseHolder().openDb(), taking care of locking details. The
+ * calls to DatabaseHolder::get(opCtx)->openDb(), taking care of locking details. The
  * requested mode must be MODE_IX or MODE_X. If the database needs to be created, the lock will
  * automatically be reacquired as MODE_X.
  *

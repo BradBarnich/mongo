@@ -1,30 +1,32 @@
 // mongo/shell/shell_utils_launcher.cpp
-/*
- *    Copyright 2010 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
@@ -59,7 +61,9 @@
 #endif
 
 #include "mongo/client/dbclient_connection.h"
+#include "mongo/db/traffic_reader.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/destructor_guard.h"
@@ -335,12 +339,10 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env, bool isMon
 // we explicitly override them.
 #ifdef _WIN32
     wchar_t* processEnv = GetEnvironmentStringsW();
-    ON_BLOCK_EXIT(
-        [](wchar_t* toFree) {
-            if (toFree)
-                FreeEnvironmentStringsW(toFree);
-        },
-        processEnv);
+    ON_BLOCK_EXIT([processEnv] {
+        if (processEnv)
+            FreeEnvironmentStringsW(processEnv);
+    });
 
     // Windows' GetEnvironmentStringsW returns a NULL terminated array of NULL separated
     // <key>=<value> pairs.
@@ -484,7 +486,18 @@ boost::filesystem::path ProgramRunner::findProgram(const string& prog) {
     // (e.g., mongorestore-2.4) or just <utility>. For windows, the appropriate extension
     // needs to be appended.
     //
-    if (p.extension() != ".exe") {
+
+    auto isExtensionValid = [](std::string extension) {
+        for (auto c : extension) {
+            if (std::isdigit(c)) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    if (!p.has_extension() || !isExtensionValid(p.extension().string())) {
         p = prog + ".exe";
     }
 #endif
@@ -774,7 +787,7 @@ BSONObj WaitProgram(const BSONObj& a, void* data) {
 // an array with all commandline tokens. The Object may have a field named "env" which contains an
 // object of Key Value pairs which will be loaded into the environment of the spawned process.
 BSONObj StartMongoProgram(const BSONObj& a, void* data) {
-    _nokillop = true;
+    shellGlobalParams.nokillop = true;
     BSONObj args = a;
     BSONObj env{};
     BSONElement firstElement = args.firstElement();
@@ -945,7 +958,7 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
         return;
     }
 
-    ON_BLOCK_EXIT(CloseHandle, event);
+    ON_BLOCK_EXIT([&] { CloseHandle(event); });
 
     bool result = SetEvent(event);
     if (!result) {
@@ -1050,6 +1063,14 @@ BSONObj StopMongoProgramByPid(const BSONObj& a, void* data) {
     return BSON("" << (double)code);
 }
 
+BSONObj ConvertTrafficRecordingToBSON(const BSONObj& a, void* data) {
+    int nFields = a.nFields();
+    uassert(ErrorCodes::FailedToParse, "wrong number of arguments", nFields == 1);
+
+    auto arr = trafficRecordingFileToBSONArr(a.firstElement().String());
+    return BSON("" << arr);
+}
+
 int KillMongoProgramInstances() {
     vector<ProcessId> pids;
     registry.getRegisteredPids(pids);
@@ -1101,6 +1122,7 @@ void installShellUtilsLauncher(Scope& scope) {
     scope.injectNative("resetDbpath", ResetDbpath);
     scope.injectNative("pathExists", PathExists);
     scope.injectNative("copyDbpath", CopyDbpath);
+    scope.injectNative("convertTrafficRecordingToBSON", ConvertTrafficRecordingToBSON);
 }
 }  // namespace shell_utils
 }  // namespace mongo

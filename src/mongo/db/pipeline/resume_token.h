@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -48,32 +50,41 @@ struct ResumeTokenData {
         kNotFromInvalidate = false,
     };
 
+    /**
+     * Flag to indicate the type of resume token we are generating.
+     */
+    enum TokenType : int {
+        kHighWaterMarkToken = 0,  // Token refers to a point in time, not an event.
+        kEventToken = 128,        // Token refers to an actual event in the stream.
+    };
+
     ResumeTokenData(){};
     ResumeTokenData(Timestamp clusterTimeIn,
                     int versionIn,
                     size_t applyOpsIndexIn,
-                    Value documentKeyIn,
-                    const boost::optional<UUID>& uuidIn)
+                    const boost::optional<UUID>& uuidIn,
+                    Value documentKeyIn)
         : clusterTime(clusterTimeIn),
           version(versionIn),
           applyOpsIndex(applyOpsIndexIn),
-          documentKey(std::move(documentKeyIn)),
-          uuid(uuidIn){};
+          uuid(uuidIn),
+          documentKey(std::move(documentKeyIn)){};
 
     bool operator==(const ResumeTokenData& other) const;
     bool operator!=(const ResumeTokenData& other) const {
         return !(*this == other);
-    };
+    }
 
     Timestamp clusterTime;
     int version = 1;
+    TokenType tokenType = TokenType::kEventToken;
     size_t applyOpsIndex = 0;
-    Value documentKey;
-    boost::optional<UUID> uuid;
     // Flag to indicate that this resume token is from an "invalidate" entry. This will not be set
     // on a token from a command that *would* invalidate a change stream, but rather the invalidate
     // notification itself.
     FromInvalidate fromInvalidate = FromInvalidate::kNotFromInvalidate;
+    boost::optional<UUID> uuid;
+    Value documentKey;
 };
 
 std::ostream& operator<<(std::ostream& out, const ResumeTokenData& tokenData);
@@ -105,6 +116,18 @@ public:
     }
 
     static ResumeToken parse(const Document& document);
+
+    /**
+     * Generate a high-water-mark token for 'clusterTime', with an optional UUID and no documentKey.
+     */
+    static ResumeToken makeHighWaterMarkToken(Timestamp clusterTime, boost::optional<UUID> uuid);
+
+    /**
+     * Returns true if the given token data represents a valid high-water-mark resume token; that
+     * is, it does not refer to a specific operation, but instead specifies a clusterTime after
+     * which the stream should resume.
+     */
+    static bool isHighWaterMarkToken(const ResumeTokenData& tokenData);
 
     /**
      * The default no-argument constructor is required by the IDL for types used as non-optional

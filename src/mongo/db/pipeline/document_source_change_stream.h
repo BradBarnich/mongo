@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -47,13 +49,44 @@ public:
     public:
         static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
                                                  const BSONElement& spec) {
-            return stdx::make_unique<LiteParsed>(request.getNamespaceString());
+            return stdx::make_unique<LiteParsed>(request.getNamespaceString(), spec);
         }
 
-        explicit LiteParsed(NamespaceString nss) : _nss(std::move(nss)) {}
+        explicit LiteParsed(NamespaceString nss, BSONElement spec) : _nss(std::move(nss)) {
+            // We don't do any validation here, just a minimal check for the resume token. We also
+            // do not need to extract the token unless the stream is running on a single namespace.
+            if (_nss.isCollectionlessAggregateNS() || spec.type() != BSONType::Object) {
+                return;
+            }
+            // Check the 'resumeAfter' field first; if empty, check the 'startAfter' field.
+            auto specObj = spec.embeddedObject();
+            _resumeToken =
+                specObj.getObjectField(DocumentSourceChangeStreamSpec::kResumeAfterFieldName);
+            if (_resumeToken.isEmpty()) {
+                _resumeToken =
+                    specObj.getObjectField(DocumentSourceChangeStreamSpec::kStartAfterFieldName);
+            }
+        }
 
         bool isChangeStream() const final {
             return true;
+        }
+
+        bool shouldResolveUUIDAndCollation() const final {
+            // If this is a whole-db or whole-cluster stream, never resolve the UUID and collation.
+            if (_nss.isCollectionlessAggregateNS()) {
+                return false;
+            }
+            // If we are not resuming, always resolve the UUID and collation.
+            if (_resumeToken.isEmpty()) {
+                return true;
+            }
+            // If we are resuming a single-collection stream from a high water mark that does not
+            // have a UUID, then the token was generated before the collection was created. Do not
+            // attempt to resolve the collection's current UUID or collation, so that the stream
+            // resumes in exactly the same condition as it was in when the token was generated.
+            auto tokenData = ResumeToken::parse(_resumeToken).getData();
+            return !(ResumeToken::isHighWaterMarkToken(tokenData) && !tokenData.uuid);
         }
 
         bool allowedToForwardFromMongos() const final {
@@ -96,6 +129,7 @@ public:
 
     private:
         const NamespaceString _nss;
+        BSONObj _resumeToken;
     };
 
     // The name of the field where the document key (_id and shard key, if present) will be found

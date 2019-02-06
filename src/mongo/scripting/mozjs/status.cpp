@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -65,25 +67,24 @@ void MongoStatusInfo::fromStatus(JSContext* cx, Status status, JS::MutableHandle
     JS::RootedObject thisv(cx);
     scope->getProto<MongoStatusInfo>().newObjectWithProto(&thisv, error);
     ObjectWrapper thisvObj(cx, thisv);
-    thisvObj.defineProperty(
-        InternedString::code,
-        undef,
-        JSPROP_ENUMERATE | JSPROP_SHARED,
-        smUtils::wrapConstrainedMethod<Functions::code, false, MongoStatusInfo>);
+    thisvObj.defineProperty(InternedString::code,
+                            JSPROP_ENUMERATE,
+                            smUtils::wrapConstrainedMethod<Functions::code, false, MongoStatusInfo>,
+                            nullptr);
 
     thisvObj.defineProperty(
         InternedString::reason,
-        undef,
-        JSPROP_ENUMERATE | JSPROP_SHARED,
-        smUtils::wrapConstrainedMethod<Functions::reason, false, MongoStatusInfo>);
+        JSPROP_ENUMERATE,
+        smUtils::wrapConstrainedMethod<Functions::reason, false, MongoStatusInfo>,
+        nullptr);
 
     // We intentionally omit JSPROP_ENUMERATE to match how Error.prototype.stack is a non-enumerable
     // property.
     thisvObj.defineProperty(
         InternedString::stack,
-        undef,
-        JSPROP_SHARED,
-        smUtils::wrapConstrainedMethod<Functions::stack, false, MongoStatusInfo>);
+        0,
+        smUtils::wrapConstrainedMethod<Functions::stack, false, MongoStatusInfo>,
+        nullptr);
 
     JS_SetPrivate(thisv, scope->trackedNew<Status>(std::move(status)));
 
@@ -100,7 +101,7 @@ void MongoStatusInfo::construct(JSContext* cx, JS::CallArgs args) {
     args.rval().set(out);
 }
 
-void MongoStatusInfo::finalize(JSFreeOp* fop, JSObject* obj) {
+void MongoStatusInfo::finalize(js::FreeOp* fop, JSObject* obj) {
     auto status = static_cast<Status*>(JS_GetPrivate(obj));
 
     if (status)
@@ -136,7 +137,8 @@ void MongoStatusInfo::Functions::stack::call(JSContext* cx, JS::CallArgs args) {
             .fromStringData(extraInfo->stack + parentWrapper.getString(InternedString::stack));
 
         // We redefine the "stack" property as the combined JavaScript stacktrace. It is important
-        // that we omit JSPROP_SHARED to the thisvObj.defineProperty() call in order to have
+        // that we omit (TODO/FIXME, no more JSPROP_SHARED) JSPROP_SHARED to the
+        // thisvObj.defineProperty() call in order to have
         // SpiderMonkey allocate memory for the string value. We also intentionally omit
         // JSPROP_ENUMERATE to match how Error.prototype.stack is a non-enumerable property.
         ObjectWrapper thisvObj(cx, args.thisv());

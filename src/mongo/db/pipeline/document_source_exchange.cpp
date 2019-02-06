@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,6 +36,7 @@
 #include <iterator>
 #include <set>
 
+#include "mongo/db/curop.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/pipeline/document_source_exchange.h"
 #include "mongo/db/storage/key_string.h"
@@ -42,6 +45,45 @@
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(exchangeFailLoadNextBatch);
+
+class MutexAndResourceLock {
+    OperationContext* _opCtx;
+    ResourceYielder* _resourceYielder;
+    stdx::unique_lock<stdx::mutex> _lock;
+
+public:
+    // Must be constructed with the mutex held. 'yielder' may be null if there are no resources
+    // which need to be yielded while waiting.
+    MutexAndResourceLock(OperationContext* opCtx,
+                         stdx::unique_lock<stdx::mutex> m,
+                         ResourceYielder* yielder)
+        : _opCtx(opCtx), _resourceYielder(yielder), _lock(std::move(m)) {
+        invariant(_lock.owns_lock());
+    }
+
+    void lock() {
+        // Acquire the operation-wide resources, then the mutex.
+        if (_resourceYielder) {
+            _resourceYielder->unyield(_opCtx);
+        }
+        _lock.lock();
+    }
+    void unlock() {
+        _lock.unlock();
+        if (_resourceYielder) {
+            _resourceYielder->yield(_opCtx);
+        }
+    }
+
+    /**
+     * Releases ownership of the lock to the caller. May only be called when the mutex is held
+     * (after a call to unlock(), for example).
+     */
+    stdx::unique_lock<stdx::mutex> releaseLockOwnership() {
+        invariant(_lock.owns_lock());
+        return std::move(_lock);
+    }
+};
 
 constexpr size_t Exchange::kMaxBufferSize;
 constexpr size_t Exchange::kMaxNumberConsumers;
@@ -57,11 +99,15 @@ Value DocumentSourceExchange::serialize(boost::optional<ExplainOptions::Verbosit
 DocumentSourceExchange::DocumentSourceExchange(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const boost::intrusive_ptr<Exchange> exchange,
-    size_t consumerId)
-    : DocumentSource(expCtx), _exchange(exchange), _consumerId(consumerId) {}
+    size_t consumerId,
+    std::unique_ptr<ResourceYielder> yielder)
+    : DocumentSource(expCtx),
+      _exchange(exchange),
+      _consumerId(consumerId),
+      _resourceYielder(std::move(yielder)) {}
 
 DocumentSource::GetNextResult DocumentSourceExchange::getNext() {
-    return _exchange->getNext(pExpCtx->opCtx, _consumerId);
+    return _exchange->getNext(pExpCtx->opCtx, _consumerId, _resourceYielder.get());
 }
 
 Exchange::Exchange(ExchangeSpec spec, std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
@@ -227,24 +273,33 @@ std::vector<FieldPath> Exchange::extractKeyPaths(const BSONObj& keyPattern) {
     return paths;
 }
 
-DocumentSource::GetNextResult Exchange::getNext(OperationContext* opCtx, size_t consumerId) {
+void Exchange::unblockLoading(size_t consumerId) {
+    // See if the loading is blocked on this consumer and if so unblock it.
+    if (_loadingThreadId == consumerId) {
+        _loadingThreadId = kInvalidThreadId;
+        _haveBufferSpace.notify_all();
+    }
+}
+DocumentSource::GetNextResult Exchange::getNext(OperationContext* opCtx,
+                                                size_t consumerId,
+                                                ResourceYielder* resourceYielder) {
     // Grab a lock.
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     for (;;) {
+        // Guard against some of the trickiness we do with moving the lock to/from the
+        // MutexAndResourceLock.
+        invariant(lk.owns_lock());
         // Execute only in case we have not encountered an error.
-        uassertStatusOKWithContext(_errorInLoadNextBatch,
-                                   "Exchange failed due to an error on different thread.");
+        if (!_errorInLoadNextBatch.isOK()) {
+            uasserted(ErrorCodes::ExchangePassthrough,
+                      "Exchange failed due to an error on different thread.");
+        }
 
         // Check if we have a document.
         if (!_consumers[consumerId]->isEmpty()) {
             auto doc = _consumers[consumerId]->getNext();
-
-            // See if the loading is blocked on this consumer and if so unblock it.
-            if (_loadingThreadId == consumerId) {
-                _loadingThreadId = kInvalidThreadId;
-                _haveBufferSpace.notify_all();
-            }
+            unblockLoading(consumerId);
 
             return doc;
         }
@@ -290,7 +345,9 @@ DocumentSource::GetNextResult Exchange::getNext(OperationContext* opCtx, size_t 
         } else {
             // Some other consumer is already loading the buffers. There is nothing else we can do
             // but wait.
-            _haveBufferSpace.wait(lk);
+            MutexAndResourceLock mutexAndResourceLock(opCtx, std::move(lk), resourceYielder);
+            _haveBufferSpace.wait(mutexAndResourceLock);
+            lk = mutexAndResourceLock.releaseLockOwnership();
         }
     }
 }
@@ -395,6 +452,9 @@ void Exchange::dispose(OperationContext* opCtx, size_t consumerId) {
     } else if (_disposeRunDown == getConsumers()) {
         _pipeline->dispose(opCtx);
     }
+
+    _consumers[consumerId]->dispose();
+    unblockLoading(consumerId);
 }
 
 DocumentSource::GetNextResult Exchange::ExchangeBuffer::getNext() {
@@ -411,6 +471,11 @@ DocumentSource::GetNextResult Exchange::ExchangeBuffer::getNext() {
 }
 
 bool Exchange::ExchangeBuffer::appendDocument(DocumentSource::GetNextResult input, size_t limit) {
+    // If the buffer is disposed then we simply ignore any appends.
+    if (_disposed) {
+        return false;
+    }
+
     if (input.isAdvanced()) {
         _bytesInBuffer += input.getDocument().getApproximateSize();
     }

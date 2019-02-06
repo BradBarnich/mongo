@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -715,9 +717,8 @@ TEST(RegexMatchExpression, MatchesElementExact) {
 
 TEST(RegexMatchExpression, TooLargePattern) {
     string tooLargePattern(50 * 1000, 'z');
-    ASSERT_THROWS_CODE(RegexMatchExpression regex("a", tooLargePattern, ""),
-                       AssertionException,
-                       ErrorCodes::BadValue);
+    ASSERT_THROWS_CODE(
+        RegexMatchExpression("a", tooLargePattern, ""), AssertionException, ErrorCodes::BadValue);
 }
 
 TEST(RegexMatchExpression, MatchesElementSimplePrefix) {
@@ -919,28 +920,28 @@ TEST(RegexMatchExpression, Equality1) {
 TEST(RegexMatchExpression, RegexCannotContainEmbeddedNullByte) {
     {
         const auto embeddedNull = "a\0b"_sd;
-        ASSERT_THROWS_CODE(RegexMatchExpression regex("path", embeddedNull, ""),
+        ASSERT_THROWS_CODE(RegexMatchExpression("path", embeddedNull, ""),
                            AssertionException,
                            ErrorCodes::BadValue);
     }
 
     {
         const auto singleNullByte = "\0"_sd;
-        ASSERT_THROWS_CODE(RegexMatchExpression regex("path", singleNullByte, ""),
+        ASSERT_THROWS_CODE(RegexMatchExpression("path", singleNullByte, ""),
                            AssertionException,
                            ErrorCodes::BadValue);
     }
 
     {
         const auto leadingNullByte = "\0bbbb"_sd;
-        ASSERT_THROWS_CODE(RegexMatchExpression regex("path", leadingNullByte, ""),
+        ASSERT_THROWS_CODE(RegexMatchExpression("path", leadingNullByte, ""),
                            AssertionException,
                            ErrorCodes::BadValue);
     }
 
     {
         const auto trailingNullByte = "bbbb\0"_sd;
-        ASSERT_THROWS_CODE(RegexMatchExpression regex("path", trailingNullByte, ""),
+        ASSERT_THROWS_CODE(RegexMatchExpression("path", trailingNullByte, ""),
                            AssertionException,
                            ErrorCodes::BadValue);
     }
@@ -949,28 +950,28 @@ TEST(RegexMatchExpression, RegexCannotContainEmbeddedNullByte) {
 TEST(RegexMatchExpression, RegexOptionsStringCannotContainEmbeddedNullByte) {
     {
         const auto embeddedNull = "a\0b"_sd;
-        ASSERT_THROWS_CODE(RegexMatchExpression regex("path", "pattern", embeddedNull),
+        ASSERT_THROWS_CODE(RegexMatchExpression("path", "pattern", embeddedNull),
                            AssertionException,
                            ErrorCodes::BadValue);
     }
 
     {
         const auto singleNullByte = "\0"_sd;
-        ASSERT_THROWS_CODE(RegexMatchExpression regex("path", "pattern", singleNullByte),
+        ASSERT_THROWS_CODE(RegexMatchExpression("path", "pattern", singleNullByte),
                            AssertionException,
                            ErrorCodes::BadValue);
     }
 
     {
         const auto leadingNullByte = "\0bbbb"_sd;
-        ASSERT_THROWS_CODE(RegexMatchExpression regex("path", "pattern", leadingNullByte),
+        ASSERT_THROWS_CODE(RegexMatchExpression("path", "pattern", leadingNullByte),
                            AssertionException,
                            ErrorCodes::BadValue);
     }
 
     {
         const auto trailingNullByte = "bbbb\0"_sd;
-        ASSERT_THROWS_CODE(RegexMatchExpression regex("path", "pattern", trailingNullByte),
+        ASSERT_THROWS_CODE(RegexMatchExpression("path", "pattern", trailingNullByte),
                            AssertionException,
                            ErrorCodes::BadValue);
     }
@@ -1009,7 +1010,7 @@ TEST(ModMatchExpression, MatchesElement) {
 }
 
 TEST(ModMatchExpression, ZeroDivisor) {
-    ASSERT_THROWS_CODE(ModMatchExpression mod("", 0, 1), AssertionException, ErrorCodes::BadValue);
+    ASSERT_THROWS_CODE(ModMatchExpression("", 0, 1), AssertionException, ErrorCodes::BadValue);
 }
 
 TEST(ModMatchExpression, MatchesScalar) {

@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2016 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
 
@@ -73,10 +75,10 @@ StatusWith<std::unique_ptr<CollatorInterface>> parseCollator(OperationContext* o
 
 Status ViewCatalog::reloadIfNeeded(OperationContext* opCtx) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return _reloadIfNeeded_inlock(opCtx);
+    return _reloadIfNeeded(lk, opCtx);
 }
 
-Status ViewCatalog::_reloadIfNeeded_inlock(OperationContext* opCtx) {
+Status ViewCatalog::_reloadIfNeeded(WithLock lk, OperationContext* opCtx) {
     if (_valid.load())
         return Status::OK();
 
@@ -124,18 +126,19 @@ Status ViewCatalog::_reloadIfNeeded_inlock(OperationContext* opCtx) {
 
 void ViewCatalog::iterate(OperationContext* opCtx, ViewIteratorCallback callback) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _requireValidCatalog_inlock(opCtx);
+    _requireValidCatalog(lk, opCtx);
     for (auto&& view : _viewMap) {
         callback(*view.second);
     }
 }
 
-Status ViewCatalog::_createOrUpdateView_inlock(OperationContext* opCtx,
-                                               const NamespaceString& viewName,
-                                               const NamespaceString& viewOn,
-                                               const BSONArray& pipeline,
-                                               std::unique_ptr<CollatorInterface> collator) {
-    _requireValidCatalog_inlock(opCtx);
+Status ViewCatalog::_createOrUpdateView(WithLock lk,
+                                        OperationContext* opCtx,
+                                        const NamespaceString& viewName,
+                                        const NamespaceString& viewOn,
+                                        const BSONArray& pipeline,
+                                        std::unique_ptr<CollatorInterface> collator) {
+    _requireValidCatalog(lk, opCtx);
 
     // Build the BSON definition for this view to be saved in the durable view catalog. If the
     // collation is empty, omit it from the definition altogether.
@@ -152,7 +155,7 @@ Status ViewCatalog::_createOrUpdateView_inlock(OperationContext* opCtx,
         viewName.db(), viewName.coll(), viewOn.coll(), ownedPipeline, std::move(collator));
 
     // Check that the resulting dependency graph is acyclic and within the maximum depth.
-    Status graphStatus = _upsertIntoGraph(opCtx, *(view.get()));
+    Status graphStatus = _upsertIntoGraph(lk, opCtx, *(view.get()));
     if (!graphStatus.isOK()) {
         return graphStatus;
     }
@@ -170,13 +173,16 @@ Status ViewCatalog::_createOrUpdateView_inlock(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status ViewCatalog::_upsertIntoGraph(OperationContext* opCtx, const ViewDefinition& viewDef) {
+Status ViewCatalog::_upsertIntoGraph(WithLock lk,
+                                     OperationContext* opCtx,
+                                     const ViewDefinition& viewDef) {
 
     // Performs the insert into the graph.
-    auto doInsert = [this, &opCtx](const ViewDefinition& viewDef, bool needsValidation) -> Status {
+    auto doInsert = [this, &lk, &opCtx](const ViewDefinition& viewDef,
+                                        bool needsValidation) -> Status {
         // Validate that the pipeline is eligible to serve as a view definition. If it is, this
         // will also return the set of involved namespaces.
-        auto pipelineStatus = _validatePipeline_inlock(opCtx, viewDef);
+        auto pipelineStatus = _validatePipeline(lk, opCtx, viewDef);
         if (!pipelineStatus.isOK()) {
             if (needsValidation) {
                 uassertStatusOKWithContext(pipelineStatus.getStatus(),
@@ -197,7 +203,7 @@ Status ViewCatalog::_upsertIntoGraph(OperationContext* opCtx, const ViewDefiniti
 
         if (needsValidation) {
             // Check the collation of all the dependent namespaces before updating the graph.
-            auto collationStatus = _validateCollation_inlock(opCtx, viewDef, refs);
+            auto collationStatus = _validateCollation(lk, opCtx, viewDef, refs);
             if (!collationStatus.isOK()) {
                 return collationStatus;
             }
@@ -229,8 +235,8 @@ Status ViewCatalog::_upsertIntoGraph(OperationContext* opCtx, const ViewDefiniti
     return doInsert(viewDef, true);
 }
 
-StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline_inlock(
-    OperationContext* opCtx, const ViewDefinition& viewDef) const {
+StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline(
+    WithLock lk, OperationContext* opCtx, const ViewDefinition& viewDef) const {
     AggregationRequest request(viewDef.viewOn(), viewDef.pipeline());
     const LiteParsedPipeline liteParsedPipeline(request);
     const auto involvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
@@ -292,11 +298,12 @@ StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline_
     return std::move(involvedNamespaces);
 }
 
-Status ViewCatalog::_validateCollation_inlock(OperationContext* opCtx,
-                                              const ViewDefinition& view,
-                                              const std::vector<NamespaceString>& refs) {
+Status ViewCatalog::_validateCollation(WithLock lk,
+                                       OperationContext* opCtx,
+                                       const ViewDefinition& view,
+                                       const std::vector<NamespaceString>& refs) {
     for (auto&& potentialViewNss : refs) {
-        auto otherView = _lookup_inlock(opCtx, potentialViewNss.ns());
+        auto otherView = _lookup(lk, opCtx, potentialViewNss.ns());
         if (otherView &&
             !CollatorInterface::collatorsMatch(view.defaultCollator(),
                                                otherView->defaultCollator())) {
@@ -320,7 +327,7 @@ Status ViewCatalog::createView(OperationContext* opCtx,
         return Status(ErrorCodes::BadValue,
                       "View must be created on a view or collection in the same database");
 
-    if (_lookup_inlock(opCtx, StringData(viewName.ns())))
+    if (_lookup(lk, opCtx, StringData(viewName.ns())))
         return Status(ErrorCodes::NamespaceExists, "Namespace already exists");
 
     if (!NamespaceString::validCollectionName(viewOn.coll()))
@@ -336,8 +343,8 @@ Status ViewCatalog::createView(OperationContext* opCtx,
     if (!collator.isOK())
         return collator.getStatus();
 
-    return _createOrUpdateView_inlock(
-        opCtx, viewName, viewOn, pipeline, std::move(collator.getValue()));
+    return _createOrUpdateView(
+        lk, opCtx, viewName, viewOn, pipeline, std::move(collator.getValue()));
 }
 
 Status ViewCatalog::modifyView(OperationContext* opCtx,
@@ -350,7 +357,7 @@ Status ViewCatalog::modifyView(OperationContext* opCtx,
         return Status(ErrorCodes::BadValue,
                       "View must be created on a view or collection in the same database");
 
-    auto viewPtr = _lookup_inlock(opCtx, viewName.ns());
+    auto viewPtr = _lookup(lk, opCtx, viewName.ns());
     if (!viewPtr)
         return Status(ErrorCodes::NamespaceNotFound,
                       str::stream() << "cannot modify missing view " << viewName.ns());
@@ -364,20 +371,20 @@ Status ViewCatalog::modifyView(OperationContext* opCtx,
         this->_viewMap[viewName.ns()] = std::make_shared<ViewDefinition>(savedDefinition);
     });
 
-    return _createOrUpdateView_inlock(
-        opCtx,
-        viewName,
-        viewOn,
-        pipeline,
-        CollatorInterface::cloneCollator(savedDefinition.defaultCollator()));
+    return _createOrUpdateView(lk,
+                               opCtx,
+                               viewName,
+                               viewOn,
+                               pipeline,
+                               CollatorInterface::cloneCollator(savedDefinition.defaultCollator()));
 }
 
 Status ViewCatalog::dropView(OperationContext* opCtx, const NamespaceString& viewName) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    _requireValidCatalog_inlock(opCtx);
+    _requireValidCatalog(lk, opCtx);
 
     // Save a copy of the view definition in case we need to roll back.
-    auto viewPtr = _lookup_inlock(opCtx, viewName.ns());
+    auto viewPtr = _lookup(lk, opCtx, viewName.ns());
     if (!viewPtr) {
         return {ErrorCodes::NamespaceNotFound,
                 str::stream() << "cannot drop missing view: " << viewName.ns()};
@@ -400,8 +407,9 @@ Status ViewCatalog::dropView(OperationContext* opCtx, const NamespaceString& vie
     return Status::OK();
 }
 
-std::shared_ptr<ViewDefinition> ViewCatalog::_lookup_inlock(OperationContext* opCtx,
-                                                            StringData ns) {
+std::shared_ptr<ViewDefinition> ViewCatalog::_lookup(WithLock lk,
+                                                     OperationContext* opCtx,
+                                                     StringData ns) {
     // We expect the catalog to be valid, so short-circuit other checks for best performance.
     if (MONGO_unlikely(!_valid.load())) {
         // If the catalog is invalid, we want to avoid references to virtualized or other invalid
@@ -409,7 +417,7 @@ std::shared_ptr<ViewDefinition> ViewCatalog::_lookup_inlock(OperationContext* op
         // invalid view definitions.
         if (!NamespaceString::validCollectionName(ns))
             return nullptr;
-        Status status = _reloadIfNeeded_inlock(opCtx);
+        Status status = _reloadIfNeeded(lk, opCtx);
         // In case of errors we've already logged a message. Only uassert if there actually is
         // a user connection, as otherwise we'd crash the server. The catalog will remain invalid,
         // and any views after the first invalid one are ignored.
@@ -426,7 +434,7 @@ std::shared_ptr<ViewDefinition> ViewCatalog::_lookup_inlock(OperationContext* op
 
 std::shared_ptr<ViewDefinition> ViewCatalog::lookup(OperationContext* opCtx, StringData ns) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    return _lookup_inlock(opCtx, ns);
+    return _lookup(lk, opCtx, ns);
 }
 
 StatusWith<ResolvedView> ViewCatalog::resolveView(OperationContext* opCtx,
@@ -461,11 +469,11 @@ StatusWith<ResolvedView> ViewCatalog::resolveView(OperationContext* opCtx,
 
             // If the catalog has been invalidated, bail and restart.
             if (!_valid.load()) {
-                uassertStatusOK(_reloadIfNeeded_inlock(opCtx));
+                uassertStatusOK(_reloadIfNeeded(lock, opCtx));
                 break;
             }
 
-            auto view = _lookup_inlock(opCtx, resolvedNss->ns());
+            auto view = _lookup(lock, opCtx, resolvedNss->ns());
             if (!view) {
                 // Return error status if pipeline is too large.
                 int pipelineSize = 0;

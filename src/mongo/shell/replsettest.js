@@ -484,7 +484,7 @@ var ReplSetTest = function(opts) {
             member._id = i;
 
             member.host = this.host;
-            if (!member.host.contains('/')) {
+            if (!member.host.includes('/')) {
                 member.host += ":" + this.ports[i];
             }
 
@@ -1191,7 +1191,9 @@ var ReplSetTest = function(opts) {
 
     /**
      * Waits for the last oplog entry on the primary to be visible in the committed snapshop view
-     * of the oplog on *all* secondaries.
+     * of the oplog on *all* secondaries. When majority read concern is disabled, there is no
+     * committed snapshot view, so this function waits for the knowledge of the majority commit
+     * point on each node to advance to the optime of the last oplog entry on the primary.
      * Returns last oplog entry.
      */
     this.awaitLastOpCommitted = function(timeout) {
@@ -1480,6 +1482,16 @@ var ReplSetTest = function(opts) {
         }, "awaiting replication", timeout);
     };
 
+    // TODO: SERVER-38961 Remove when simultaneous index builds complete.
+    this.waitForAllIndexBuildsToFinish = function(dbName, collName) {
+        // Run a no-op command and wait for it to be applied on secondaries. Due to the asynchronous
+        // completion nature of indexes on secondaries, we can guarantee an index build is complete
+        // on all secondaries once all secondaries have applied this collMod command.
+        assert.commandWorked(this.getPrimary().getDB(dbName).runCommand(
+            {collMod: collName, usePowerOf2Sizes: true}));
+        this.awaitReplication();
+    };
+
     this.getHashesUsingSessions = function(sessions, dbName, {
         filterCapped: filterCapped = true,
         filterMapReduce: filterMapReduce = true,
@@ -1623,18 +1635,25 @@ var ReplSetTest = function(opts) {
         return {master: hashes[0], slaves: hashes.slice(1)};
     };
 
+    this.findOplog = function(conn, query, limit) {
+        return conn.getDB('local')
+            .getCollection(oplogName)
+            .find(query)
+            .sort({$natural: -1})
+            .limit(limit);
+    };
+
     this.dumpOplog = function(conn, query = {}, limit = 10) {
         var log = 'Dumping the latest ' + limit + ' documents that match ' + tojson(query) +
             ' from the oplog ' + oplogName + ' of ' + conn.host;
-        var cursor = conn.getDB('local')
-                         .getCollection(oplogName)
-                         .find(query)
-                         .sort({$natural: -1})
-                         .limit(limit);
+        let entries = [];
+        let cursor = this.findOplog(conn, query, limit);
         cursor.forEach(function(entry) {
             log = log + '\n' + tojsononeline(entry);
+            entries.push(entry);
         });
         jsTestLog(log);
+        return entries;
     };
 
     // Call the provided checkerFunction, after the replica set has been write locked.
@@ -2229,7 +2248,6 @@ var ReplSetTest = function(opts) {
             oplogSize: this.oplogSize,
             keyFile: this.keyFile,
             port: _useBridge ? _unbridgedPorts[n] : this.ports[n],
-            noprealloc: "",
             replSet: this.useSeedList ? this.getURL() : this.name,
             dbpath: "$set-$node"
         };
@@ -2261,9 +2279,17 @@ var ReplSetTest = function(opts) {
 
         // Turn off periodic noop writes for replica sets by default.
         options.setParameter = options.setParameter || {};
+        if (typeof(options.setParameter) === "string") {
+            var eqIdx = options.setParameter.indexOf("=");
+            if (eqIdx != -1) {
+                var param = options.setParameter.substring(0, eqIdx);
+                var value = options.setParameter.substring(eqIdx + 1);
+                options.setParameter = {};
+                options.setParameter[param] = value;
+            }
+        }
         options.setParameter.writePeriodicNoops = options.setParameter.writePeriodicNoops || false;
-        options.setParameter.numInitialSyncAttempts =
-            options.setParameter.numInitialSyncAttempts || 1;
+
         // We raise the number of initial sync connect attempts for tests that disallow chaining.
         // Disabling chaining can cause sync source selection to take longer so we must increase
         // the number of connection attempts.
@@ -2618,7 +2644,7 @@ var ReplSetTest = function(opts) {
             // and too slowly processing heartbeats. When it steps down, it closes all of
             // its connections.
             _constructFromExistingSeedNode(opts);
-        }, 10);
+        }, 60);
     } else {
         _constructStartNewInstances(opts);
     }

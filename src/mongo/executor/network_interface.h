@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,12 +38,10 @@
 #include "mongo/stdx/functional.h"
 #include "mongo/transport/baton.h"
 #include "mongo/util/fail_point_service.h"
+#include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
-
-class BSONObjBuilder;
-
 namespace executor {
 
 MONGO_FAIL_POINT_DECLARE(networkInterfaceDiscardCommandsBeforeAcquireConn);
@@ -55,7 +55,7 @@ class NetworkInterface {
 
 public:
     using Response = RemoteCommandResponse;
-    using RemoteCommandCompletionFn = stdx::function<void(const TaskExecutor::ResponseStatus&)>;
+    using RemoteCommandCompletionFn = unique_function<void(const TaskExecutor::ResponseStatus&)>;
 
     virtual ~NetworkInterface();
 
@@ -143,22 +143,21 @@ public:
      */
     virtual Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
                                 RemoteCommandRequest& request,
-                                const RemoteCommandCompletionFn& onFinish,
-                                const transport::BatonHandle& baton = nullptr) = 0;
+                                RemoteCommandCompletionFn&& onFinish,
+                                const BatonHandle& baton = nullptr) = 0;
 
-    Future<TaskExecutor::ResponseStatus> startCommand(
-        const TaskExecutor::CallbackHandle& cbHandle,
-        RemoteCommandRequest& request,
-        const transport::BatonHandle& baton = nullptr) {
+    Future<TaskExecutor::ResponseStatus> startCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                                                      RemoteCommandRequest& request,
+                                                      const BatonHandle& baton = nullptr) {
         auto pf = makePromiseFuture<TaskExecutor::ResponseStatus>();
 
-        auto status =
-            startCommand(cbHandle,
-                         request,
-                         [sp = pf.promise.share()](const TaskExecutor::ResponseStatus& rs) mutable {
-                             sp.emplaceValue(rs);
-                         },
-                         baton);
+        auto status = startCommand(
+            cbHandle,
+            request,
+            [p = std::move(pf.promise)](const TaskExecutor::ResponseStatus& rs) mutable {
+                p.emplaceValue(rs);
+            },
+            baton);
 
         if (!status.isOK()) {
             return status;
@@ -171,7 +170,7 @@ public:
      * completed.
      */
     virtual void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle,
-                               const transport::BatonHandle& baton = nullptr) = 0;
+                               const BatonHandle& baton = nullptr) = 0;
 
     /**
      * Sets an alarm, which schedules "action" to run no sooner than "when".
@@ -187,9 +186,7 @@ public:
      * Any callbacks invoked from setAlarm must observe onNetworkThread to
      * return true. See that method for why.
      */
-    virtual Status setAlarm(Date_t when,
-                            const stdx::function<void()>& action,
-                            const transport::BatonHandle& baton = nullptr) = 0;
+    virtual Status setAlarm(Date_t when, unique_function<void()> action) = 0;
 
     /**
      * Returns true if called from a thread dedicated to networking. I.e. not a

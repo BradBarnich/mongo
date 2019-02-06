@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,7 +40,7 @@
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_test_lib.h"
 #include "mongo/util/log.h"
@@ -64,59 +66,85 @@ void QueryPlannerTest::clearState() {
 }
 
 void QueryPlannerTest::addIndex(BSONObj keyPattern, bool multikey) {
-    params.indices.push_back(IndexEntry(keyPattern,
-                                        multikey,
-                                        false,  // sparse
-                                        false,  // unique
-                                        IndexEntry::Identifier{"hari_king_of_the_stove"},
-                                        NULL,  // filterExpr
-                                        BSONObj()));
+    params.indices.push_back({keyPattern,
+                              IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                              multikey,
+                              {},
+                              {},
+                              false,  // sparse
+                              false,  // unique
+                              IndexEntry::Identifier{"hari_king_of_the_stove"},
+                              nullptr,  // filterExpr
+                              BSONObj(),
+                              nullptr,
+                              nullptr});
 }
 
 void QueryPlannerTest::addIndex(BSONObj keyPattern, bool multikey, bool sparse) {
-    params.indices.push_back(IndexEntry(keyPattern,
-                                        multikey,
-                                        sparse,
-                                        false,  // unique
-                                        IndexEntry::Identifier{"note_to_self_dont_break_build"},
-                                        NULL,  // filterExpr
-                                        BSONObj()));
+    params.indices.push_back({keyPattern,
+                              IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                              multikey,
+                              {},
+                              {},
+                              sparse,
+                              false,  // unique
+                              IndexEntry::Identifier{"note_to_self_dont_break_build"},
+                              nullptr,  // filterExpr
+                              BSONObj(),
+                              nullptr,
+                              nullptr});
 }
 
 void QueryPlannerTest::addIndex(BSONObj keyPattern, bool multikey, bool sparse, bool unique) {
     params.indices.push_back(
-        IndexEntry(keyPattern,
-                   multikey,
-                   sparse,
-                   unique,
-                   IndexEntry::Identifier{"sql_query_walks_into_bar_and_says_can_i_join_you?"},
-                   NULL,  // filterExpr
-                   BSONObj()));
+        {keyPattern,
+         IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+         multikey,
+         {},
+         {},
+         sparse,
+         unique,
+         IndexEntry::Identifier{"sql_query_walks_into_bar_and_says_can_i_join_you?"},
+         nullptr,  // filterExpr
+         BSONObj(),
+         nullptr,
+         nullptr});
 }
 
 void QueryPlannerTest::addIndex(BSONObj keyPattern, BSONObj infoObj) {
-    params.indices.push_back(IndexEntry(keyPattern,
-                                        false,  // multikey
-                                        false,  // sparse
-                                        false,  // unique
-                                        IndexEntry::Identifier{"foo"},
-                                        NULL,  // filterExpr
-                                        infoObj));
+    params.indices.push_back({keyPattern,
+                              IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                              false,  // multikey
+                              {},
+                              {},
+                              false,  // sparse
+                              false,  // unique
+                              IndexEntry::Identifier{"foo"},
+                              nullptr,  // filterExpr
+                              infoObj,
+                              nullptr,
+                              nullptr});
 }
 
 void QueryPlannerTest::addIndex(BSONObj keyPattern, MatchExpression* filterExpr) {
-    params.indices.push_back(IndexEntry(keyPattern,
-                                        false,  // multikey
-                                        false,  // sparse
-                                        false,  // unique
-                                        IndexEntry::Identifier{"foo"},
-                                        filterExpr,
-                                        BSONObj()));
+    params.indices.push_back({keyPattern,
+                              IndexNames::nameToType(IndexNames::findPluginName(keyPattern)),
+                              false,  // multikey
+                              {},
+                              {},
+                              false,  // sparse
+                              false,  // unique
+                              IndexEntry::Identifier{"foo"},
+                              filterExpr,
+                              BSONObj(),
+                              nullptr,
+                              nullptr});
 }
 
 void QueryPlannerTest::addIndex(BSONObj keyPattern, const MultikeyPaths& multikeyPaths) {
     invariant(multikeyPaths.size() == static_cast<size_t>(keyPattern.nFields()));
 
+    const auto type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
     const bool multikey =
         std::any_of(multikeyPaths.cbegin(),
                     multikeyPaths.cend(),
@@ -126,21 +154,42 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, const MultikeyPaths& multike
     const char name[] = "my_index_with_path_level_multikey_info";
     const MatchExpression* filterExpr = nullptr;
     const BSONObj infoObj;
-    IndexEntry entry(
-        keyPattern, multikey, sparse, unique, IndexEntry::Identifier{name}, filterExpr, infoObj);
+    IndexEntry entry(keyPattern,
+                     type,
+                     multikey,
+                     {},
+                     {},
+                     sparse,
+                     unique,
+                     IndexEntry::Identifier{name},
+                     filterExpr,
+                     infoObj,
+                     nullptr,
+                     nullptr);
     entry.multikeyPaths = multikeyPaths;
     params.indices.push_back(entry);
 }
 
 void QueryPlannerTest::addIndex(BSONObj keyPattern, const CollatorInterface* collator) {
+    const auto type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
     const bool sparse = false;
     const bool unique = false;
     const bool multikey = false;
     const char name[] = "my_index_with_collator";
     const MatchExpression* filterExpr = nullptr;
     const BSONObj infoObj;
-    IndexEntry entry(
-        keyPattern, multikey, sparse, unique, IndexEntry::Identifier{name}, filterExpr, infoObj);
+    IndexEntry entry(keyPattern,
+                     type,
+                     multikey,
+                     {},
+                     {},
+                     sparse,
+                     unique,
+                     IndexEntry::Identifier{name},
+                     filterExpr,
+                     infoObj,
+                     nullptr,
+                     nullptr);
     entry.collator = collator;
     params.indices.push_back(entry);
 }
@@ -148,14 +197,25 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, const CollatorInterface* col
 void QueryPlannerTest::addIndex(BSONObj keyPattern,
                                 const CollatorInterface* collator,
                                 StringData indexName) {
+    const auto type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
     const bool sparse = false;
     const bool unique = false;
     const bool multikey = false;
     const auto name = indexName.toString();
     const MatchExpression* filterExpr = nullptr;
     const BSONObj infoObj;
-    IndexEntry entry(
-        keyPattern, multikey, sparse, unique, IndexEntry::Identifier{name}, filterExpr, infoObj);
+    IndexEntry entry(keyPattern,
+                     type,
+                     multikey,
+                     {},
+                     {},
+                     sparse,
+                     unique,
+                     IndexEntry::Identifier{name},
+                     filterExpr,
+                     infoObj,
+                     nullptr,
+                     nullptr);
     entry.collator = collator;
     params.indices.push_back(entry);
 }
@@ -163,13 +223,24 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern,
 void QueryPlannerTest::addIndex(BSONObj keyPattern,
                                 MatchExpression* filterExpr,
                                 const CollatorInterface* collator) {
+    const auto type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
     const bool sparse = false;
     const bool unique = false;
     const bool multikey = false;
     const char name[] = "my_partial_index_with_collator";
     const BSONObj infoObj;
-    IndexEntry entry(
-        keyPattern, multikey, sparse, unique, IndexEntry::Identifier{name}, filterExpr, infoObj);
+    IndexEntry entry(keyPattern,
+                     type,
+                     multikey,
+                     {},
+                     {},
+                     sparse,
+                     unique,
+                     IndexEntry::Identifier{name},
+                     filterExpr,
+                     infoObj,
+                     nullptr,
+                     nullptr);
     entry.collator = collator;
     params.indices.push_back(entry);
 }

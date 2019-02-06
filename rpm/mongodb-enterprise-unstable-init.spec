@@ -244,10 +244,11 @@ fi
 
 %files tools
 %defattr(-,root,root,-)
-#%doc README GNU-AGPL-3.0.txt
+#%doc README
 
 %{_bindir}/bsondump
 %{_bindir}/install_compass
+%{_bindir}/mongocryptd
 %{_bindir}/mongodecrypt
 %{_bindir}/mongoldap
 %{_bindir}/mongodump

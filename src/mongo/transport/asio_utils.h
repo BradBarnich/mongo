@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -72,9 +74,12 @@ inline Status errorCodeToStatus(const std::error_code& ec) {
     if (ec == asio::error::try_again || ec == asio::error::would_block) {
 #endif
         return {ErrorCodes::NetworkTimeout, "Socket operation timed out"};
-    } else if (ec == asio::error::eof || ec == asio::error::connection_reset ||
-               ec == asio::error::network_reset) {
-        return {ErrorCodes::HostUnreachable, "Connection was closed"};
+    } else if (ec == asio::error::eof) {
+        return {ErrorCodes::HostUnreachable, "Connection closed by peer"};
+    } else if (ec == asio::error::connection_reset) {
+        return {ErrorCodes::HostUnreachable, "Connection reset by peer"};
+    } else if (ec == asio::error::network_reset) {
+        return {ErrorCodes::HostUnreachable, "Connection reset by network"};
     }
 
     // If the ec.category() is a mongoErrorCategory() then this error was propogated from
@@ -348,7 +353,7 @@ struct AsyncHandlerHelper {
 template <>
 struct AsyncHandlerHelper<> {
     using Result = void;
-    static void complete(SharedPromise<Result>* promise) {
+    static void complete(Promise<Result>* promise) {
         promise->emplaceValue();
     }
 };
@@ -356,7 +361,7 @@ struct AsyncHandlerHelper<> {
 template <typename Arg>
 struct AsyncHandlerHelper<Arg> {
     using Result = Arg;
-    static void complete(SharedPromise<Result>* promise, Arg arg) {
+    static void complete(Promise<Result>* promise, Arg arg) {
         promise->emplaceValue(arg);
     }
 };
@@ -367,7 +372,7 @@ struct AsyncHandlerHelper<std::error_code, Args...> {
     using Result = typename Helper::Result;
 
     template <typename... Args2>
-    static void complete(SharedPromise<Result>* promise, std::error_code ec, Args2&&... args) {
+    static void complete(Promise<Result>* promise, std::error_code ec, Args2&&... args) {
         if (ec) {
             promise->setError(errorCodeToStatus(ec));
         } else {
@@ -379,7 +384,7 @@ struct AsyncHandlerHelper<std::error_code, Args...> {
 template <>
 struct AsyncHandlerHelper<std::error_code> {
     using Result = void;
-    static void complete(SharedPromise<Result>* promise, std::error_code ec) {
+    static void complete(Promise<Result>* promise, std::error_code ec) {
         if (ec) {
             promise->setError(errorCodeToStatus(ec));
         } else {
@@ -400,7 +405,7 @@ struct AsyncHandler {
         Helper::complete(&promise, std::forward<Args2>(args)...);
     }
 
-    SharedPromise<Result> promise;
+    Promise<Result> promise;
 };
 
 template <typename... Args>
@@ -412,7 +417,7 @@ struct AsyncResult {
     explicit AsyncResult(completion_handler_type& handler) {
         auto pf = makePromiseFuture<RealResult>();
         fut = std::move(pf.future);
-        handler.promise = pf.promise.share();
+        handler.promise = std::move(pf.promise);
     }
 
     auto get() {

@@ -9,9 +9,6 @@
 (function() {
     "use strict";
 
-    load('jstests/aggregation/extras/utils.js');  // For assertErrorCode().
-    load('jstests/libs/change_stream_util.js');   // For ChangeStreamTest.
-
     // For supportsMajorityReadConcern().
     load("jstests/multiVersion/libs/causal_consistency_helpers.js");
 
@@ -51,13 +48,14 @@
         {moveChunk: mongosColl.getFullName(), find: {_id: 1}, to: st.rs1.getURL()}));
 
     function checkStream() {
+        load('jstests/libs/change_stream_util.js');  // For assertChangeStreamEventEq.
+
         db = db.getSiblingDB(jsTestName());
         let coll = db[jsTestName()];
-        let changeStream =
-            coll.aggregate([{$changeStream: {}}, {$project: {_id: 0, clusterTime: 0}}]);
+        let changeStream = coll.aggregate([{$changeStream: {}}]);
 
         assert.soon(() => changeStream.hasNext());
-        assert.docEq(changeStream.next(), {
+        assertChangeStreamEventEq(changeStream.next(), {
             documentKey: {_id: -1000},
             fullDocument: {_id: -1000},
             ns: {db: db.getName(), coll: coll.getName()},
@@ -65,7 +63,7 @@
         });
 
         assert.soon(() => changeStream.hasNext());
-        assert.docEq(changeStream.next(), {
+        assertChangeStreamEventEq(changeStream.next(), {
             documentKey: {_id: 1001},
             fullDocument: {_id: 1001},
             ns: {db: db.getName(), coll: coll.getName()},
@@ -73,7 +71,7 @@
         });
 
         assert.soon(() => changeStream.hasNext());
-        assert.docEq(changeStream.next(), {
+        assertChangeStreamEventEq(changeStream.next(), {
             documentKey: {_id: -1002},
             fullDocument: {_id: -1002},
             ns: {db: db.getName(), coll: coll.getName()},
@@ -89,12 +87,14 @@
 
     // Wait for the aggregate cursor to appear in currentOp on the current shard.
     function waitForShardCursor(rs) {
-        assert.soon(
-            () => st.rs0.getPrimary()
-                      .getDB('admin')
-                      .aggregate(
-                          [{"$listLocalCursors": {}}, {"$match": {ns: mongosColl.getFullName()}}])
-                      .itcount() === 1);
+        assert.soon(() => st.rs0.getPrimary()
+                              .getDB('admin')
+                              .aggregate([
+                                  {"$currentOp": {"idleCursors": true}},
+                                  {"$match": {ns: mongosColl.getFullName(), type: "idleCursor"}}
+
+                              ])
+                              .itcount() === 1);
     }
     // Make sure the shard 0 $changeStream cursor is established before doing the first writes.
     waitForShardCursor(st.rs0);

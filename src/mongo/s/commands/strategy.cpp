@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2010 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -75,6 +77,7 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/cluster_find.h"
+#include "mongo/s/session_catalog_router.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/util/fail_point_service.h"
@@ -158,6 +161,9 @@ void invokeInTransactionRouter(OperationContext* opCtx,
                                CommandInvocation* invocation,
                                TransactionRouter* txnRouter,
                                rpc::ReplyBuilderInterface* result) {
+    // No-op if the transaction is not running with snapshot read concern.
+    txnRouter->setDefaultAtClusterTime(opCtx);
+
     try {
         invocation->run(opCtx, result);
     } catch (const DBException& e) {
@@ -168,7 +174,7 @@ void invokeInTransactionRouter(OperationContext* opCtx,
             throw;
         }
 
-        txnRouter->implicitlyAbortTransaction(opCtx);
+        txnRouter->implicitlyAbortTransaction(opCtx, e.toStatus());
         throw;
     }
 }
@@ -293,15 +299,27 @@ void execCommandClient(OperationContext* opCtx,
         } else {
             invocation->run(opCtx, result);
         }
+
+        auto body = result->getBodyBuilder();
+
+        MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
+            return CommandHelpers::shouldActivateFailCommandFailPoint(
+                       data, request.getCommandName(), opCtx->getClient()) &&
+                data.hasField("writeConcernError");
+        }) {
+            body.append(data.getData()["writeConcernError"]);
+        }
     }
 
     auto body = result->getBodyBuilder();
+
     bool ok = CommandHelpers::extractOrAppendOk(body);
     if (!ok) {
         c->incrementCommandsFailed();
 
         if (auto txnRouter = TransactionRouter::get(opCtx)) {
-            txnRouter->implicitlyAbortTransaction(opCtx);
+            txnRouter->implicitlyAbortTransaction(opCtx,
+                                                  getStatusFromCommandResult(body.asTempObj()));
         }
     }
 }
@@ -360,8 +378,21 @@ void runCommand(OperationContext* opCtx,
     // Fill out all currentOp details.
     CurOp::get(opCtx)->setGenericOpRequestDetails(opCtx, nss, command, request.body, opType);
 
+    auto osi = initializeOperationSessionInfo(opCtx,
+                                              request.body,
+                                              command->requiresAuth(),
+                                              command->attachLogicalSessionsToOpCtx(),
+                                              true,
+                                              true);
+    validateSessionOptions(osi, command->getName(), nss.db());
+
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    auto readConcernParseStatus = readConcernArgs.initialize(request.body);
+    auto readConcernParseStatus = [&]() {
+        // We must obtain the client lock to set the ReadConcernArgs on the operation
+        // context as it may be concurrently read by CurrentOp.
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        return readConcernArgs.initialize(request.body);
+    }();
     if (!readConcernParseStatus.isOK()) {
         auto builder = replyBuilder->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(builder, readConcernParseStatus);
@@ -378,13 +409,11 @@ void runCommand(OperationContext* opCtx,
                 !readConcernArgs.getArgsAtClusterTime());
     }
 
-    boost::optional<ScopedRouterSession> scopedSession;
-    auto osi =
-        initializeOperationSessionInfo(opCtx, request.body, command->requiresAuth(), true, true);
-
+    boost::optional<RouterOperationContextSession> routerSession;
     try {
-        if (osi && osi->getAutocommit()) {
-            scopedSession.emplace(opCtx);
+        CommandHelpers::evaluateFailCommandFailPoint(opCtx, commandName);
+        if (osi.getAutocommit()) {
+            routerSession.emplace(opCtx);
 
             auto txnRouter = TransactionRouter::get(opCtx);
             invariant(txnRouter);
@@ -392,12 +421,20 @@ void runCommand(OperationContext* opCtx,
             auto txnNumber = opCtx->getTxnNumber();
             invariant(txnNumber);
 
-            auto startTxnSetting = osi->getStartTransaction();
-            bool startTransaction = startTxnSetting ? *startTxnSetting : false;
+            auto transactionAction = ([&] {
+                auto startTxnSetting = osi.getStartTransaction();
+                if (startTxnSetting && *startTxnSetting) {
+                    return TransactionRouter::TransactionActions::kStart;
+                }
 
-            uassertStatusOK(CommandHelpers::canUseTransactions(nss.db(), command->getName()));
+                if (command->getName() == CommitTransaction::kCommandName) {
+                    return TransactionRouter::TransactionActions::kCommit;
+                }
 
-            txnRouter->beginOrContinueTxn(opCtx, *txnNumber, startTransaction);
+                return TransactionRouter::TransactionActions::kContinue;
+            })();
+
+            txnRouter->beginOrContinueTxn(opCtx, *txnNumber, transactionAction);
         }
 
         for (int tries = 0;; ++tries) {
@@ -415,6 +452,12 @@ void runCommand(OperationContext* opCtx,
             replyBuilder->reset();
             try {
                 execCommandClient(opCtx, invocation.get(), request, replyBuilder);
+
+                auto responseBuilder = replyBuilder->getBodyBuilder();
+                if (auto txnRouter = TransactionRouter::get(opCtx)) {
+                    txnRouter->appendRecoveryToken(&responseBuilder);
+                }
+
                 return;
             } catch (const ExceptionForCat<ErrorCategory::NeedRetargettingError>& ex) {
                 const auto staleNs = [&] {
@@ -422,6 +465,14 @@ void runCommand(OperationContext* opCtx,
                         return staleInfo->getNss();
                     } else if (auto implicitCreateInfo =
                                    ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
+                        // Requests that attempt to implicitly create a collection in a transaction
+                        // should always fail with OperationNotSupportedInTransaction - this
+                        // assertion is only meant to safeguard that assumption.
+                        uassert(50983,
+                                str::stream() << "Cannot handle exception in a transaction: "
+                                              << ex.toStatus(),
+                                !TransactionRouter::get(opCtx));
+
                         return implicitCreateInfo->getNss();
                     } else {
                         throw;
@@ -430,7 +481,13 @@ void runCommand(OperationContext* opCtx,
 
                 // Send setShardVersion on this thread's versioned connections to shards (to support
                 // commands that use the legacy (ShardConnection) versioning protocol).
-                if (!MONGO_FAIL_POINT(doNotRefreshShardsOnRetargettingError)) {
+                //
+                // Versioned connections are a legacy concept, which is never used from code running
+                // under a transaction (see the invariant inside ShardConnection). Because of this,
+                // the retargeting error could not have come from a ShardConnection, so we don't
+                // need to reset the connection's in-memory state.
+                if (!MONGO_FAIL_POINT(doNotRefreshShardsOnRetargettingError) &&
+                    !TransactionRouter::get(opCtx)) {
                     ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
                 }
 
@@ -439,11 +496,11 @@ void runCommand(OperationContext* opCtx,
                 // Update transaction tracking state for a possible retry. Throws and aborts the
                 // transaction if it cannot continue.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
-                    auto abortGuard =
-                        MakeGuard([&] { txnRouter->implicitlyAbortTransaction(opCtx); });
+                    auto abortGuard = makeGuard(
+                        [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
                     handleCanRetryInTransaction(opCtx, txnRouter, canRetry, ex);
-                    txnRouter->onStaleShardOrDbError(commandName);
-                    abortGuard.Dismiss();
+                    txnRouter->onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
+                    abortGuard.dismiss();
                 }
 
                 if (canRetry) {
@@ -458,11 +515,11 @@ void runCommand(OperationContext* opCtx,
                 // Update transaction tracking state for a possible retry. Throws and aborts the
                 // transaction if it cannot continue.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
-                    auto abortGuard =
-                        MakeGuard([&] { txnRouter->implicitlyAbortTransaction(opCtx); });
+                    auto abortGuard = makeGuard(
+                        [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
                     handleCanRetryInTransaction(opCtx, txnRouter, canRetry, ex);
-                    txnRouter->onStaleShardOrDbError(commandName);
-                    abortGuard.Dismiss();
+                    txnRouter->onStaleShardOrDbError(opCtx, commandName, ex.toStatus());
+                    abortGuard.dismiss();
                 }
 
                 if (canRetry) {
@@ -475,11 +532,11 @@ void runCommand(OperationContext* opCtx,
                 // Update transaction tracking state for a possible retry. Throws and aborts the
                 // transaction if it cannot continue.
                 if (auto txnRouter = TransactionRouter::get(opCtx)) {
-                    auto abortGuard =
-                        MakeGuard([&] { txnRouter->implicitlyAbortTransaction(opCtx); });
+                    auto abortGuard = makeGuard(
+                        [&] { txnRouter->implicitlyAbortTransaction(opCtx, ex.toStatus()); });
                     handleCanRetryInTransaction(opCtx, txnRouter, canRetry, ex);
-                    txnRouter->onSnapshotError();
-                    abortGuard.Dismiss();
+                    txnRouter->onSnapshotError(opCtx, ex.toStatus());
+                    abortGuard.dismiss();
                 }
 
                 if (canRetry) {
@@ -492,7 +549,7 @@ void runCommand(OperationContext* opCtx,
     } catch (const DBException& e) {
         command->incrementCommandsFailed();
         LastError::get(opCtx->getClient()).setLastError(e.code(), e.reason());
-        auto errorLabels = getErrorLabels(osi, command->getName(), e.code());
+        auto errorLabels = getErrorLabels(osi, command->getName(), e.code(), false);
         errorBuilder->appendElements(errorLabels);
         throw;
     }
@@ -858,7 +915,13 @@ void Strategy::explainFind(OperationContext* opCtx,
 
             // Send setShardVersion on this thread's versioned connections to shards (to support
             // commands that use the legacy (ShardConnection) versioning protocol).
-            if (!MONGO_FAIL_POINT(doNotRefreshShardsOnRetargettingError)) {
+            //
+            // Versioned connections are a legacy concept, which is never used from code running
+            // under a transaction (see the invariant inside ShardConnection). Because of this, the
+            // retargeting error could not have come from a ShardConnection, so we don't need to
+            // reset the connection's in-memory state.
+            if (!MONGO_FAIL_POINT(doNotRefreshShardsOnRetargettingError) &&
+                !TransactionRouter::get(opCtx)) {
                 ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
             }
 

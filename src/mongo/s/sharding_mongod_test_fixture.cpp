@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -98,8 +100,8 @@ ShardingMongodTestFixture::~ShardingMongodTestFixture() = default;
 void ShardingMongodTestFixture::setUp() {
     ServiceContextMongoDTest::setUp();
 
-    auto service = getServiceContext();
-    _opCtx = cc().makeOperationContext();
+    const auto service = getServiceContext();
+    _opCtx = makeOperationContext();
 
     // Set up this node as part of a replica set.
 
@@ -170,18 +172,12 @@ std::unique_ptr<executor::TaskExecutorPool> ShardingMongodTestFixture::makeTaskE
     // again just the (single) thread the unit test is running on. Therefore, all tasks, local and
     // remote, must be carried out synchronously by the test thread.
     auto fixedTaskExecutor = makeThreadPoolTestExecutor(std::move(netForFixedTaskExecutor));
-
     _networkTestEnv = stdx::make_unique<NetworkTestEnv>(fixedTaskExecutor.get(), _mockNetwork);
 
-    // Set up a NetworkInterfaceMock for the (one) arbitrary TaskExecutor that will go in the set
-    // of arbitrary TaskExecutors.
-    auto netForArbitraryExecutor = stdx::make_unique<executor::NetworkInterfaceMock>();
-
     // Set up (one) TaskExecutor for the set of arbitrary TaskExecutors.
-    auto arbitraryExecutorForExecutorPool =
-        makeThreadPoolTestExecutor(std::move(netForArbitraryExecutor));
     std::vector<std::unique_ptr<executor::TaskExecutor>> arbitraryExecutorsForExecutorPool;
-    arbitraryExecutorsForExecutorPool.emplace_back(std::move(arbitraryExecutorForExecutorPool));
+    arbitraryExecutorsForExecutorPool.emplace_back(
+        makeThreadPoolTestExecutor(stdx::make_unique<executor::NetworkInterfaceMock>()));
 
     // Set up the TaskExecutorPool with the fixed TaskExecutor and set of arbitrary TaskExecutors.
     auto executorPool = stdx::make_unique<executor::TaskExecutorPool>();
@@ -361,11 +357,6 @@ DistLockManager* ShardingMongodTestFixture::distLock() const {
 RemoteCommandTargeterFactoryMock* ShardingMongodTestFixture::targeterFactory() const {
     invariant(_targeterFactory);
     return _targeterFactory;
-}
-
-OperationContext* ShardingMongodTestFixture::operationContext() const {
-    invariant(_opCtx);
-    return _opCtx.get();
 }
 
 void ShardingMongodTestFixture::onCommand(NetworkTestEnv::OnCommandFunction func) {

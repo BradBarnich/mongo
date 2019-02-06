@@ -1,37 +1,66 @@
+
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_out_gen.h"
+#include "mongo/db/write_concern_options.h"
+#include "mongo/s/chunk_version.h"
 
 namespace mongo {
+
+/**
+ * Manipulates the state of the OperationContext so that while this object is in scope, reads and
+ * writes will use a local read concern and see the latest version of the data. Resets the
+ * OperationContext back to its original state upon destruction.
+ */
+class LocalReadConcernBlock {
+    OperationContext* _opCtx;
+    repl::ReadConcernArgs _originalArgs;
+    RecoveryUnit::ReadSource _originalSource;
+
+public:
+    LocalReadConcernBlock(OperationContext* opCtx) : _opCtx(opCtx) {
+        _originalArgs = repl::ReadConcernArgs::get(_opCtx);
+        _originalSource = _opCtx->recoveryUnit()->getTimestampReadSource();
+
+        repl::ReadConcernArgs::get(_opCtx) = repl::ReadConcernArgs();
+        _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::kUnset);
+    }
+
+    ~LocalReadConcernBlock() {
+        repl::ReadConcernArgs::get(_opCtx) = _originalArgs;
+        _opCtx->recoveryUnit()->setTimestampReadSource(_originalSource);
+    }
+};
 
 /**
  * Abstract class for the $out aggregation stage.
@@ -66,10 +95,17 @@ public:
         bool _allowShardedOutNss;
     };
 
+    /**
+     * Builds a new $out stage which will spill all documents into 'outputNs' as inserts. If
+     * 'targetCollectionVersion' is provided then processing will stop with an error if the
+     * collection's epoch changes during the course of execution. This is used as a mechanism to
+     * prevent the shard key from changing.
+     */
     DocumentSourceOut(NamespaceString outputNs,
                       const boost::intrusive_ptr<ExpressionContext>& expCtx,
                       WriteModeEnum mode,
-                      std::set<FieldPath> uniqueKey);
+                      std::set<FieldPath> uniqueKey,
+                      boost::optional<ChunkVersion> targetCollectionVersion);
 
     virtual ~DocumentSourceOut() = default;
 
@@ -163,7 +199,10 @@ public:
      * Writes the documents in 'batch' to the write namespace.
      */
     virtual void spill(BatchedObjects&& batch) {
-        pExpCtx->mongoProcessInterface->insert(pExpCtx, getWriteNs(), std::move(batch.objects));
+        LocalReadConcernBlock readLocal(pExpCtx->opCtx);
+
+        pExpCtx->mongoProcessInterface->insert(
+            pExpCtx, getWriteNs(), std::move(batch.objects), _writeConcern, _targetEpoch());
     };
 
     /**
@@ -178,7 +217,8 @@ public:
         NamespaceString outputNs,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         WriteModeEnum,
-        std::set<FieldPath> uniqueKey = std::set<FieldPath>{"_id"});
+        std::set<FieldPath> uniqueKey = std::set<FieldPath>{"_id"},
+        boost::optional<ChunkVersion> targetCollectionVersion = boost::none);
 
     /**
      * Parses a $out stage from the user-supplied BSON.
@@ -186,11 +226,49 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
+protected:
+    // Stash the writeConcern of the original command as the operation context may change by the
+    // time we start to spill $out writes. This is because certain aggregations (e.g. $exchange)
+    // establish cursors with batchSize 0 then run subsequent getMore's which use a new operation
+    // context. The getMore's will not have an attached writeConcern however we still want to
+    // respect the writeConcern of the original command.
+    WriteConcernOptions _writeConcern;
+
+    const NamespaceString _outputNs;
+    boost::optional<ChunkVersion> _targetCollectionVersion;
+
+    boost::optional<OID> _targetEpoch() {
+        return _targetCollectionVersion ? boost::optional<OID>(_targetCollectionVersion->epoch())
+                                        : boost::none;
+    }
+
 private:
+    /**
+     * If 'spec' does not specify a uniqueKey, uses the sharding catalog to pick a default key of
+     * the shard key + _id. Returns a pair of the uniqueKey (either from the spec or generated), and
+     * an optional ChunkVersion, populated with the version stored in the sharding catalog when we
+     * asked for the shard key.
+     */
+    static std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>> resolveUniqueKeyOnMongoS(
+        const boost::intrusive_ptr<ExpressionContext>&,
+        const DocumentSourceOutSpec& spec,
+        const NamespaceString& outputNs);
+
+    /**
+     * Ensures that 'spec' contains a uniqueKey which has a supporting index - either because the
+     * uniqueKey was sent from mongos or because there is a corresponding unique index. Returns the
+     * target ChunkVersion already attached to 'spec', but verifies that this node's cached routing
+     * table agrees on the epoch for that version before returning. Throws a StaleConfigException if
+     * not.
+     */
+    static std::pair<std::set<FieldPath>, boost::optional<ChunkVersion>> resolveUniqueKeyOnMongoD(
+        const boost::intrusive_ptr<ExpressionContext>&,
+        const DocumentSourceOutSpec& spec,
+        const NamespaceString& outputNs);
+
     bool _initialized = false;
     bool _done = false;
 
-    const NamespaceString _outputNs;
     WriteModeEnum _mode;
 
     // Holds the unique key used for uniquely identifying documents. There must exist a unique index

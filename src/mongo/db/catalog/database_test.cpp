@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,12 +34,13 @@
 
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
@@ -164,7 +167,7 @@ TEST_F(DatabaseTest, CreateCollectionThrowsExceptionWhenDatabaseIsInADropPending
                 db->createCollection(_opCtx.get(), _nss.ns()),
                 AssertionException,
                 ErrorCodes::DatabaseDropPending,
-                (StringBuilder() << "Cannot create collection " << _nss.ns()
+                (StringBuilder() << "Cannot create collection " << _nss
                                  << " - database is in the process of being dropped.")
                     .stringData());
         });
@@ -297,13 +300,6 @@ void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationCont
             wuow.commit();
         }
 
-        MultiIndexBlock indexer(opCtx, collection);
-        ON_BLOCK_EXIT([&indexer, opCtx] {
-            WriteUnitOfWork wuow(opCtx);
-            indexer.commit();
-            wuow.commit();
-        });
-
         auto indexCatalog = collection->getIndexCatalog();
         ASSERT_EQUALS(indexCatalog->numIndexesInProgress(opCtx), 0);
         auto indexInfoObj = BSON(
@@ -311,7 +307,20 @@ void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationCont
                 << "a_1"
                 << "ns"
                 << nss.ns());
-        ASSERT_OK(indexer.init(indexInfoObj).getStatus());
+
+        auto indexBuildBlock =
+            indexCatalog->createIndexBuildBlock(opCtx, indexInfoObj, IndexBuildMethod::kHybrid);
+        {
+            WriteUnitOfWork wuow(opCtx);
+            ASSERT_OK(indexBuildBlock->init());
+            wuow.commit();
+        }
+        ON_BLOCK_EXIT([&indexBuildBlock, opCtx] {
+            WriteUnitOfWork wuow(opCtx);
+            indexBuildBlock->success();
+            wuow.commit();
+        });
+
         ASSERT_GREATER_THAN(indexCatalog->numIndexesInProgress(opCtx), 0);
 
         WriteUnitOfWork wuow(opCtx);
@@ -487,7 +496,7 @@ TEST_F(DatabaseTest, AutoGetDBSucceedsWithDeadlineMin) {
     Lock::DBLock lock(_opCtx.get(), nss.db(), MODE_X);
     ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
     try {
-        AutoGetDb db(_opCtx.get(), nss.db(), MODE_X, Date_t::min());
+        AutoGetDb db(_opCtx.get(), nss.db(), MODE_X, Date_t());
         ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
     } catch (const ExceptionFor<ErrorCodes::LockTimeout>&) {
         FAIL("Should get the db within the timeout");
@@ -516,7 +525,7 @@ TEST_F(DatabaseTest, AutoGetCollectionForReadCommandSucceedsWithDeadlineMin) {
     ASSERT(_opCtx.get()->lockState()->isCollectionLockedForMode(nss.toString(), MODE_X));
     try {
         AutoGetCollectionForReadCommand db(
-            _opCtx.get(), nss, AutoGetCollection::kViewsForbidden, Date_t::min());
+            _opCtx.get(), nss, AutoGetCollection::kViewsForbidden, Date_t());
     } catch (const ExceptionFor<ErrorCodes::LockTimeout>&) {
         FAIL("Should get the db within the timeout");
     }
@@ -541,7 +550,7 @@ TEST_F(DatabaseTest, CreateCollectionProhibitsReplicatedCollectionsWithoutIdInde
                 db->createCollection(_opCtx.get(), _nss.ns(), options),
                 AssertionException,
                 50001,
-                (StringBuilder() << "autoIndexId:false is not allowed for collection " << _nss.ns()
+                (StringBuilder() << "autoIndexId:false is not allowed for collection " << _nss
                                  << " because it can be replicated")
                     .stringData());
         });

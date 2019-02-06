@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,6 +32,7 @@
 
 #include <memory>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
 #include "mongo/db/fts/fts_query.h"
 #include "mongo/db/jsobj.h"
@@ -48,6 +51,12 @@ class GeoNearExpression;
  */
 struct QuerySolutionNode {
     QuerySolutionNode() {}
+
+    /**
+     * Constructs a QuerySolutionNode with a single child.
+     */
+    QuerySolutionNode(std::unique_ptr<QuerySolutionNode> child) : children{child.release()} {}
+
     virtual ~QuerySolutionNode() {
         for (size_t i = 0; i < children.size(); ++i) {
             delete children[i];
@@ -505,6 +514,8 @@ struct IndexScanNode : public QuerySolutionNode {
     // If there's a 'returnKey' projection we add key metadata.
     bool addKeyMetadata;
 
+    bool shouldDedup = false;
+
     IndexBounds bounds;
 
     const CollatorInterface* queryCollator;
@@ -516,40 +527,26 @@ struct IndexScanNode : public QuerySolutionNode {
     std::set<StringData> multikeyFields;
 };
 
-struct ProjectionNode : public QuerySolutionNode {
-    /**
-     * We have a few implementations of the projection functionality.  The most general
-     * implementation 'DEFAULT' is much slower than the fast-path implementations
-     * below.  We only really have all the information available to choose a projection
-     * implementation at planning time.
-     */
-    enum ProjectionType {
-        // This is the most general implementation of the projection functionality.  It handles
-        // every case.
-        DEFAULT,
+/**
+ * We have a few implementations of the projection functionality. They are chosen by constructing
+ * a type derived from this abstract struct. The most general implementation 'ProjectionNodeDefault'
+ * is much slower than the fast-path implementations. We only really have all the information
+ * available to choose a projection implementation at planning time.
+ */
+struct ProjectionNode : QuerySolutionNode {
+    ProjectionNode(std::unique_ptr<QuerySolutionNode> child,
+                   const MatchExpression& fullExpression,
+                   BSONObj projection,
+                   ParsedProjection parsed)
+        : QuerySolutionNode(std::move(child)),
+          _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
+          fullExpression(fullExpression),
+          projection(std::move(projection)),
+          parsed(parsed) {}
 
-        // This is a fast-path for when the projection is fully covered by one index.
-        COVERED_ONE_INDEX,
+    void computeProperties() final;
 
-        // This is a fast-path for when the projection only has inclusions on non-dotted fields.
-        SIMPLE_DOC,
-    };
-
-    ProjectionNode(ParsedProjection proj)
-        : _sorts(SimpleBSONObjComparator::kInstance.makeBSONObjSet()),
-          fullExpression(NULL),
-          projType(DEFAULT),
-          parsed(proj) {}
-
-    virtual ~ProjectionNode() {}
-
-    virtual StageType getType() const {
-        return STAGE_PROJECTION;
-    }
-
-    virtual void computeProperties();
-
-    virtual void appendToString(mongoutils::str::stream* ss, int indent) const;
+    void appendToString(mongoutils::str::stream* ss, int indent) const final;
 
     /**
      * Data from the projection node is considered fetch iff the child provides fetched data.
@@ -580,27 +577,87 @@ struct ProjectionNode : public QuerySolutionNode {
         return _sorts;
     }
 
-    QuerySolutionNode* clone() const;
+protected:
+    void cloneProjectionData(ProjectionNode* copy) const;
+
+public:
+    /**
+     * Identify projectionImplementation type as a string.
+     */
+    virtual StringData projectionImplementationTypeToString() const = 0;
 
     BSONObjSet _sorts;
 
     // The full query tree.  Needed when we have positional operators.
     // Owned in the CanonicalQuery, not here.
-    MatchExpression* fullExpression;
+    const MatchExpression& fullExpression;
 
     // Given that we don't yet have a MatchExpression analogue for the expression language, we
     // use a BSONObj.
     BSONObj projection;
 
-    // What implementation of the projection algorithm should we use?
-    ProjectionType projType;
-
     ParsedProjection parsed;
+};
 
-    // Only meaningful if projType == COVERED_ONE_INDEX.  This is the key pattern of the index
-    // supplying our covered data.  We can pre-compute which fields to include and cache that
-    // data for later if we know we only have one index.
+/**
+ * This is the most general implementation of the projection functionality. It handles every case.
+ */
+struct ProjectionNodeDefault final : ProjectionNode {
+    using ProjectionNode::ProjectionNode;
+
+    StageType getType() const final {
+        return STAGE_PROJECTION_DEFAULT;
+    }
+
+    ProjectionNode* clone() const final;
+
+    StringData projectionImplementationTypeToString() const final {
+        return "DEFAULT"_sd;
+    }
+};
+
+/**
+ * This is a fast-path for when the projection is fully covered by one index.
+ */
+struct ProjectionNodeCovered final : ProjectionNode {
+    ProjectionNodeCovered(std::unique_ptr<QuerySolutionNode> child,
+                          const MatchExpression& fullExpression,
+                          BSONObj projection,
+                          ParsedProjection parsed,
+                          BSONObj coveredKeyObj)
+        : ProjectionNode(std::move(child), fullExpression, projection, parsed),
+          coveredKeyObj(std::move(coveredKeyObj)) {}
+
+    StageType getType() const final {
+        return STAGE_PROJECTION_COVERED;
+    }
+
+    ProjectionNode* clone() const final;
+
+    StringData projectionImplementationTypeToString() const final {
+        return "COVERED_ONE_INDEX"_sd;
+    }
+
+    // This is the key pattern of the index supplying our covered data. We can pre-compute which
+    // fields to include and cache that data for later if we know we only have one index.
     BSONObj coveredKeyObj;
+};
+
+/**
+ * This is a fast-path for when the projection only has inclusions on non-dotted fields.
+ */
+struct ProjectionNodeSimple final : ProjectionNode {
+    using ProjectionNode::ProjectionNode;
+
+    StageType getType() const final {
+        return STAGE_PROJECTION_SIMPLE;
+    }
+
+    ProjectionNode* clone() const final;
+
+    StringData projectionImplementationTypeToString() const final {
+        return "SIMPLE_DOC"_sd;
+    }
 };
 
 struct SortKeyGeneratorNode : public QuerySolutionNode {

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -93,13 +95,25 @@ public:
      * If 'validateForStorage' is true, ensures that modified elements do not violate depth or DBRef
      * constraints. Ensures that no paths in 'immutablePaths' are modified (though they may be
      * created, if they do not yet exist).
+     *
+     * The value of 'isInsert' controls whether $setOnInsert modifiers get applied.
+     *
+     * If 'modifiedPaths' is not null, this method will populate it with the set of paths that were
+     * either modified at runtime or present statically in the update modifiers. For arrays, the
+     * set will include only the path to the array if the length has changed. All paths encode array
+     * indexes explicitly.
+     *
+     * The caller must either provide a null pointer, or a non-null pointer to an empty field ref
+     * set.
      */
     Status update(StringData matchedField,
                   mutablebson::Document* doc,
                   bool validateForStorage,
                   const FieldRefSet& immutablePaths,
+                  bool isInsert,
                   BSONObj* logOpRec = nullptr,
-                  bool* docWasModified = nullptr);
+                  bool* docWasModified = nullptr,
+                  FieldRefSetWithStorage* modifiedPaths = nullptr);
 
     //
     // Accessors
@@ -116,10 +130,6 @@ public:
 
     bool fromOplogApplication() const;
     void setFromOplogApplication(bool fromOplogApplication);
-
-    void setInsert(bool insert) {
-        _insert = insert;
-    }
 
     mutablebson::Document& getDocument() {
         return _objDoc;
@@ -179,9 +189,6 @@ private:
 
     // Do any of the mods require positional match details when calling 'prepare'?
     bool _positional = false;
-
-    // Is this update going to be an upsert?
-    bool _insert = false;
 
     // The document used to represent or store the object being updated.
     mutablebson::Document _objDoc;

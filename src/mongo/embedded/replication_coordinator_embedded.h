@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -60,7 +62,8 @@ public:
 
     bool isReplEnabled() const override;
     bool isMasterForReportingPurposes() override;
-    bool isInPrimaryOrSecondaryState() const override;
+    bool isInPrimaryOrSecondaryState(OperationContext* opCtx) const override;
+    bool isInPrimaryOrSecondaryState_UNSAFE() const override;
 
     bool canAcceptWritesForDatabase(OperationContext* opCtx, StringData dbName) override;
     bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName) override;
@@ -101,6 +104,13 @@ public:
 
     Status checkIfWriteConcernCanBeSatisfied(const WriteConcernOptions&) const override;
 
+    Status checkIfCommitQuorumCanBeSatisfied(
+        const CommitQuorumOptions& commitQuorum) const override;
+
+    StatusWith<bool> checkIfCommitQuorumIsSatisfied(
+        const CommitQuorumOptions& commitQuorum,
+        const std::vector<HostAndPort>& commitReadyMembers) const override;
+
     void setMyLastAppliedOpTime(const repl::OpTime&) override;
     void setMyLastDurableOpTime(const repl::OpTime&) override;
 
@@ -119,12 +129,17 @@ public:
                                        boost::optional<Date_t>) override;
 
     Status waitUntilOpTimeForRead(OperationContext*, const repl::ReadConcernArgs&) override;
+    Status awaitOpTimeCommitted(OperationContext* opCtx, repl::OpTime opTime) override;
 
     OID getElectionId() override;
 
     int getMyId() const override;
 
+    HostAndPort getMyHostAndPort() const override;
+
     Status setFollowerMode(const repl::MemberState&) override;
+
+    Status setFollowerModeStrict(OperationContext* opCtx, const repl::MemberState&) override;
 
     ApplierState getApplierState() override;
 
@@ -198,8 +213,6 @@ public:
 
     bool getWriteConcernMajorityShouldJournal() override;
 
-    void summarizeAsHtml(repl::ReplSetHtmlSummary*) override;
-
     void dropAllSnapshots() override;
 
     long long getTerm() override;
@@ -216,14 +229,17 @@ public:
 
     size_t getNumUncommittedSnapshots() override;
 
-    repl::ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const override;
-    void setIndexPrefetchConfig(const repl::ReplSettings::IndexPrefetchConfig) override;
-
     Status stepUpIfEligible(bool skipDryRun) override;
 
     Status abortCatchupIfNeeded() override;
 
     void signalDropPendingCollectionsRemovedFromStorage() final;
+
+    boost::optional<Timestamp> getRecoveryTimestamp() override;
+
+    bool setContainsArbiter() const override;
+
+    void attemptToAdvanceStableTimestamp() override;
 
 private:
     // Back pointer to the ServiceContext that has started the instance.

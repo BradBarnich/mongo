@@ -1,25 +1,27 @@
 // sorted_data_interface_test_harness.cpp
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,12 +39,12 @@
 #include "mongo/unittest/unittest.h"
 
 auto mongo::SortedDataInterfaceHarnessHelper::newSortedDataInterface(
-    bool unique, std::initializer_list<IndexKeyEntry> toInsert)
+    bool unique, bool partial, std::initializer_list<IndexKeyEntry> toInsert)
     -> std::unique_ptr<SortedDataInterface> {
     invariant(std::is_sorted(
         toInsert.begin(), toInsert.end(), IndexEntryComparison(Ordering::make(BSONObj()))));
 
-    auto index = newSortedDataInterface(unique);
+    auto index = newSortedDataInterface(unique, partial);
     insertToIndex(this, index, toInsert);
     return index;
 }
@@ -72,7 +74,8 @@ namespace {
 
 TEST(SortedDataInterface, InsertWithDups1) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -104,7 +107,8 @@ TEST(SortedDataInterface, InsertWithDups1) {
 
 TEST(SortedDataInterface, InsertWithDups2) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -132,7 +136,8 @@ TEST(SortedDataInterface, InsertWithDups2) {
 
 TEST(SortedDataInterface, InsertWithDups3AndRollback) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -160,7 +165,8 @@ TEST(SortedDataInterface, InsertWithDups3AndRollback) {
 
 TEST(SortedDataInterface, InsertNoDups1) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(true));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/true, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -188,7 +194,8 @@ TEST(SortedDataInterface, InsertNoDups1) {
 
 TEST(SortedDataInterface, InsertNoDups2) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(true));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/true, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -216,7 +223,8 @@ TEST(SortedDataInterface, InsertNoDups2) {
 
 TEST(SortedDataInterface, Unindex1) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -281,7 +289,8 @@ TEST(SortedDataInterface, Unindex1) {
 
 TEST(SortedDataInterface, Unindex2Rollback) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -316,7 +325,8 @@ TEST(SortedDataInterface, Unindex2Rollback) {
 
 TEST(SortedDataInterface, CursorIterate1) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     int N = 5;
     for (int i = 0; i < N; i++) {
@@ -342,7 +352,8 @@ TEST(SortedDataInterface, CursorIterate1) {
 
 TEST(SortedDataInterface, CursorIterate1WithSaveRestore) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     int N = 5;
     for (int i = 0; i < N; i++) {
@@ -371,7 +382,8 @@ TEST(SortedDataInterface, CursorIterate1WithSaveRestore) {
 
 TEST(SortedDataInterface, CursorIterateAllDupKeysWithSaveRestore) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     int N = 5;
     for (int i = 0; i < N; i++) {
@@ -400,7 +412,8 @@ TEST(SortedDataInterface, CursorIterateAllDupKeysWithSaveRestore) {
 
 TEST(SortedDataInterface, Locate1) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     BSONObj key = BSON("" << 1);
     RecordId loc(5, 16);
@@ -429,7 +442,8 @@ TEST(SortedDataInterface, Locate1) {
 
 TEST(SortedDataInterface, Locate2) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -455,7 +469,8 @@ TEST(SortedDataInterface, Locate2) {
 
 TEST(SortedDataInterface, Locate2Empty) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     {
         const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -486,7 +501,8 @@ TEST(SortedDataInterface, Locate2Empty) {
 
 TEST(SortedDataInterface, Locate3Descending) {
     const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
-    const std::unique_ptr<SortedDataInterface> sorted(harnessHelper->newSortedDataInterface(false));
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
     auto buildEntry = [](int i) { return IndexKeyEntry(BSON("" << i), RecordId(1, i * 2)); };
 
@@ -529,7 +545,8 @@ TEST(SortedDataInterface, Locate3Descending) {
 
 TEST(SortedDataInterface, Locate4) {
     const auto harnessHelper = newSortedDataInterfaceHarnessHelper();
-    auto sorted = harnessHelper->newSortedDataInterface(false,
+    auto sorted = harnessHelper->newSortedDataInterface(/*unique=*/false,
+                                                        /*partial=*/false,
                                                         {
                                                             {BSON("" << 1), RecordId(1, 2)},
                                                             {BSON("" << 1), RecordId(1, 4)},

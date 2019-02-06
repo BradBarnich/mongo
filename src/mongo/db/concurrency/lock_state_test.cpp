@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,7 +38,6 @@
 #include "mongo/config.h"
 #include "mongo/db/concurrency/lock_manager_test_help.h"
 #include "mongo/db/concurrency/locker.h"
-#include "mongo/db/operation_context_noop.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
@@ -161,6 +161,43 @@ TEST(LockerImpl, saveAndRestoreGlobal) {
 }
 
 /**
+ * Test that saveLockerImpl can save and restore the RSTL.
+ */
+TEST(LockerImpl, saveAndRestoreRSTL) {
+    Locker::LockSnapshot lockInfo;
+
+    LockerImpl locker;
+
+    const ResourceId resIdDatabase(RESOURCE_DATABASE, "TestDB"_sd);
+
+    // Acquire locks.
+    ASSERT_EQUALS(LOCK_OK, locker.lock(resourceIdReplicationStateTransitionLock, MODE_IX));
+    locker.lockGlobal(MODE_IX);
+    ASSERT_EQUALS(LOCK_OK, locker.lock(resIdDatabase, MODE_IX));
+
+    // Save the lock state.
+    locker.saveLockStateAndUnlock(&lockInfo);
+    ASSERT(!locker.isLocked());
+    ASSERT_EQUALS(MODE_IX, lockInfo.globalMode);
+
+    // Check locks are unlocked.
+    ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resourceIdReplicationStateTransitionLock));
+    ASSERT(!locker.isLocked());
+    ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdDatabase));
+
+    // Restore the lock(s) we had.
+    locker.restoreLockState(lockInfo);
+
+    // Check locks are re-locked.
+    ASSERT(locker.isLocked());
+    ASSERT_EQUALS(MODE_IX, locker.getLockMode(resIdDatabase));
+    ASSERT_EQUALS(MODE_IX, locker.getLockMode(resourceIdReplicationStateTransitionLock));
+
+    ASSERT(locker.unlockGlobal());
+    ASSERT(locker.unlock(resourceIdReplicationStateTransitionLock));
+}
+
+/**
  * Test that we don't unlock when we have the global lock more than once.
  */
 TEST(LockerImpl, saveAndRestoreGlobalAcquiredTwice) {
@@ -217,6 +254,138 @@ TEST(LockerImpl, saveAndRestoreDBAndCollection) {
     ASSERT(locker.unlockGlobal());
 }
 
+TEST(LockerImpl, releaseWriteUnitOfWork) {
+    Locker::LockSnapshot lockInfo;
+
+    LockerImpl locker;
+
+    const ResourceId resIdDatabase(RESOURCE_DATABASE, "TestDB"_sd);
+    const ResourceId resIdCollection(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+
+    locker.beginWriteUnitOfWork();
+    // Lock some stuff.
+    locker.lockGlobal(MODE_IX);
+    ASSERT_EQUALS(LOCK_OK, locker.lock(resIdDatabase, MODE_IX));
+    ASSERT_EQUALS(LOCK_OK, locker.lock(resIdCollection, MODE_X));
+    // Unlock them so that they will be pending to unlock.
+    ASSERT_FALSE(locker.unlock(resIdCollection));
+    ASSERT_FALSE(locker.unlock(resIdDatabase));
+    ASSERT_FALSE(locker.unlockGlobal());
+
+    ASSERT(locker.releaseWriteUnitOfWork(&lockInfo));
+
+    // Things shouldn't be locked anymore.
+    ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdDatabase));
+    ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdCollection));
+    ASSERT_FALSE(locker.isLocked());
+
+    // Destructor should succeed since the locker's state should be empty.
+}
+
+TEST(LockerImpl, restoreWriteUnitOfWork) {
+    Locker::LockSnapshot lockInfo;
+
+    LockerImpl locker;
+
+    const ResourceId resIdDatabase(RESOURCE_DATABASE, "TestDB"_sd);
+    const ResourceId resIdCollection(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+
+    locker.beginWriteUnitOfWork();
+    // Lock some stuff.
+    locker.lockGlobal(MODE_IX);
+    ASSERT_EQUALS(LOCK_OK, locker.lock(resIdDatabase, MODE_IX));
+    ASSERT_EQUALS(LOCK_OK, locker.lock(resIdCollection, MODE_X));
+    // Unlock them so that they will be pending to unlock.
+    ASSERT_FALSE(locker.unlock(resIdCollection));
+    ASSERT_FALSE(locker.unlock(resIdDatabase));
+    ASSERT_FALSE(locker.unlockGlobal());
+
+    ASSERT(locker.releaseWriteUnitOfWork(&lockInfo));
+
+    // Things shouldn't be locked anymore.
+    ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdDatabase));
+    ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdCollection));
+    ASSERT_FALSE(locker.isLocked());
+
+    // Restore lock state.
+    locker.restoreWriteUnitOfWork(nullptr, lockInfo);
+
+    // Make sure things were re-locked.
+    ASSERT_EQUALS(MODE_IX, locker.getLockMode(resIdDatabase));
+    ASSERT_EQUALS(MODE_X, locker.getLockMode(resIdCollection));
+    ASSERT(locker.isLocked());
+
+    locker.endWriteUnitOfWork();
+
+    ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdDatabase));
+    ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdCollection));
+    ASSERT_FALSE(locker.isLocked());
+}
+
+TEST(LockerImpl, releaseAndRestoreReadOnlyWriteUnitOfWork) {
+    Locker::LockSnapshot lockInfo;
+
+    LockerImpl locker;
+
+    const ResourceId resIdDatabase(RESOURCE_DATABASE, "TestDB"_sd);
+    const ResourceId resIdCollection(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+
+    // Snapshot transactions delay shared locks as well.
+    locker.setSharedLocksShouldTwoPhaseLock(true);
+
+    locker.beginWriteUnitOfWork();
+    // Lock some stuff in IS mode.
+    locker.lockGlobal(MODE_IS);
+    ASSERT_EQUALS(LOCK_OK, locker.lock(resIdDatabase, MODE_IS));
+    ASSERT_EQUALS(LOCK_OK, locker.lock(resIdCollection, MODE_IS));
+    // Unlock them.
+    ASSERT_FALSE(locker.unlock(resIdCollection));
+    ASSERT_FALSE(locker.unlock(resIdDatabase));
+    ASSERT_FALSE(locker.unlockGlobal());
+    ASSERT_EQ(3u, locker.numResourcesToUnlockAtEndUnitOfWorkForTest());
+
+    // Things shouldn't be locked anymore.
+    ASSERT_TRUE(locker.releaseWriteUnitOfWork(&lockInfo));
+
+    ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdDatabase));
+    ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdCollection));
+    ASSERT_FALSE(locker.isLocked());
+
+    // Restore lock state.
+    locker.restoreWriteUnitOfWork(nullptr, lockInfo);
+
+    ASSERT_EQUALS(MODE_IS, locker.getLockMode(resIdDatabase));
+    ASSERT_EQUALS(MODE_IS, locker.getLockMode(resIdCollection));
+    ASSERT_TRUE(locker.isLocked());
+
+    locker.endWriteUnitOfWork();
+
+    ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdDatabase));
+    ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdCollection));
+    ASSERT_FALSE(locker.isLocked());
+}
+
+TEST(LockerImpl, releaseAndRestoreEmptyWriteUnitOfWork) {
+    Locker::LockSnapshot lockInfo;
+    LockerImpl locker;
+
+    // Snapshot transactions delay shared locks as well.
+    locker.setSharedLocksShouldTwoPhaseLock(true);
+
+    locker.beginWriteUnitOfWork();
+
+    // Nothing to yield.
+    ASSERT_FALSE(locker.releaseWriteUnitOfWork(&lockInfo));
+    ASSERT_FALSE(locker.isLocked());
+
+    // Restore lock state.
+    locker.restoreWriteUnitOfWork(nullptr, lockInfo);
+    ASSERT_FALSE(locker.isLocked());
+
+    locker.endWriteUnitOfWork();
+    ASSERT_FALSE(locker.isLocked());
+}
+
 TEST(LockerImpl, DefaultLocker) {
     const ResourceId resId(RESOURCE_DATABASE, "TestDB"_sd);
 
@@ -235,57 +404,6 @@ TEST(LockerImpl, DefaultLocker) {
     ASSERT(locker.unlockGlobal());
 }
 
-TEST(LockerImpl, CanceledDeadlockUnblocks) {
-    const ResourceId db1(RESOURCE_DATABASE, "db1"_sd);
-    const ResourceId db2(RESOURCE_DATABASE, "db2"_sd);
-
-    LockerImpl locker1;
-    LockerImpl locker2;
-    LockerImpl locker3;
-
-    ASSERT(LOCK_OK == locker1.lockGlobal(MODE_IX));
-    ASSERT(LOCK_OK == locker1.lock(db1, MODE_S));
-
-    ASSERT(LOCK_OK == locker2.lockGlobal(MODE_IX));
-    ASSERT(LOCK_OK == locker2.lock(db2, MODE_X));
-
-    // Set up locker1 and locker2 for deadlock
-    ASSERT(LOCK_WAITING == locker1.lockBegin(nullptr, db2, MODE_X));
-    ASSERT(LOCK_WAITING == locker2.lockBegin(nullptr, db1, MODE_X));
-
-    // Locker3 blocks behind locker 2
-    ASSERT(LOCK_OK == locker3.lockGlobal(MODE_IX));
-    ASSERT(LOCK_WAITING == locker3.lockBegin(nullptr, db1, MODE_S));
-
-    // Detect deadlock, canceling our request
-    ASSERT(
-        LOCK_DEADLOCK ==
-        locker2.lockComplete(db1, MODE_X, Date_t::now() + Milliseconds(1), /*checkDeadlock*/ true));
-
-    // Now locker3 must be able to complete its request
-    ASSERT(LOCK_OK ==
-           locker3.lockComplete(
-               db1, MODE_S, Date_t::now() + Milliseconds(1), /*checkDeadlock*/ false));
-
-    // Locker1 still can't complete its request
-    ASSERT(LOCK_TIMEOUT ==
-           locker1.lockComplete(db2, MODE_X, Date_t::now() + Milliseconds(1), false));
-
-    // Check ownership for db1
-    ASSERT(locker1.getLockMode(db1) == MODE_S);
-    ASSERT(locker2.getLockMode(db1) == MODE_NONE);
-    ASSERT(locker3.getLockMode(db1) == MODE_S);
-
-    // Check ownership for db2
-    ASSERT(locker1.getLockMode(db2) == MODE_NONE);
-    ASSERT(locker2.getLockMode(db2) == MODE_X);
-    ASSERT(locker3.getLockMode(db2) == MODE_NONE);
-
-    ASSERT(locker1.unlockGlobal());
-    ASSERT(locker2.unlockGlobal());
-    ASSERT(locker3.unlockGlobal());
-}
-
 TEST(LockerImpl, SharedLocksShouldTwoPhaseLockIsTrue) {
     // Test that when setSharedLocksShouldTwoPhaseLock is true and we are in a WUOW, unlock on IS
     // and S locks are postponed until endWriteUnitOfWork() is called. Mode IX and X locks always
@@ -302,6 +420,9 @@ TEST(LockerImpl, SharedLocksShouldTwoPhaseLockIsTrue) {
 
     ASSERT_EQ(LOCK_OK, locker.lockGlobal(MODE_IS));
     ASSERT_EQ(locker.getLockMode(globalResId), MODE_IS);
+
+    ASSERT_EQ(LOCK_OK, locker.lock(resourceIdReplicationStateTransitionLock, MODE_IS));
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_IS);
 
     ASSERT_EQ(LOCK_OK, locker.lock(resId1, MODE_IS));
     ASSERT_EQ(LOCK_OK, locker.lock(resId2, MODE_IX));
@@ -323,6 +444,9 @@ TEST(LockerImpl, SharedLocksShouldTwoPhaseLockIsTrue) {
     ASSERT_EQ(locker.getLockMode(resId3), MODE_S);
     ASSERT_EQ(locker.getLockMode(resId4), MODE_X);
 
+    ASSERT_FALSE(locker.unlock(resourceIdReplicationStateTransitionLock));
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_IS);
+
     ASSERT_FALSE(locker.unlockGlobal());
     ASSERT_EQ(locker.getLockMode(globalResId), MODE_IS);
 
@@ -332,6 +456,7 @@ TEST(LockerImpl, SharedLocksShouldTwoPhaseLockIsTrue) {
     ASSERT_EQ(locker.getLockMode(resId2), MODE_NONE);
     ASSERT_EQ(locker.getLockMode(resId3), MODE_NONE);
     ASSERT_EQ(locker.getLockMode(resId4), MODE_NONE);
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_NONE);
     ASSERT_EQ(locker.getLockMode(globalResId), MODE_NONE);
 }
 
@@ -349,6 +474,9 @@ TEST(LockerImpl, ModeIXAndXLockParticipatesInTwoPhaseLocking) {
 
     ASSERT_EQ(LOCK_OK, locker.lockGlobal(MODE_IX));
     ASSERT_EQ(locker.getLockMode(globalResId), MODE_IX);
+
+    ASSERT_EQ(LOCK_OK, locker.lock(resourceIdReplicationStateTransitionLock, MODE_IX));
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_IX);
 
     ASSERT_EQ(LOCK_OK, locker.lock(resId1, MODE_IS));
     ASSERT_EQ(LOCK_OK, locker.lock(resId2, MODE_IX));
@@ -370,6 +498,9 @@ TEST(LockerImpl, ModeIXAndXLockParticipatesInTwoPhaseLocking) {
     ASSERT_EQ(locker.getLockMode(resId3), MODE_NONE);
     ASSERT_EQ(locker.getLockMode(resId4), MODE_X);
 
+    ASSERT_FALSE(locker.unlock(resourceIdReplicationStateTransitionLock));
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_IX);
+
     ASSERT_FALSE(locker.unlockGlobal());
     ASSERT_EQ(locker.getLockMode(globalResId), MODE_IX);
 
@@ -377,7 +508,99 @@ TEST(LockerImpl, ModeIXAndXLockParticipatesInTwoPhaseLocking) {
 
     ASSERT_EQ(locker.getLockMode(resId2), MODE_NONE);
     ASSERT_EQ(locker.getLockMode(resId4), MODE_NONE);
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_NONE);
     ASSERT_EQ(locker.getLockMode(globalResId), MODE_NONE);
+}
+
+TEST(LockerImpl, RSTLUnlocksWithNestedLock) {
+    LockerImpl locker;
+
+    ASSERT_EQ(LOCK_OK, locker.lock(resourceIdReplicationStateTransitionLock, MODE_IX));
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_IX);
+
+    locker.beginWriteUnitOfWork();
+
+    // Do a nested lock acquisition.
+    ASSERT_EQ(LOCK_OK, locker.lock(resourceIdReplicationStateTransitionLock, MODE_IX));
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_IX);
+
+    ASSERT(locker.unlockRSTLforPrepare());
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_NONE);
+
+    ASSERT_FALSE(locker.unlockRSTLforPrepare());
+
+    locker.endWriteUnitOfWork();
+
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_NONE);
+
+    ASSERT_FALSE(locker.unlockRSTLforPrepare());
+    ASSERT_FALSE(locker.unlock(resourceIdReplicationStateTransitionLock));
+}
+
+TEST(LockerImpl, RSTLModeIXWithTwoPhaseLockingCanBeUnlockedWhenPrepared) {
+    LockerImpl locker;
+
+    ASSERT_EQ(LOCK_OK, locker.lock(resourceIdReplicationStateTransitionLock, MODE_IX));
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_IX);
+
+    locker.beginWriteUnitOfWork();
+
+    ASSERT_FALSE(locker.unlock(resourceIdReplicationStateTransitionLock));
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_IX);
+
+    ASSERT(locker.unlockRSTLforPrepare());
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_NONE);
+
+    ASSERT_FALSE(locker.unlockRSTLforPrepare());
+
+    locker.endWriteUnitOfWork();
+
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_NONE);
+
+    ASSERT_FALSE(locker.unlockRSTLforPrepare());
+    ASSERT_FALSE(locker.unlock(resourceIdReplicationStateTransitionLock));
+}
+
+TEST(LockerImpl, RSTLModeISWithTwoPhaseLockingCanBeUnlockedWhenPrepared) {
+    LockerImpl locker;
+
+    ASSERT_EQ(LOCK_OK, locker.lock(resourceIdReplicationStateTransitionLock, MODE_IS));
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_IS);
+
+    locker.beginWriteUnitOfWork();
+
+    ASSERT(locker.unlockRSTLforPrepare());
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_NONE);
+
+    ASSERT_FALSE(locker.unlockRSTLforPrepare());
+
+    locker.endWriteUnitOfWork();
+
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_NONE);
+
+    ASSERT_FALSE(locker.unlockRSTLforPrepare());
+    ASSERT_FALSE(locker.unlock(resourceIdReplicationStateTransitionLock));
+}
+
+TEST(LockerImpl, RSTLTwoPhaseLockingBehaviorModeIS) {
+    LockerImpl locker;
+
+    ASSERT_EQ(LOCK_OK, locker.lock(resourceIdReplicationStateTransitionLock, MODE_IS));
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_IS);
+
+    locker.beginWriteUnitOfWork();
+
+    ASSERT_TRUE(locker.unlock(resourceIdReplicationStateTransitionLock));
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_NONE);
+
+    ASSERT_FALSE(locker.unlockRSTLforPrepare());
+
+    locker.endWriteUnitOfWork();
+
+    ASSERT_EQ(locker.getLockMode(resourceIdReplicationStateTransitionLock), MODE_NONE);
+
+    ASSERT_FALSE(locker.unlockRSTLforPrepare());
+    ASSERT_FALSE(locker.unlock(resourceIdReplicationStateTransitionLock));
 }
 
 TEST(LockerImpl, OverrideLockRequestTimeout) {
@@ -525,9 +748,7 @@ TEST(LockerImpl, GetLockerInfoShouldReportPendingLocks) {
     ASSERT(successfulLocker.unlock(dbId));
     ASSERT(successfulLocker.unlockGlobal());
 
-    const bool checkDeadlock = false;
-    ASSERT_EQ(LOCK_OK,
-              conflictingLocker.lockComplete(collectionId, MODE_IS, Date_t::now(), checkDeadlock));
+    ASSERT_EQ(LOCK_OK, conflictingLocker.lockComplete(collectionId, MODE_IS, Date_t::now()));
 
     conflictingLocker.getLockerInfo(&lockerInfo, boost::none);
     ASSERT_FALSE(lockerInfo.waitingResource.isValid());
@@ -658,102 +879,4 @@ TEST(LockerImpl, ConvertLockPendingUnlockAndUnlock) {
     locker.unlockGlobal();
 }
 
-/**
- * This test mimics the process that replica set state transitions go through.
- * First a request for the global X lock is enqueued, then the existing locks held by various
- * ongoing prepared transactions are yielded so that the global X lock request can succeed.
- * When the state transition is complete we then need to atomically restore the locks that were
- * yielded while dropping the global X lock that was held for the transition.
- */
-TEST(LockerImpl, AtomicLockRestoreAndGlobalLockReleaseForReplStateTransitions) {
-    const ResourceId globalResId(RESOURCE_GLOBAL, ResourceId::SINGLETON_GLOBAL);
-    const ResourceId resIdDatabase(RESOURCE_DATABASE, "TestDB"_sd);
-    const ResourceId resIdCollection1(RESOURCE_COLLECTION, "TestDB.collection1"_sd);
-    const ResourceId resIdCollection2(RESOURCE_COLLECTION, "TestDB.collection2"_sd);
-    const ResourceId resIdCollection3(RESOURCE_COLLECTION, "TestDB.collection2"_sd);
-
-    Locker::LockSnapshot lockInfo1, lockInfo2, lockInfo3;
-    LockerImpl stepUpLocker, txnLocker1, txnLocker2, txnLocker3, randomOpLocker1, randomOpLocker2;
-    OperationContextNoop opCtx1, opCtx2, opCtx3;
-    ON_BLOCK_EXIT([&] {
-        // clean up locks on test completion.
-        stepUpLocker.unlockGlobal();
-        txnLocker1.unlockGlobal();
-        txnLocker2.unlockGlobal();
-        txnLocker3.unlockGlobal();
-        randomOpLocker1.unlockGlobal();
-        randomOpLocker2.unlockGlobal();
-    });
-
-    // Take some locks, mimicking the locks that would be held by ongoing prepared transactions.
-    txnLocker1.lockGlobal(&opCtx1, MODE_IX);
-    ASSERT_EQUALS(LOCK_OK, txnLocker1.lock(&opCtx1, resIdDatabase, MODE_IX));
-    ASSERT_EQUALS(LOCK_OK, txnLocker1.lock(&opCtx1, resIdCollection1, MODE_IX));
-    ASSERT_EQUALS(LOCK_OK, txnLocker1.lock(&opCtx1, resIdCollection2, MODE_IX));
-
-    txnLocker2.lockGlobal(&opCtx2, MODE_IX);
-    ASSERT_EQUALS(LOCK_OK, txnLocker2.lock(&opCtx2, resIdDatabase, MODE_IX));
-    ASSERT_EQUALS(LOCK_OK, txnLocker2.lock(&opCtx2, resIdCollection2, MODE_IX));
-
-    txnLocker3.lockGlobal(&opCtx3, MODE_IX);
-    ASSERT_EQUALS(LOCK_OK, txnLocker3.lock(&opCtx3, resIdDatabase, MODE_IX));
-    ASSERT_EQUALS(LOCK_OK, txnLocker3.lock(&opCtx3, resIdCollection3, MODE_IX));
-
-    // Enqueue request for global X lock in stepUpLocker, mimicking the lock held by the thread
-    // performing the state transition.
-    ASSERT_EQUALS(LockResult::LOCK_WAITING, stepUpLocker.lockGlobalBegin(MODE_X, Date_t::max()));
-
-    // Enqueue a lock request behind the pending global X request to ensure that it gets granted
-    // later when the global X lock is released.
-    ASSERT_EQUALS(LockResult::LOCK_WAITING,
-                  randomOpLocker1.lockGlobalBegin(MODE_IS, Date_t::max()));
-
-    // Yield locks on all txn threads.
-    ASSERT_TRUE(txnLocker1.saveLockStateAndUnlock(&lockInfo1));
-    ASSERT_TRUE(txnLocker2.saveLockStateAndUnlock(&lockInfo2));
-    ASSERT_TRUE(txnLocker3.saveLockStateAndUnlock(&lockInfo3));
-
-    // Ensure that stepUpLocker is now able to acquire the global X lock.
-    ASSERT_EQUALS(LockResult::LOCK_OK, stepUpLocker.lockGlobalComplete(Date_t::max()));
-
-    // Enqueue a lock request behind the global X lock to ensure that it gets granted
-    // later when the global X lock is released.
-    ASSERT_EQUALS(LockResult::LOCK_WAITING,
-                  randomOpLocker2.lockGlobalBegin(MODE_IX, Date_t::max()));
-
-    // Now we need to atomically release the global X lock from stepUpLocker and restore the lock
-    // state for the txn threads. We start by restoring the lock state from the txn threads with
-    // the global locks placed into a temporary LockHead.
-    LockManager::TemporaryResourceQueue tempGlobalResource(globalResId);
-
-    txnLocker1.restoreLockStateWithTemporaryGlobalResource(&opCtx1, lockInfo1, &tempGlobalResource);
-    txnLocker2.restoreLockStateWithTemporaryGlobalResource(&opCtx2, lockInfo2, &tempGlobalResource);
-    txnLocker3.restoreLockStateWithTemporaryGlobalResource(&opCtx3, lockInfo3, &tempGlobalResource);
-
-    // Atomically release the global X lock from stepUpLocker and move the global locks for the
-    // txn threads from the temporary LockHead into the true LockHead for the global lock.
-    stepUpLocker.replaceGlobalLockStateWithTemporaryGlobalResource(&tempGlobalResource);
-
-    // Make sure all the locks were acquired and released appropriately.
-    ASSERT_EQUALS(MODE_NONE, stepUpLocker.getLockMode(globalResId));
-
-    ASSERT_EQUALS(MODE_IX, txnLocker1.getLockMode(globalResId));
-    ASSERT_EQUALS(MODE_IX, txnLocker1.getLockMode(resIdDatabase));
-    ASSERT_EQUALS(MODE_IX, txnLocker1.getLockMode(resIdCollection1));
-    ASSERT_EQUALS(MODE_IX, txnLocker1.getLockMode(resIdCollection2));
-
-    ASSERT_EQUALS(MODE_IX, txnLocker2.getLockMode(globalResId));
-    ASSERT_EQUALS(MODE_IX, txnLocker2.getLockMode(resIdDatabase));
-    ASSERT_EQUALS(MODE_IX, txnLocker2.getLockMode(resIdCollection2));
-
-    ASSERT_EQUALS(MODE_IX, txnLocker3.getLockMode(globalResId));
-    ASSERT_EQUALS(MODE_IX, txnLocker3.getLockMode(resIdDatabase));
-    ASSERT_EQUALS(MODE_IX, txnLocker3.getLockMode(resIdCollection3));
-
-    // Make sure the pending global lock requests got granted when the global X lock was released.
-    ASSERT_EQUALS(LockResult::LOCK_OK, randomOpLocker1.lockGlobalComplete(Date_t::now()));
-    ASSERT_EQUALS(LockResult::LOCK_OK, randomOpLocker2.lockGlobalComplete(Date_t::now()));
-    ASSERT_EQUALS(MODE_IS, randomOpLocker1.getLockMode(globalResId));
-    ASSERT_EQUALS(MODE_IX, randomOpLocker2.getLockMode(globalResId));
-}
 }  // namespace mongo

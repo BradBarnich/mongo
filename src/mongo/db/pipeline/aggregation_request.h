@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -36,6 +38,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/exchange_spec_gen.h"
 #include "mongo/db/query/explain_options.h"
+#include "mongo/db/write_concern_options.h"
 
 namespace mongo {
 
@@ -53,6 +56,7 @@ public:
     static constexpr StringData kBatchSizeName = "batchSize"_sd;
     static constexpr StringData kFromMongosName = "fromMongos"_sd;
     static constexpr StringData kNeedsMergeName = "needsMerge"_sd;
+    static constexpr StringData kMergeByPBRTName = "mergeByPBRT"_sd;
     static constexpr StringData kPipelineName = "pipeline"_sd;
     static constexpr StringData kCollationName = "collation"_sd;
     static constexpr StringData kExplainName = "explain"_sd;
@@ -103,7 +107,8 @@ public:
      * Constructs an AggregationRequest over the given namespace with the given pipeline. All
      * options aside from the pipeline assume their default values.
      */
-    AggregationRequest(NamespaceString nss, std::vector<BSONObj> pipeline);
+    AggregationRequest(NamespaceString nss, std::vector<BSONObj> pipeline)
+        : _nss(std::move(nss)), _pipeline(std::move(pipeline)), _batchSize(kDefaultBatchSize) {}
 
     /**
      * Serializes the options to a Document. Note that this serialization includes the original
@@ -149,6 +154,22 @@ public:
         return _needsMerge;
     }
 
+    /**
+     * Returns true if this request is a change stream pipeline which originated from a mongoS that
+     * can merge based on the documents' raw resume tokens and the 'postBatchResumeToken' field. If
+     * not, then the mongoD will need to produce the old {ts, uuid, docKey} $sortKey format instead.
+     * TODO SERVER-38539: this flag is no longer necessary in 4.4, since all change streams will be
+     * merged using raw resume tokens and PBRTs. This mechanism was chosen over FCV for two reasons:
+     * first, because this code is intended for backport to 4.0, where the same issue exists but FCV
+     * cannot be leveraged. Secondly, FCV can be changed at any point during runtime, but mongoS
+     * cannot dynamically switch from one $sortKey format to another mid-stream. The 'mergeByPBRT'
+     * flag allows the mongoS to dictate which $sortKey format will be used, and it will stay
+     * consistent for the entire duration of the stream.
+     */
+    bool mergeByPBRT() const {
+        return _mergeByPBRT;
+    }
+
     bool shouldAllowDiskUse() const {
         return _allowDiskUse;
     }
@@ -192,6 +213,10 @@ public:
         return _exchangeSpec;
     }
 
+    boost::optional<WriteConcernOptions> getWriteConcern() const {
+        return _writeConcern;
+    }
+
     //
     // Setters for optional fields.
     //
@@ -232,6 +257,10 @@ public:
         _needsMerge = needsMerge;
     }
 
+    void setMergeByPBRT(bool mergeByPBRT) {
+        _mergeByPBRT = mergeByPBRT;
+    }
+
     void setBypassDocumentValidation(bool shouldBypassDocumentValidation) {
         _bypassDocumentValidation = shouldBypassDocumentValidation;
     }
@@ -250,6 +279,10 @@ public:
 
     void setExchangeSpec(ExchangeSpec spec) {
         _exchangeSpec = std::move(spec);
+    }
+
+    void setWriteConcern(WriteConcernOptions writeConcern) {
+        _writeConcern = writeConcern;
     }
 
 private:
@@ -288,6 +321,7 @@ private:
     bool _allowDiskUse = false;
     bool _fromMongos = false;
     bool _needsMerge = false;
+    bool _mergeByPBRT = false;
     bool _bypassDocumentValidation = false;
 
     // A user-specified maxTimeMS limit, or a value of '0' if not specified.
@@ -297,5 +331,8 @@ private:
     // represents a producer running as a part of the exchange machinery.
     // This is an internal option; we do not expect it to be set on requests from users or drivers.
     boost::optional<ExchangeSpec> _exchangeSpec;
+
+    // The explicit writeConcern for the operation or boost::none if the user did not specifiy one.
+    boost::optional<WriteConcernOptions> _writeConcern;
 };
 }  // namespace mongo

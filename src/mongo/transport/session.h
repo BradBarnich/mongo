@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,6 +33,7 @@
 #include <memory>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/baton.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/message.h"
 #include "mongo/transport/session_id.h"
@@ -44,8 +47,6 @@ namespace transport {
 
 class TransportLayer;
 class Session;
-class Baton;
-using BatonHandle = std::shared_ptr<Baton>;
 
 using SessionHandle = std::shared_ptr<Session>;
 using ConstSessionHandle = std::shared_ptr<const Session>;
@@ -105,7 +106,7 @@ public:
      * Source (receive) a new Message from the remote host for this Session.
      */
     virtual StatusWith<Message> sourceMessage() = 0;
-    virtual Future<Message> asyncSourceMessage(const transport::BatonHandle& handle = nullptr) = 0;
+    virtual Future<Message> asyncSourceMessage(const BatonHandle& handle = nullptr) = 0;
 
     /**
      * Sink (send) a Message to the remote host for this Session.
@@ -113,15 +114,14 @@ public:
      * Async version will keep the buffer alive until the operation completes.
      */
     virtual Status sinkMessage(Message message) = 0;
-    virtual Future<void> asyncSinkMessage(Message message,
-                                          const transport::BatonHandle& handle = nullptr) = 0;
+    virtual Future<void> asyncSinkMessage(Message message, const BatonHandle& handle = nullptr) = 0;
 
     /**
      * Cancel any outstanding async operations. There is no way to cancel synchronous calls.
      * Futures will finish with an ErrorCodes::CallbackCancelled error if they haven't already
      * completed.
      */
-    virtual void cancelAsyncOperations(const transport::BatonHandle& handle = nullptr) = 0;
+    virtual void cancelAsyncOperations(const BatonHandle& handle = nullptr) = 0;
 
     /**
     * This should only be used to detect when the remote host has disappeared without
@@ -153,14 +153,14 @@ public:
      *
      * The 'kPending' tag is only for new sessions; callers should not set it directly.
      */
-    virtual void setTags(TagMask tagsToSet);
+    void setTags(TagMask tagsToSet);
 
     /**
      * Atomically clears all of the session tags specified in the 'tagsToUnset' bit field. If the
      * 'kPending' tag is set, indicating that no tags have yet been specified for the session, this
      * function also clears that tag as part of the same atomic operation.
      */
-    virtual void unsetTags(TagMask tagsToUnset);
+    void unsetTags(TagMask tagsToUnset);
 
     /**
      * Loads the session tags, passes them to 'mutateFunc' and then stores the result of that call
@@ -173,9 +173,9 @@ public:
      * of the 'mutateFunc' call. The 'kPending' tag is only for new sessions; callers should never
      * try to set it.
      */
-    virtual void mutateTags(const stdx::function<TagMask(TagMask)>& mutateFunc);
+    void mutateTags(const stdx::function<TagMask(TagMask)>& mutateFunc);
 
-    virtual TagMask getTags() const;
+    TagMask getTags() const;
 
 protected:
     Session();

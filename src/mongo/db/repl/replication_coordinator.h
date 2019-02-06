@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -44,6 +45,7 @@ namespace mongo {
 
 class BSONObj;
 class BSONObjBuilder;
+class CommitQuorumOptions;
 class IndexDescriptor;
 class NamespaceString;
 class OperationContext;
@@ -66,13 +68,11 @@ namespace repl {
 
 class BackgroundSync;
 class IsMasterResponse;
-class OplogReader;
 class OpTime;
 class ReadConcernArgs;
 class ReplSetConfig;
 class ReplSetHeartbeatArgsV1;
 class ReplSetHeartbeatResponse;
-class ReplSetHtmlSummary;
 class ReplSetRequestVotesArgs;
 class ReplSetRequestVotesResponse;
 class UpdatePositionArgs;
@@ -157,8 +157,13 @@ public:
      * This method may be optimized to reduce synchronization overhead compared to
      * reading the current member state with getMemberState().
      */
-    virtual bool isInPrimaryOrSecondaryState() const = 0;
+    virtual bool isInPrimaryOrSecondaryState(OperationContext* opCtx) const = 0;
 
+    /**
+     * Version which does not check for the RSTL. Without the RSTL, the return value may be
+     * inaccurate by the time the function returns.
+     */
+    virtual bool isInPrimaryOrSecondaryState_UNSAFE() const = 0;
 
     /**
      * Returns how slave delayed this node is configured to be, or 0 seconds if this node is not a
@@ -215,9 +220,8 @@ public:
     virtual bool canAcceptWritesForDatabase(OperationContext* opCtx, StringData dbName) = 0;
 
     /**
-     * Version which does not check for the global lock.  Do not use in new code.
-     * Without the global lock held, the return value may be inaccurate by the time
-     * the function returns.
+     * Version which does not check for the RSTL.  Do not use in new code. Without the RSTL, the
+     * return value may be inaccurate by the time the function returns.
      */
     virtual bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName) = 0;
 
@@ -230,9 +234,8 @@ public:
     virtual bool canAcceptWritesFor(OperationContext* opCtx, const NamespaceString& ns) = 0;
 
     /**
-     * Version which does not check for the global lock.  Do not use in new code.
-     * Without the global lock held, the return value may be inaccurate by the time
-     * the function returns.
+     * Version which does not check for the RSTL.  Do not use in new code. Without the RSTL held,
+     * the return value may be inaccurate by the time the function returns.
      */
     virtual bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx, const NamespaceString& ns) = 0;
 
@@ -248,6 +251,26 @@ public:
         const WriteConcernOptions& writeConcern) const = 0;
 
     /**
+     * Checks if the 'commitQuorum' can be satisfied by all the members in the replica set; if it
+     * cannot be satisfied, then the 'UnsatisfiableCommitQuorum' error code is returned.
+     *
+     * Returns the 'NoReplicationEnabled' error code if this is called without replication enabled.
+     */
+    virtual Status checkIfCommitQuorumCanBeSatisfied(
+        const CommitQuorumOptions& commitQuorum) const = 0;
+
+    /**
+     * Checks if the 'commitQuorum' has been satisfied by the 'commitReadyMembers', if it has been
+     * satisfied, return true.
+     *
+     * Prior to checking if the 'commitQuorum' is satisfied by 'commitReadyMembers', it calls
+     * 'checkIfCommitQuorumCanBeSatisfied()' with all the replica set members.
+     */
+    virtual StatusWith<bool> checkIfCommitQuorumIsSatisfied(
+        const CommitQuorumOptions& commitQuorum,
+        const std::vector<HostAndPort>& commitReadyMembers) const = 0;
+
+    /**
      * Returns Status::OK() if it is valid for this node to serve reads on the given collection
      * and an errorcode indicating why the node cannot if it cannot.
      */
@@ -256,9 +279,8 @@ public:
                                          bool slaveOk) = 0;
 
     /**
-     * Version which does not check for the global lock.  Do not use in new code.
-     * Without the global lock held, the return value may be inaccurate by the time
-     * the function returns.
+     * Version which does not check for the RSTL.  Do not use in new code. Without the RSTL held,
+     * the return value may be inaccurate by the time the function returns.
      */
     virtual Status checkCanServeReadsFor_UNSAFE(OperationContext* opCtx,
                                                 const NamespaceString& ns,
@@ -367,6 +389,19 @@ public:
                                                boost::optional<Date_t> deadline) = 0;
 
     /**
+     * Wait until the given optime is known to be majority committed.
+     *
+     * The given optime is expected to be an optime in this node's local oplog. This method cannot
+     * determine correctly whether an arbitrary optime is majority committed within a replica set.
+     * It is expected that the execution of this method is contained within the span of one user
+     * operation, and thus, should not span rollbacks.
+     *
+     * Returns whether the wait was successful. Will respect the deadline on the given
+     * OperationContext, if one has been set.
+     */
+    virtual Status awaitOpTimeCommitted(OperationContext* opCtx, OpTime opTime) = 0;
+
+    /**
      * Retrieves and returns the current election id, which is a unique id that is local to
      * this node and changes every time we become primary.
      * TODO(spencer): Use term instead.
@@ -377,6 +412,12 @@ public:
      * Returns the id for this node as specified in the current replica set configuration.
      */
     virtual int getMyId() const = 0;
+
+    /**
+     * Returns the host and port pair for this node as specified in the current replica
+     * set configuration.
+     */
+    virtual HostAndPort getMyHostAndPort() const = 0;
 
     /**
      * Sets this node into a specific follower mode.
@@ -394,6 +435,13 @@ public:
      * application process.
      */
     virtual Status setFollowerMode(const MemberState& newState) = 0;
+
+    /**
+     * Version which checks for the RSTL in mode X before setting this node into a specific follower
+     * mode. This is used for transitioning to RS_ROLLBACK so that we can conflict with readers
+     * holding the RSTL in intent mode.
+     */
+    virtual Status setFollowerModeStrict(OperationContext* opCtx, const MemberState& newState) = 0;
 
     /**
      * Step-up
@@ -699,12 +747,6 @@ public:
     virtual bool getWriteConcernMajorityShouldJournal() = 0;
 
     /**
-     * Writes into 'output' all the information needed to generate a summary of the current
-     * replication state for use by the web interface.
-     */
-    virtual void summarizeAsHtml(ReplSetHtmlSummary* output) = 0;
-
-    /**
      * Returns the current term.
      */
     virtual long long getTerm() = 0;
@@ -759,8 +801,6 @@ public:
      */
     virtual WriteConcernOptions populateUnsetWriteConcernOptionsSyncMode(
         WriteConcernOptions wc) = 0;
-    virtual ReplSettings::IndexPrefetchConfig getIndexPrefetchConfig() const = 0;
-    virtual void setIndexPrefetchConfig(const ReplSettings::IndexPrefetchConfig cfg) = 0;
 
     virtual Status stepUpIfEligible(bool skipDryRun) = 0;
 
@@ -781,6 +821,24 @@ public:
      * operation.
      */
     bool isOplogDisabledFor(OperationContext* opCtx, const NamespaceString& nss);
+
+    /**
+     * Returns the stable timestamp that the storage engine recovered to on startup. If the
+     * recovery point was not stable, returns "none".
+     */
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() = 0;
+
+    /**
+     * Returns true if the current replica set config has at least one arbiter.
+     */
+    virtual bool setContainsArbiter() const = 0;
+
+    /**
+     * Instructs the ReplicationCoordinator to recalculate the stable timestamp and advance it for
+     * storage if needed.
+     */
+    virtual void attemptToAdvanceStableTimestamp() = 0;
+
 
 protected:
     ReplicationCoordinator();

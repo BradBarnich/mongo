@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -62,6 +64,12 @@ OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
         return OplogEntry::CommandType::kConvertToCapped;
     } else if (commandString == "createIndexes") {
         return OplogEntry::CommandType::kCreateIndexes;
+    } else if (commandString == "startIndexBuild") {
+        return OplogEntry::CommandType::kStartIndexBuild;
+    } else if (commandString == "commitIndexBuild") {
+        return OplogEntry::CommandType::kCommitIndexBuild;
+    } else if (commandString == "abortIndexBuild") {
+        return OplogEntry::CommandType::kAbortIndexBuild;
     } else if (commandString == "dropIndexes") {
         return OplogEntry::CommandType::kDropIndexes;
     } else if (commandString == "deleteIndexes") {
@@ -71,9 +79,10 @@ OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
     } else if (commandString == "abortTransaction") {
         return OplogEntry::CommandType::kAbortTransaction;
     } else {
-        severe() << "Unknown oplog entry command type: " << commandString
-                 << " Object field: " << redact(objectField);
-        fassertFailedNoTrace(40444);
+        uasserted(ErrorCodes::BadValue,
+                  str::stream() << "Unknown oplog entry command type: " << commandString
+                                << " Object field: "
+                                << redact(objectField));
     }
     MONGO_UNREACHABLE;
 }
@@ -82,7 +91,7 @@ OplogEntry::CommandType parseCommandType(const BSONObj& objectField) {
  * Returns a document representing an oplog entry with the given fields.
  */
 BSONObj makeOplogEntryDoc(OpTime opTime,
-                          long long hash,
+                          const boost::optional<long long> hash,
                           OpTypeEnum opType,
                           const NamespaceString& nss,
                           const boost::optional<UUID>& uuid,
@@ -101,10 +110,12 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
     sessionInfo.serialize(&builder);
     builder.append(OplogEntryBase::kTimestampFieldName, opTime.getTimestamp());
     builder.append(OplogEntryBase::kTermFieldName, opTime.getTerm());
-    builder.append(OplogEntryBase::kHashFieldName, hash);
     builder.append(OplogEntryBase::kVersionFieldName, version);
     builder.append(OplogEntryBase::kOpTypeFieldName, OpType_serializer(opType));
     builder.append(OplogEntryBase::kNssFieldName, nss.toString());
+    if (hash) {
+        builder.append(OplogEntryBase::kHashFieldName, hash.get());
+    }
     if (uuid) {
         uuid->appendToBuilder(&builder, OplogEntryBase::kUuidFieldName);
     }
@@ -206,7 +217,7 @@ OplogEntry::OplogEntry(BSONObj rawInput) : raw(std::move(rawInput)) {
 }
 
 OplogEntry::OplogEntry(OpTime opTime,
-                       long long hash,
+                       const boost::optional<long long> hash,
                        OpTypeEnum opType,
                        const NamespaceString& nss,
                        const boost::optional<UUID>& uuid,

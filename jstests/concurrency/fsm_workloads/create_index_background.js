@@ -7,6 +7,8 @@
  * The command to create a background index completes in the shell once the
  * index has completed and the test no longer needs to execute more transitions.
  * The first thread (tid = 0) will be the one that creates the background index.
+ *
+ * @tags: [creates_background_indexes]
  */
 load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isMongos
 
@@ -27,12 +29,19 @@ var $config = (function() {
             });
             return highest;
         },
+        getPartialFilterExpression: function getPartialFilterExpression() {
+            return undefined;
+        },
         getIndexSpec: function getIndexSpec() {
             return {x: 1};
         },
         extendDocument: function getDocument(originalDocument) {
             // Only relevant for extended workloads.
             return originalDocument;
+        },
+        extendUpdateExpr: function extendUpdateExpr(update) {
+            // Only relevant for extended workloads.
+            return update;
         }
     };
 
@@ -57,7 +66,14 @@ var $config = (function() {
                 assertWhenOwnColl.soon(function() {
                     return coll.find({crud: {$exists: true}}).itcount() > 0;
                 }, 'No documents with "crud" field have been inserted or updated', 60 * 1000);
-                res = coll.createIndex(this.getIndexSpec(), {background: true});
+
+                let createOptions = {background: true};
+                let filter = this.getPartialFilterExpression();
+                if (filter !== undefined) {
+                    createOptions['partialFilterExpression'] = filter;
+                }
+
+                res = coll.createIndex(this.getIndexSpec(), createOptions);
                 assertAlways.commandWorked(res, tojson(res));
             }
         }
@@ -114,8 +130,11 @@ var $config = (function() {
                 for (var i = 0; i < this.nDocumentsToUpdate; ++i) {
                     // Do randomized updates on index x. A document is not guaranteed
                     // to match the randomized 'x' predicate.
-                    res =
-                        coll.update({x: Random.randInt(highest), tid: this.tid}, {$inc: {crud: 1}});
+
+                    let updateExpr = {$inc: {crud: 1}};
+                    updateExpr = this.extendUpdateExpr(updateExpr);
+
+                    res = coll.update({x: Random.randInt(highest), tid: this.tid}, updateExpr);
                     assertAlways.writeOK(res);
                     if (db.getMongo().writeMode() === 'commands') {
                         assertWhenOwnColl.contains(res.nModified, [0, 1], tojson(res));

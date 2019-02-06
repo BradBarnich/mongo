@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,12 +39,16 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/oplog_applier_impl.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/session.h"
+#include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
@@ -265,9 +271,47 @@ void ReplicationRecoveryImpl::recoverFromOplog(OperationContext* opCtx,
     } else {
         _recoverFromUnstableCheckpoint(opCtx, appliedThrough, topOfOplog);
     }
+
+    _reconstructPreparedTransactions(opCtx);
 } catch (...) {
     severe() << "Caught exception during replication recovery: " << exceptionToStatus();
     std::terminate();
+}
+
+void ReplicationRecoveryImpl::_reconstructPreparedTransactions(OperationContext* opCtx) {
+    DBDirectClient client(opCtx);
+    const auto cursor = client.query(NamespaceString::kSessionTransactionsTableNamespace,
+                                     {BSON("state"
+                                           << "prepared")});
+
+    // Iterate over each entry in the transactions table that has a prepared transaction.
+    while (cursor->more()) {
+        const auto txnRecordObj = cursor->next();
+        const auto txnRecord = SessionTxnRecord::parse(
+            IDLParserErrorContext("recovering prepared transaction"), txnRecordObj);
+
+        invariant(txnRecord.getState() == DurableTxnStateEnum::kPrepared);
+
+        // Get the prepareTransaction oplog entry corresponding to this transactions table entry.
+        invariant(!opCtx->recoveryUnit()->getPointInTimeReadTimestamp());
+        const auto prepareOpTime = txnRecord.getLastWriteOpTime();
+        invariant(!prepareOpTime.isNull());
+        TransactionHistoryIterator iter(prepareOpTime);
+        invariant(iter.hasNext());
+        const auto prepareOplogEntry = iter.next(opCtx);
+
+        {
+            // Make a new opCtx so that we can set the lsid when applying the prepare transaction
+            // oplog entry.
+            auto newClient =
+                opCtx->getServiceContext()->makeClient("reconstruct-prepared-transactions");
+            AlternativeClientRegion acr(newClient);
+            const auto newOpCtx = cc().makeOperationContext();
+
+            // Checks out the session, applies the operations and prepares the transactions.
+            uassertStatusOK(applyRecoveredPrepareTransaction(newOpCtx.get(), prepareOplogEntry));
+        }
+    }
 }
 
 void ReplicationRecoveryImpl::_recoverFromStableTimestamp(OperationContext* opCtx,

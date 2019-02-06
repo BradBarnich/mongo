@@ -4,7 +4,7 @@
  * Runs update, findAndModify, delete, find, and getMore in a transaction with all threads using the
  * same session.
  *
- * @tags: [uses_transactions]
+ * @tags: [uses_transactions, state_functions_share_transaction, assumes_snapshot_transactions]
  */
 
 load('jstests/concurrency/fsm_libs/extend_workload.js');  // for extendWorkload
@@ -27,9 +27,11 @@ var $config = extendWorkload($config, function($config, $super) {
         print("Overriding sessionID " + tojson(oldId) + " with " + tojson(lsid) + " for test.");
         this.session._serverSession.handle.getId = () => lsid;
 
-        this.txnNumber = -1;
         this.sessionDb = this.session.getDatabase(db.getName());
         this.iteration = 1;
+
+        this.session.startTransaction_forTesting({readConcern: {level: 'snapshot'}});
+        this.txnNumber = 0;
     };
 
     return $config;

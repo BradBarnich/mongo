@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -189,9 +190,32 @@ public:
     virtual bool unlockGlobal() = 0;
 
     /**
+     * Requests the RSTL to be acquired in mode X. This should only be called inside
+     * ReplicationStateTransitionLockGuard.
+     *
+     * See the comments for lockBegin/Complete for more information on the semantics.
+     */
+    virtual LockResult lockRSTLBegin(OperationContext* opCtx) = 0;
+
+    /**
+     * Waits for the completion of acquiring the RSTL in mode X. This should only be called inside
+     * ReplicationStateTransitionLockGuard.
+     */
+    virtual LockResult lockRSTLComplete(OperationContext* opCtx, Date_t deadline) = 0;
+
+    /**
+     * Unlocks the RSTL when the transaction becomes prepared. This is used to bypass two-phase
+     * locking and unlock the RSTL immediately, rather than at the end of the WUOW.
+     *
+     * @return true if the RSTL is unlocked; false if we fail to unlock the RSTL or if it was
+     * already unlocked.
+     */
+    virtual bool unlockRSTLforPrepare() = 0;
+
+    /**
      * beginWriteUnitOfWork/endWriteUnitOfWork are called at the start and end of WriteUnitOfWorks.
-     * They can be used to implement two-phase locking. Each call to begin should be matched with an
-     * eventual call to end.
+     * They can be used to implement two-phase locking. Each call to begin or restore should be
+     * matched with an eventual call to end or release.
      *
      * endWriteUnitOfWork, if not called in a nested WUOW, will release all two-phase locking held
      * lock resources.
@@ -220,26 +244,19 @@ public:
      *              returning LOCK_TIMEOUT. This parameter defaults to an infinite deadline.
      *              If Milliseconds(0) is passed, the request will return immediately, if
      *              the request could not be granted right away.
-     * @param checkDeadlock Whether to enable deadlock detection for this acquisition. This
-     *              parameter is put in place until we can handle deadlocks at all places,
-     *              which acquire locks.
      *
      * @return All LockResults except for LOCK_WAITING, because it blocks.
      */
     virtual LockResult lock(OperationContext* opCtx,
                             ResourceId resId,
                             LockMode mode,
-                            Date_t deadline = Date_t::max(),
-                            bool checkDeadlock = false) = 0;
+                            Date_t deadline = Date_t::max()) = 0;
 
     /**
      * Calling lock without an OperationContext does not allow LOCK_WAITING states to be
      * interrupted.
      */
-    virtual LockResult lock(ResourceId resId,
-                            LockMode mode,
-                            Date_t deadline = Date_t::max(),
-                            bool checkDeadlock = false) = 0;
+    virtual LockResult lock(ResourceId resId, LockMode mode, Date_t deadline = Date_t::max()) = 0;
 
     /**
      * Downgrades the specified resource's lock mode without changing the reference count.
@@ -359,12 +376,6 @@ public:
     virtual bool saveLockStateAndUnlock(LockSnapshot* stateOut) = 0;
 
     /**
-     * Like saveLockStateAndUnlock but allows saving locks from within a WUOW.  Used during
-     * replication state transitions for yielding locks held by prepared transactions.
-     */
-    virtual bool saveLockStateAndUnlockForPrepare(LockSnapshot* stateOut) = 0;
-
-    /**
      * Re-locks all locks whose state was stored in 'stateToRestore'.
      * @param opCtx An operation context that enables the restoration to be interrupted.
      */
@@ -372,25 +383,13 @@ public:
     virtual void restoreLockState(const LockSnapshot& stateToRestore) = 0;
 
     /**
-     * Works like restoreLockState but for any global locks in the state to restore, rather than
-     * restoring them into the true global lock resource owned by the LockManager,
-     * restores the global locks into the TemporaryResourceQueue for the global resource that is
-     * provided.  Locks on resources other than the global lock are restored to their true
-     * LockManager-owned resource objects.
-     * Also allows restoring locks from within a WUOW.
+     * releaseWriteUnitOfWork opts out two-phase locking and yield the locks after a WUOW
+     * has been released. restoreWriteUnitOfWork reaquires the locks and resume the two-phase
+     * locking behavior of WUOW.
      */
-    virtual void restoreLockStateWithTemporaryGlobalResource(
-        OperationContext* opCtx,
-        const LockSnapshot& stateToRestore,
-        LockManager::TemporaryResourceQueue* tempGlobalResource) = 0;
-
-    /**
-     * Atomically releases the global X lock from the true global resource managed by the
-     * LockManager and transfers the locks from the 'tempGlobalResource' into the true global
-     * resource.
-     */
-    virtual void replaceGlobalLockStateWithTemporaryGlobalResource(
-        LockManager::TemporaryResourceQueue* tempGlobalResource) = 0;
+    virtual bool releaseWriteUnitOfWork(LockSnapshot* stateOut) = 0;
+    virtual void restoreWriteUnitOfWork(OperationContext* opCtx,
+                                        const LockSnapshot& stateToRestore) = 0;
 
     /**
      * Releases the ticket associated with the Locker. This allows locks to be held without
@@ -419,6 +418,10 @@ public:
     virtual bool isLocked() const = 0;
     virtual bool isWriteLocked() const = 0;
     virtual bool isReadLocked() const = 0;
+
+    virtual bool isRSTLExclusive() const = 0;
+    virtual bool isRSTLLocked() const = 0;
+
     virtual bool isGlobalLockedRecursively() = 0;
 
     /**
@@ -458,6 +461,14 @@ public:
         return _numResourcesToUnlockAtEndUnitOfWork;
     }
 
+    std::string getDebugInfo() const {
+        return _debugInfo;
+    }
+
+    void setDebugInfo(const std::string& info) {
+        _debugInfo = info;
+    }
+
 protected:
     Locker() {}
 
@@ -478,6 +489,7 @@ protected:
 private:
     bool _shouldConflictWithSecondaryBatchApplication = true;
     bool _shouldAcquireTicket = true;
+    std::string _debugInfo;  // Extra info about this locker for debugging purpose
 };
 
 /**

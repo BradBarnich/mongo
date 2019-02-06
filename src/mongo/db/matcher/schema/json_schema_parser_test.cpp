@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -32,7 +34,7 @@
 #include "mongo/db/bson/bson_helper.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/matcher/schema/json_schema_parser.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -2084,6 +2086,116 @@ TEST(JSONSchemaParserTest, TopLevelEnumWithZeroObjectsTranslatesCorrectly) {
     auto optimizedResult = MatchExpression::optimize(std::move(result.getValue()));
     ASSERT_SERIALIZES_TO(optimizedResult, fromjson("{$alwaysFalse: 1}"));
 }
+
+TEST(JSONSchemaParserTest, EncryptTranslatesCorrectly) {
+    BSONObj schema = fromjson("{properties: {foo: {encrypt: {}}}}");
+    auto result = JSONSchemaParser::parse(schema);
+    ASSERT_OK(result.getStatus());
+    auto optimizedResult = MatchExpression::optimize(std::move(result.getValue()));
+    ASSERT_SERIALIZES_TO(optimizedResult, fromjson(R"(
+        {
+            $or: [
+                {$nor: [{foo: {$exists: true}}]},
+                {$and: [
+                       {foo: {$_internalSchemaBinDataSubType: 6}},
+                       {foo: {$_internalSchemaType: [5]}}
+                       ]
+                    }
+                ]
+            }
+        })"));
+}
+
+TEST(JSONSchemaParserTest, TopLevelEncryptTranslatesCorrectly) {
+    BSONObj schema = fromjson("{encrypt: {}}");
+    auto result = JSONSchemaParser::parse(schema);
+    ASSERT_OK(result.getStatus());
+    auto optimizedResult = MatchExpression::optimize(std::move(result.getValue()));
+    ASSERT_SERIALIZES_TO(optimizedResult, BSON(AlwaysFalseMatchExpression::kName << 1));
+}
+
+TEST(JSONSchemaParserTest, NestedEncryptTranslatesCorrectly) {
+    BSONObj schema =
+        fromjson("{properties: {a: {type: 'object', properties: {b: {encrypt: {}}}}}}}");
+    auto result = JSONSchemaParser::parse(schema);
+    ASSERT_OK(result.getStatus());
+    auto optimizedResult = MatchExpression::optimize(std::move(result.getValue()));
+    ASSERT_SERIALIZES_TO(optimizedResult, fromjson(R"(
+        {
+            $or: [
+                {$nor: [{a: {$exists: true}}]},
+                {$and: [
+                        {a: {$_internalSchemaObjectMatch: {$or: [
+                                        {$nor: [{b: {$exists: true}}]},
+                                        {$and: [
+                                                {b: {$_internalSchemaBinDataSubType: 6}},
+                                                {b: {$_internalSchemaType: [5]}}
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                        {a: {$_internalSchemaType: [3]}}
+                    ]
+                }
+            ]
+        })"));
+}
+
+TEST(JSONSchemaParserTest, NestedEncryptInArrayTranslatesCorrectly) {
+    BSONObj schema = fromjson("{properties: {a: {type: 'array', items: {encrypt: {}}}}}");
+    auto result = JSONSchemaParser::parse(schema);
+    ASSERT_OK(result.getStatus());
+    auto optimizedResult = MatchExpression::optimize(std::move(result.getValue()));
+    ASSERT_SERIALIZES_TO(optimizedResult, fromjson(R"(
+        {
+            $or: [
+                {$nor: [{a: {$exists: true}}]},
+                {
+                $and: [
+                    {
+                        a: {
+                            $_internalSchemaAllElemMatchFromIndex: [
+                                0,
+                                {$and: [
+                                    {i: {$_internalSchemaBinDataSubType: 6}},
+                                    {i: {$_internalSchemaType: [5]}}]
+                                }
+                            ]
+                        }
+                    },
+                    {a: {$_internalSchemaType: [4]}}
+                ]
+                }
+            ]
+        })"));
+}
+
+TEST(JSONSchemaParserTest, FailsToParseIfBothEncryptAndTypeArePresent) {
+    BSONObj schema = fromjson("{encrypt: {}, type: 'object'}");
+    auto result = JSONSchemaParser::parse(schema);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::FailedToParse);
+}
+
+TEST(JSONSchemaParserTest, FailsToParseIfBothEncryptAndBSONTypeArePresent) {
+    BSONObj schema = fromjson("{encrypt: {}, bsonType: 'binData'}");
+    auto result = JSONSchemaParser::parse(schema);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::FailedToParse);
+}
+
+TEST(JSONSchemaParserTest, FailsToParseIfEncryptValueIsNotObject) {
+    BSONObj schema = fromjson("{properties: {foo: {encrypt: 12}}}");
+    auto result = JSONSchemaParser::parse(schema);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::FailedToParse);
+}
+
+TEST(JSONSchemaParserTest, FailsToParseIfEncryptValueIsNotEmptyObject) {
+    BSONObj schema = fromjson("{properties: {foo: {encrypt: {foo: 12}}}}");
+    auto result = JSONSchemaParser::parse(schema);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::FailedToParse);
+}
+
 
 }  // namespace
 }  // namespace mongo

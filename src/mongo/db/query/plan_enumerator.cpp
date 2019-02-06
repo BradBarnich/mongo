@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
@@ -409,7 +411,7 @@ bool PlanEnumerator::prepMemo(MatchExpression* node, PrepMemoContext context) {
                 // either of the predicates on 'c', since this would change the predicate's meaning
                 // from a==1 to "b.a"==1.
                 if (it->second.traversedThroughElemMatchObj) {
-                    it = childContextCopy.outsidePreds.erase(it);
+                    childContextCopy.outsidePreds.erase(it++);
                 } else {
                     it->second.route.push_back(i);
                     ++it;
@@ -1329,7 +1331,7 @@ void PlanEnumerator::getMultikeyCompoundablePreds(const vector<MatchExpression*>
         RelevantTag* usedRt = static_cast<RelevantTag*>(assignedPred->getTag());
         set<string> usedPrefixes;
         usedPrefixes.insert(getPathPrefix(usedRt->path));
-        used[NULL] = usedPrefixes;
+        used[nullptr] = usedPrefixes;
 
         // If 'assigned' is a predicate inside an $elemMatch, we have to
         // add the prefix not only to the top-level context, but also to the
@@ -1354,8 +1356,8 @@ void PlanEnumerator::getMultikeyCompoundablePreds(const vector<MatchExpression*>
 
         if (used.end() == used.find(rt->elemMatchExpr)) {
             // This is a new $elemMatch that we haven't seen before.
-            invariant(used.end() != used.find(NULL));
-            set<string>& topLevelUsed = used.find(NULL)->second;
+            invariant(used.end() != used.find(nullptr));
+            set<string>& topLevelUsed = used.find(nullptr)->second;
 
             // If the top-level path prefix of the $elemMatch hasn't been
             // used yet, couldCompound[i] is safe to compound.

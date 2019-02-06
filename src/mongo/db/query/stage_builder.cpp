@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -66,7 +68,7 @@ using std::unique_ptr;
 using stdx::make_unique;
 
 PlanStage* buildStages(OperationContext* opCtx,
-                       Collection* collection,
+                       const Collection* collection,
                        const CanonicalQuery& cq,
                        const QuerySolution& qsol,
                        const QuerySolutionNode* root,
@@ -75,13 +77,12 @@ PlanStage* buildStages(OperationContext* opCtx,
         case STAGE_COLLSCAN: {
             const CollectionScanNode* csn = static_cast<const CollectionScanNode*>(root);
             CollectionScanParams params;
-            params.collection = collection;
             params.tailable = csn->tailable;
             params.shouldTrackLatestOplogTimestamp = csn->shouldTrackLatestOplogTimestamp;
             params.direction = (csn->direction == 1) ? CollectionScanParams::FORWARD
                                                      : CollectionScanParams::BACKWARD;
             params.shouldWaitForOplogVisibility = csn->shouldWaitForOplogVisibility;
-            return new CollectionScan(opCtx, params, ws, csn->filter.get());
+            return new CollectionScan(opCtx, collection, params, ws, csn->filter.get());
         }
         case STAGE_IXSCAN: {
             const IndexScanNode* ixn = static_cast<const IndexScanNode*>(root);
@@ -97,7 +98,7 @@ PlanStage* buildStages(OperationContext* opCtx,
 
             // We use the node's internal name, keyPattern and multikey details here. For $**
             // indexes, these may differ from the information recorded in the index's descriptor.
-            IndexScanParams params{*descriptor,
+            IndexScanParams params{descriptor,
                                    ixn->index.identifier.catalogName,
                                    ixn->index.keyPattern,
                                    ixn->index.multikeyPaths,
@@ -105,6 +106,7 @@ PlanStage* buildStages(OperationContext* opCtx,
             params.bounds = ixn->bounds;
             params.direction = ixn->direction;
             params.addKeyMetadata = ixn->addKeyMetadata;
+            params.shouldDedup = ixn->shouldDedup;
             return new IndexScan(opCtx, std::move(params), ws, ixn->filter.get());
         }
         case STAGE_FETCH: {
@@ -122,7 +124,6 @@ PlanStage* buildStages(OperationContext* opCtx,
                 return nullptr;
             }
             SortStageParams params;
-            params.collection = collection;
             params.pattern = sn->pattern;
             params.limit = sn->limit;
             return new SortStage(opCtx, params, ws, childStage);
@@ -137,31 +138,38 @@ PlanStage* buildStages(OperationContext* opCtx,
             return new SortKeyGeneratorStage(
                 opCtx, childStage, ws, keyGenNode->sortSpec, cq.getCollator());
         }
-        case STAGE_PROJECTION: {
-            const ProjectionNode* pn = static_cast<const ProjectionNode*>(root);
-            PlanStage* childStage = buildStages(opCtx, collection, cq, qsol, pn->children[0], ws);
+        case STAGE_PROJECTION_DEFAULT: {
+            auto pn = static_cast<const ProjectionNodeDefault*>(root);
+            unique_ptr<PlanStage> childStage{
+                buildStages(opCtx, collection, cq, qsol, pn->children[0], ws)};
             if (nullptr == childStage) {
                 return nullptr;
             }
-
-            ProjectionStageParams params;
-            params.projObj = pn->projection;
-            params.collator = cq.getCollator();
-
-            // Stuff the right data into the params depending on what proj impl we use.
-            if (ProjectionNode::DEFAULT == pn->projType) {
-                params.fullExpression = pn->fullExpression;
-                params.projImpl = ProjectionStageParams::NO_FAST_PATH;
-            } else if (ProjectionNode::COVERED_ONE_INDEX == pn->projType) {
-                params.projImpl = ProjectionStageParams::COVERED_ONE_INDEX;
-                params.coveredKeyObj = pn->coveredKeyObj;
-                invariant(!pn->coveredKeyObj.isEmpty());
-            } else {
-                invariant(ProjectionNode::SIMPLE_DOC == pn->projType);
-                params.projImpl = ProjectionStageParams::SIMPLE_DOC;
+            return new ProjectionStageDefault(opCtx,
+                                              pn->projection,
+                                              ws,
+                                              std::move(childStage),
+                                              pn->fullExpression,
+                                              cq.getCollator());
+        }
+        case STAGE_PROJECTION_COVERED: {
+            auto pn = static_cast<const ProjectionNodeCovered*>(root);
+            unique_ptr<PlanStage> childStage{
+                buildStages(opCtx, collection, cq, qsol, pn->children[0], ws)};
+            if (nullptr == childStage) {
+                return nullptr;
             }
-
-            return new ProjectionStage(opCtx, params, ws, childStage);
+            return new ProjectionStageCovered(
+                opCtx, pn->projection, ws, std::move(childStage), pn->coveredKeyObj);
+        }
+        case STAGE_PROJECTION_SIMPLE: {
+            auto pn = static_cast<const ProjectionNodeSimple*>(root);
+            unique_ptr<PlanStage> childStage{
+                buildStages(opCtx, collection, cq, qsol, pn->children[0], ws)};
+            if (nullptr == childStage) {
+                return nullptr;
+            }
+            return new ProjectionStageSimple(opCtx, pn->projection, ws, std::move(childStage));
         }
         case STAGE_LIMIT: {
             const LimitNode* ln = static_cast<const LimitNode*>(root);
@@ -181,7 +189,7 @@ PlanStage* buildStages(OperationContext* opCtx,
         }
         case STAGE_AND_HASH: {
             const AndHashNode* ahn = static_cast<const AndHashNode*>(root);
-            auto ret = make_unique<AndHashStage>(opCtx, ws, collection);
+            auto ret = make_unique<AndHashStage>(opCtx, ws);
             for (size_t i = 0; i < ahn->children.size(); ++i) {
                 PlanStage* childStage =
                     buildStages(opCtx, collection, cq, qsol, ahn->children[i], ws);
@@ -207,7 +215,7 @@ PlanStage* buildStages(OperationContext* opCtx,
         }
         case STAGE_AND_SORTED: {
             const AndSortedNode* asn = static_cast<const AndSortedNode*>(root);
-            auto ret = make_unique<AndSortedStage>(opCtx, ws, collection);
+            auto ret = make_unique<AndSortedStage>(opCtx, ws);
             for (size_t i = 0; i < asn->children.size(); ++i) {
                 PlanStage* childStage =
                     buildStages(opCtx, collection, cq, qsol, asn->children[i], ws);
@@ -224,7 +232,7 @@ PlanStage* buildStages(OperationContext* opCtx,
             params.dedup = msn->dedup;
             params.pattern = msn->sort;
             params.collator = cq.getCollator();
-            auto ret = make_unique<MergeSortStage>(opCtx, params, ws, collection);
+            auto ret = make_unique<MergeSortStage>(opCtx, params, ws);
             for (size_t i = 0; i < msn->children.size(); ++i) {
                 PlanStage* childStage =
                     buildStages(opCtx, collection, cq, qsol, msn->children[i], ws);
@@ -245,12 +253,11 @@ PlanStage* buildStages(OperationContext* opCtx,
             params.addPointMeta = node->addPointMeta;
             params.addDistMeta = node->addDistMeta;
 
-            IndexDescriptor* twoDIndex = collection->getIndexCatalog()->findIndexByName(
+            const IndexDescriptor* twoDIndex = collection->getIndexCatalog()->findIndexByName(
                 opCtx, node->index.identifier.catalogName);
             invariant(twoDIndex);
 
-            GeoNear2DStage* nearStage =
-                new GeoNear2DStage(params, opCtx, ws, collection, twoDIndex);
+            GeoNear2DStage* nearStage = new GeoNear2DStage(params, opCtx, ws, twoDIndex);
 
             return nearStage;
         }
@@ -264,19 +271,19 @@ PlanStage* buildStages(OperationContext* opCtx,
             params.addPointMeta = node->addPointMeta;
             params.addDistMeta = node->addDistMeta;
 
-            IndexDescriptor* s2Index = collection->getIndexCatalog()->findIndexByName(
+            const IndexDescriptor* s2Index = collection->getIndexCatalog()->findIndexByName(
                 opCtx, node->index.identifier.catalogName);
             invariant(s2Index);
 
-            return new GeoNear2DSphereStage(params, opCtx, ws, collection, s2Index);
+            return new GeoNear2DSphereStage(params, opCtx, ws, s2Index);
         }
         case STAGE_TEXT: {
             const TextNode* node = static_cast<const TextNode*>(root);
-            IndexDescriptor* desc = collection->getIndexCatalog()->findIndexByName(
+            const IndexDescriptor* desc = collection->getIndexCatalog()->findIndexByName(
                 opCtx, node->index.identifier.catalogName);
             invariant(desc);
-            const FTSAccessMethod* fam =
-                static_cast<FTSAccessMethod*>(collection->getIndexCatalog()->getIndex(desc));
+            const FTSAccessMethod* fam = static_cast<const FTSAccessMethod*>(
+                collection->getIndexCatalog()->getEntry(desc)->accessMethod());
             invariant(fam);
 
             TextStageParams params(fam->getSpec());
@@ -297,11 +304,11 @@ PlanStage* buildStages(OperationContext* opCtx,
             if (nullptr == childStage) {
                 return nullptr;
             }
-            return new ShardFilterStage(
-                opCtx,
-                CollectionShardingState::get(opCtx, collection->ns())->getMetadata(opCtx),
-                ws,
-                childStage);
+            return new ShardFilterStage(opCtx,
+                                        CollectionShardingState::get(opCtx, collection->ns())
+                                            ->getMetadataForOperation(opCtx),
+                                        ws,
+                                        childStage);
         }
         case STAGE_DISTINCT_SCAN: {
             const DistinctNode* dn = static_cast<const DistinctNode*>(root);
@@ -317,7 +324,7 @@ PlanStage* buildStages(OperationContext* opCtx,
 
             // We use the node's internal name, keyPattern and multikey details here. For $**
             // indexes, these may differ from the information recorded in the index's descriptor.
-            DistinctParams params{*descriptor,
+            DistinctParams params{descriptor,
                                   dn->index.identifier.catalogName,
                                   dn->index.keyPattern,
                                   dn->index.multikeyPaths,
@@ -342,7 +349,7 @@ PlanStage* buildStages(OperationContext* opCtx,
 
             // We use the node's internal name, keyPattern and multikey details here. For $**
             // indexes, these may differ from the information recorded in the index's descriptor.
-            CountScanParams params{*descriptor,
+            CountScanParams params{descriptor,
                                    csn->index.identifier.catalogName,
                                    csn->index.keyPattern,
                                    csn->index.multikeyPaths,
@@ -352,7 +359,6 @@ PlanStage* buildStages(OperationContext* opCtx,
             params.startKeyInclusive = csn->startKeyInclusive;
             params.endKey = csn->endKey;
             params.endKeyInclusive = csn->endKeyInclusive;
-
             return new CountScan(opCtx, std::move(params), ws);
         }
         case STAGE_ENSURE_SORTED: {
@@ -364,18 +370,20 @@ PlanStage* buildStages(OperationContext* opCtx,
             return new EnsureSortedStage(opCtx, esn->pattern, ws, childStage);
         }
         case STAGE_CACHED_PLAN:
+        case STAGE_CHANGE_STREAM_PROXY:
         case STAGE_COUNT:
         case STAGE_DELETE:
         case STAGE_EOF:
-        case STAGE_GROUP:
         case STAGE_IDHACK:
         case STAGE_MULTI_ITERATOR:
         case STAGE_MULTI_PLAN:
         case STAGE_PIPELINE_PROXY:
         case STAGE_QUEUED_DATA:
+        case STAGE_RECORD_STORE_FAST_COUNT:
         case STAGE_SUBPLAN:
-        case STAGE_TEXT_OR:
         case STAGE_TEXT_MATCH:
+        case STAGE_TEXT_OR:
+        case STAGE_TRIAL:
         case STAGE_UNKNOWN:
         case STAGE_UPDATE: {
             mongoutils::str::stream ss;
@@ -389,7 +397,7 @@ PlanStage* buildStages(OperationContext* opCtx,
 
 // static (this one is used for Cached and MultiPlanStage)
 bool StageBuilder::build(OperationContext* opCtx,
-                         Collection* collection,
+                         const Collection* collection,
                          const CanonicalQuery& cq,
                          const QuerySolution& solution,
                          WorkingSet* wsIn,

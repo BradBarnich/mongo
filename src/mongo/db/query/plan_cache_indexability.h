@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -41,7 +43,7 @@ class BSONObj;
 class CollatorInterface;
 class CompositeIndexabilityDiscriminator;
 class MatchExpression;
-struct IndexEntry;
+struct CoreIndexInfo;
 
 using IndexabilityDiscriminator = stdx::function<bool(const MatchExpression* me)>;
 using IndexabilityDiscriminators = std::vector<IndexabilityDiscriminator>;
@@ -102,9 +104,9 @@ public:
     IndexToDiscriminatorMap buildWildcardDiscriminators(StringData path) const;
 
     /**
-     * Clears discriminators for all paths, and regenerate them from 'indexEntries'.
+     * Clears discriminators for all paths, and regenerates them from 'indexCores'.
      */
-    void updateDiscriminators(const std::vector<IndexEntry>& indexEntries);
+    void updateDiscriminators(const std::vector<CoreIndexInfo>& indexCores);
 
 private:
     using PathDiscriminatorsMap = StringMap<IndexToDiscriminatorMap>;
@@ -115,21 +117,21 @@ private:
      * index.
      */
     struct WildcardIndexDiscriminatorContext {
-        WildcardIndexDiscriminatorContext(std::unique_ptr<ProjectionExecAgg> proj,
+        WildcardIndexDiscriminatorContext(const ProjectionExecAgg* proj,
                                           std::string name,
                                           const MatchExpression* filter,
                                           const CollatorInterface* coll)
-            : projectionExec(std::move(proj)),
-              catalogName(std::move(name)),
+            : projectionExec(proj),
               filterExpr(filter),
-              collator(coll) {}
-
-        std::unique_ptr<ProjectionExecAgg> projectionExec;
-        std::string catalogName;
+              collator(coll),
+              catalogName(std::move(name)) {}
 
         // These are owned by the catalog.
+        const ProjectionExecAgg* projectionExec;
         const MatchExpression* filterExpr;  // For partial indexes.
         const CollatorInterface* collator;
+
+        std::string catalogName;
     };
 
     /**
@@ -172,7 +174,7 @@ private:
      * path, appropriate discriminators for the wildcard index will be included if it includes the
      * given path.
      */
-    void processWildcardIndex(const IndexEntry& ie);
+    void processWildcardIndex(const CoreIndexInfo& cii);
 
     // PathDiscriminatorsMap is a map from field path to index name to IndexabilityDiscriminator.
     PathDiscriminatorsMap _pathDiscriminatorsMap;

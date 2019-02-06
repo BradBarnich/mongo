@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -40,11 +42,18 @@ namespace mongo {
 
 class BSONObj;
 class Collection;
+class MetadataManager;
 class OperationContext;
+
+// The maximum number of documents to delete in a single batch during range deletion.
+// secondaryThrottle and rangeDeleterBatchDelayMS apply between each batch.
+// Must be positive or 0 (the default), which means to use the value of
+// internalQueryExecYieldIterations (or 1 if that's negative or zero).
+extern AtomicWord<int> rangeDeleterBatchSize;
 
 // After completing a batch of document deletions, the time in millis to wait before commencing the
 // next batch of deletions.
-extern AtomicInt32 rangeDeleterBatchDelayMS;
+extern AtomicWord<int> rangeDeleterBatchDelayMS;
 
 class CollectionRangeDeleter {
     MONGO_DISALLOW_COPYING(CollectionRangeDeleter);
@@ -164,16 +173,30 @@ public:
      * If it should be scheduled to run again because there might be more documents to delete,
      * returns the time to begin, or boost::none otherwise.
      *
+     * Negative (or zero) value for 'maxToDelete' indicates some canonical default should be used.
+     *
      * Argument 'forTestOnly' is used in unit tests that exercise the CollectionRangeDeleter class,
      * so that they do not need to set up CollectionShardingState and MetadataManager objects.
      */
     static boost::optional<Date_t> cleanUpNextRange(OperationContext*,
                                                     NamespaceString const& nss,
                                                     OID const& epoch,
-                                                    int maxToDelete,
+                                                    int maxToDelete = 0,
                                                     CollectionRangeDeleter* forTestOnly = nullptr);
 
 private:
+    /**
+     * Verifies that the metadata for the collection to be cleaned up is still valid. Makes sure
+     * the collection has not been dropped (or dropped then recreated).
+     */
+    static bool _checkCollectionMetadataStillValid(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        OID const& epoch,
+        CollectionRangeDeleter* forTestOnly,
+        Collection* collection,
+        std::shared_ptr<MetadataManager> metadataManager);
+
     /**
      * Performs the deletion of up to maxToDelete entries within the range in progress. Must be
      * called under the collection lock.

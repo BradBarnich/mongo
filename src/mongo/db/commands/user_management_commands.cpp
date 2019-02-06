@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
 
@@ -47,7 +49,6 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/privilege_parser.h"
@@ -418,7 +419,7 @@ Status insertRoleDocument(OperationContext* opCtx, const BSONObj& roleObj) {
     if (status.code() == ErrorCodes::DuplicateKey) {
         std::string name = roleObj[AuthorizationManager::ROLE_NAME_FIELD_NAME].String();
         std::string source = roleObj[AuthorizationManager::ROLE_DB_FIELD_NAME].String();
-        return Status(ErrorCodes::DuplicateKey,
+        return Status(ErrorCodes::Error(51002),
                       str::stream() << "Role \"" << name << "@" << source << "\" already exists");
     }
     if (status.code() == ErrorCodes::UnknownError) {
@@ -477,7 +478,7 @@ Status insertPrivilegeDocument(OperationContext* opCtx, const BSONObj& userObj) 
     if (status.code() == ErrorCodes::DuplicateKey) {
         std::string name = userObj[AuthorizationManager::USER_NAME_FIELD_NAME].String();
         std::string source = userObj[AuthorizationManager::USER_DB_FIELD_NAME].String();
-        return Status(ErrorCodes::DuplicateKey,
+        return Status(ErrorCodes::Error(51003),
                       str::stream() << "User \"" << name << "@" << source << "\" already exists");
     }
     if (status.code() == ErrorCodes::UnknownError) {
@@ -703,7 +704,7 @@ Status buildCredentials(BSONObjBuilder* builder, const auth::CreateOrUpdateUserA
         if (!args.digestPassword) {
             return {ErrorCodes::BadValue, "Use of SCRAM-SHA-256 requires undigested passwords"};
         }
-        const auto swPwd = saslPrep(args.password);
+        const auto swPwd = icuSaslPrep(args.password);
         if (!swPwd.isOK()) {
             return swPwd.getStatus();
         }
@@ -768,10 +769,6 @@ Status trimCredentials(OperationContext* opCtx,
 class CmdCreateUser : public BasicCommand {
 public:
     CmdCreateUser() : BasicCommand("createUser") {}
-
-    bool isUserManagementCommand() const override {
-        return true;
-    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -893,10 +890,6 @@ public:
 class CmdUpdateUser : public BasicCommand {
 public:
     CmdUpdateUser() : BasicCommand("updateUser") {}
-
-    bool isUserManagementCommand() const override {
-        return true;
-    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -1021,10 +1014,6 @@ class CmdDropUser : public BasicCommand {
 public:
     CmdDropUser() : BasicCommand("dropUser") {}
 
-    bool isUserManagementCommand() const override {
-        return true;
-    }
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -1083,10 +1072,6 @@ class CmdDropAllUsersFromDatabase : public BasicCommand {
 public:
     CmdDropAllUsersFromDatabase() : BasicCommand("dropAllUsersFromDatabase") {}
 
-    bool isUserManagementCommand() const override {
-        return true;
-    }
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -1134,10 +1119,6 @@ public:
 class CmdGrantRolesToUser : public BasicCommand {
 public:
     CmdGrantRolesToUser() : BasicCommand("grantRolesToUser") {}
-
-    bool isUserManagementCommand() const override {
-        return true;
-    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -1201,10 +1182,6 @@ public:
 class CmdRevokeRolesFromUser : public BasicCommand {
 public:
     CmdRevokeRolesFromUser() : BasicCommand("revokeRolesFromUser") {}
-
-    bool isUserManagementCommand() const override {
-        return true;
-    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -1423,10 +1400,6 @@ class CmdCreateRole : public BasicCommand {
 public:
     CmdCreateRole() : BasicCommand("createRole") {}
 
-    bool isUserManagementCommand() const override {
-        return true;
-    }
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -1526,10 +1499,6 @@ public:
 class CmdUpdateRole : public BasicCommand {
 public:
     CmdUpdateRole() : BasicCommand("updateRole") {}
-
-    bool isUserManagementCommand() const override {
-        return true;
-    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -1633,10 +1602,6 @@ class CmdGrantPrivilegesToRole : public BasicCommand {
 public:
     CmdGrantPrivilegesToRole() : BasicCommand("grantPrivilegesToRole") {}
 
-    bool isUserManagementCommand() const override {
-        return true;
-    }
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -1727,10 +1692,6 @@ public:
 class CmdRevokePrivilegesFromRole : public BasicCommand {
 public:
     CmdRevokePrivilegesFromRole() : BasicCommand("revokePrivilegesFromRole") {}
-
-    bool isUserManagementCommand() const override {
-        return true;
-    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -1826,10 +1787,6 @@ class CmdGrantRolesToRole : public BasicCommand {
 public:
     CmdGrantRolesToRole() : BasicCommand("grantRolesToRole") {}
 
-    bool isUserManagementCommand() const override {
-        return true;
-    }
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -1906,10 +1863,6 @@ class CmdRevokeRolesFromRole : public BasicCommand {
 public:
     CmdRevokeRolesFromRole() : BasicCommand("revokeRolesFromRole") {}
 
-    bool isUserManagementCommand() const override {
-        return true;
-    }
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -1983,10 +1936,6 @@ class CmdDropRole : public BasicCommand {
 public:
     CmdDropRole() : BasicCommand("dropRole") {}
 
-    bool isUserManagementCommand() const override {
-        return true;
-    }
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -2032,7 +1981,7 @@ public:
         uassertStatusOK(status);
 
         // From here on, we always want to invalidate the user cache before returning.
-        auto invalidateGuard = MakeGuard([&] {
+        auto invalidateGuard = makeGuard([&] {
             try {
                 authzManager->invalidateUserCache(opCtx);
             } catch (const DBException& e) {
@@ -2119,10 +2068,6 @@ class CmdDropAllRolesFromDatabase : public BasicCommand {
 public:
     CmdDropAllRolesFromDatabase() : BasicCommand("dropAllRolesFromDatabase") {}
 
-    bool isUserManagementCommand() const override {
-        return true;
-    }
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
@@ -2157,7 +2102,7 @@ public:
 
         auto lk = uassertStatusOK(requireWritableAuthSchema28SCRAM(opCtx, authzManager));
         // From here on, we always want to invalidate the user cache before returning.
-        auto invalidateGuard = MakeGuard([&] {
+        auto invalidateGuard = makeGuard([&] {
             try {
                 authzManager->invalidateUserCache(opCtx);
             } catch (const DBException& e) {
@@ -2350,7 +2295,7 @@ public:
              const string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
+        AuthorizationManager* authzManager = AuthorizationManager::get(opCtx->getServiceContext());
         auto lk = requireReadableAuthSchema26Upgrade(opCtx, authzManager);
         authzManager->invalidateUserCache(opCtx);
         return true;
@@ -2388,7 +2333,7 @@ public:
              const string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        AuthorizationManager* authzManager = getGlobalAuthorizationManager();
+        AuthorizationManager* authzManager = AuthorizationManager::get(opCtx->getServiceContext());
         result.append("cacheGeneration", authzManager->getCacheGeneration());
         return true;
     }
@@ -2408,10 +2353,6 @@ public:
 class CmdMergeAuthzCollections : public BasicCommand {
 public:
     CmdMergeAuthzCollections() : BasicCommand("_mergeAuthzCollections") {}
-
-    bool isUserManagementCommand() const override {
-        return true;
-    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
@@ -2771,7 +2712,7 @@ public:
 
         auto lk = uassertStatusOK(requireWritableAuthSchema28SCRAM(opCtx, authzManager));
         // From here on, we always want to invalidate the user cache before returning.
-        auto invalidateGuard = MakeGuard([&] {
+        auto invalidateGuard = makeGuard([&] {
             try {
                 authzManager->invalidateUserCache(opCtx);
             } catch (const DBException& e) {

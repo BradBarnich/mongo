@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -75,6 +77,8 @@ MONGO_FAIL_POINT_DEFINE(maxTimeNeverTimeOut);
 // inclusive.
 MONGO_FAIL_POINT_DEFINE(checkForInterruptFail);
 
+const auto kNoWaiterThread = stdx::thread::id();
+
 }  // namespace
 
 OperationContext::OperationContext(Client* client, unsigned int opId)
@@ -82,6 +86,8 @@ OperationContext::OperationContext(Client* client, unsigned int opId)
       _opId(opId),
       _elapsedTime(client ? client->getServiceContext()->getTickSource()
                           : SystemTickSource::get()) {}
+
+OperationContext::~OperationContext() = default;
 
 void OperationContext::setDeadlineAndMaxTime(Date_t when,
                                              Microseconds maxTime,
@@ -149,6 +155,10 @@ bool OperationContext::hasDeadlineExpired() const {
 
     const auto now = getServiceContext()->getFastClockSource()->now();
     return now >= getDeadline();
+}
+
+ErrorCodes::Error OperationContext::getTimeoutError() const {
+    return _timeoutError;
 }
 
 Milliseconds OperationContext::getRemainingMaxTimeMillis() const {
@@ -253,6 +263,7 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
         stdx::lock_guard<Client> clientLock(*getClient());
         invariant(!_waitMutex);
         invariant(!_waitCV);
+        invariant(_waitThread == kNoWaiterThread);
         invariant(0 == _numKillers);
 
         // This interrupt check must be done while holding the client lock, so as not to race with a
@@ -263,6 +274,7 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
         }
         _waitMutex = m.mutex();
         _waitCV = &cv;
+        _waitThread = stdx::this_thread::get_id();
     }
 
     // If the maxTimeNeverTimeOut failpoint is set, behave as though the operation's deadline does
@@ -294,6 +306,7 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
         if (0 == _numKillers) {
             _waitMutex = nullptr;
             _waitCV = nullptr;
+            _waitThread = kNoWaiterThread;
             return true;
         }
         return false;
@@ -320,10 +333,23 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
 void OperationContext::markKilled(ErrorCodes::Error killCode) {
     invariant(killCode != ErrorCodes::OK);
     stdx::unique_lock<stdx::mutex> lkWaitMutex;
-    if (_waitMutex) {
+
+    // If we have a _waitMutex, it means this opCtx is currently blocked in
+    // waitForConditionOrInterrupt.
+    //
+    // From there, we also know which thread is actually doing that waiting (it's recorded in
+    // _waitThread).  If that thread isn't our thread, it's necessary to do the regular numKillers
+    // song and dance mentioned in waitForConditionOrInterrupt.
+    //
+    // If it is our thread, we know that we're currently inside that call to
+    // waitForConditionOrInterrupt and are being invoked by a callback run from Baton->run.  And
+    // that means we don't need to deal with the waitMutex and waitCV (because we're running
+    // callbacks, which means run is returning, which means we'll be checking _killCode in the near
+    // future).
+    if (_waitMutex && stdx::this_thread::get_id() != _waitThread) {
         invariant(++_numKillers > 0);
         getClient()->unlock();
-        ON_BLOCK_EXIT([this]() noexcept {
+        ON_BLOCK_EXIT([this] {
             getClient()->lock();
             invariant(--_numKillers >= 0);
         });

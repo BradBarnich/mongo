@@ -1,29 +1,30 @@
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
@@ -36,24 +37,27 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/index_catalog_entry.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/ops/write_ops_exec.h"
-#include "mongo/db/ops/write_ops_gen.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline_d.h"
+#include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/session_catalog.h"
+#include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/stats/fill_locker_info.h"
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/transaction_participant.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/write_ops/cluster_write.h"
+#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/query/document_source_merge_cursors.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -68,57 +72,41 @@ using write_ops::UpdateOpEntry;
 
 namespace {
 
-/**
- * Builds an ordered insert op on namespace 'nss' and documents to be written 'objs'.
- */
-Insert buildInsertOp(const NamespaceString& nss,
-                     std::vector<BSONObj>&& objs,
-                     bool bypassDocValidation) {
-    Insert insertOp(nss);
-    insertOp.setDocuments(std::move(objs));
-    insertOp.setWriteCommandBase([&] {
-        write_ops::WriteCommandBase wcb;
-        wcb.setOrdered(true);
-        wcb.setBypassDocumentValidation(bypassDocValidation);
-        return wcb;
-    }());
-    return insertOp;
-}
+class MongoDResourceYielder : public ResourceYielder {
+public:
+    void yield(OperationContext* opCtx) override {
+        // We're about to block. Check back in the session so that it's available to other
+        // threads. Note that we may block on a request to _ourselves_, meaning that we may have to
+        // wait for another thread which will use the same session. This step is necessary
+        // to prevent deadlocks.
 
-/**
- * Builds an ordered update op on namespace 'nss' with update entries {q: <queries>, u: <updates>}.
- *
- * Note that 'queries' and 'updates' must be the same length.
- */
-Update buildUpdateOp(const NamespaceString& nss,
-                     std::vector<BSONObj>&& queries,
-                     std::vector<BSONObj>&& updates,
-                     bool upsert,
-                     bool multi,
-                     bool bypassDocValidation) {
-    Update updateOp(nss);
-    updateOp.setUpdates([&] {
-        std::vector<UpdateOpEntry> updateEntries;
-        for (size_t index = 0; index < queries.size(); ++index) {
-            updateEntries.push_back([&] {
-                UpdateOpEntry entry;
-                entry.setQ(std::move(queries[index]));
-                entry.setU(std::move(updates[index]));
-                entry.setUpsert(upsert);
-                entry.setMulti(multi);
-                return entry;
-            }());
+        Session* const session = OperationContextSession::get(opCtx);
+        if (session) {
+            MongoDOperationContextSession::checkIn(opCtx);
         }
-        return updateEntries;
-    }());
-    updateOp.setWriteCommandBase([&] {
-        write_ops::WriteCommandBase wcb;
-        wcb.setOrdered(true);
-        wcb.setBypassDocumentValidation(bypassDocValidation);
-        return wcb;
-    }());
-    return updateOp;
-}
+        _yielded = (session != nullptr);
+    }
+
+    void unyield(OperationContext* opCtx) override {
+        if (_yielded) {
+            // This may block on a sub-operation on this node finishing. It's possible that while
+            // blocked on the network layer, another shard could have responded, theoretically
+            // unblocking this thread of execution. However, we must wait until the child operation
+            // on this shard finishes so we can get the session back. This may limit the throughput
+            // of the operation, but it's correct.
+            MongoDOperationContextSession::checkOut(opCtx,
+                                                    // Assumes this is only called from the
+                                                    // 'aggregate' or 'getMore' commands.  The code
+                                                    // which relies on this parameter does not
+                                                    // distinguish/care about the difference so we
+                                                    // simply always pass 'aggregate'.
+                                                    "aggregate");
+        }
+    }
+
+private:
+    bool _yielded = false;
+};
 
 // Returns true if the field names of 'keyPattern' are exactly those in 'uniqueKeyPaths', and each
 // of the elements of 'keyPattern' is numeric, i.e. not "text", "$**", or any other special type of
@@ -159,28 +147,84 @@ DBClientBase* MongoInterfaceStandalone::directClient() {
 }
 
 bool MongoInterfaceStandalone::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
-    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
-    auto const css = CollectionShardingState::get(opCtx, nss);
-    return css->getMetadata(opCtx)->isSharded();
+    AutoGetCollectionForRead autoColl(opCtx, nss);
+    const auto metadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
+    return metadata->isSharded();
+}
+
+Insert MongoInterfaceStandalone::buildInsertOp(const NamespaceString& nss,
+                                               std::vector<BSONObj>&& objs,
+                                               bool bypassDocValidation) {
+    Insert insertOp(nss);
+    insertOp.setDocuments(std::move(objs));
+    insertOp.setWriteCommandBase([&] {
+        write_ops::WriteCommandBase wcb;
+        wcb.setOrdered(false);
+        wcb.setBypassDocumentValidation(bypassDocValidation);
+        return wcb;
+    }());
+    return insertOp;
+}
+
+Update MongoInterfaceStandalone::buildUpdateOp(const NamespaceString& nss,
+                                               std::vector<BSONObj>&& queries,
+                                               std::vector<BSONObj>&& updates,
+                                               bool upsert,
+                                               bool multi,
+                                               bool bypassDocValidation) {
+    Update updateOp(nss);
+    updateOp.setUpdates([&] {
+        std::vector<UpdateOpEntry> updateEntries;
+        for (size_t index = 0; index < queries.size(); ++index) {
+            updateEntries.push_back([&] {
+                UpdateOpEntry entry;
+                entry.setQ(std::move(queries[index]));
+                entry.setU(std::move(updates[index]));
+                entry.setUpsert(upsert);
+                entry.setMulti(multi);
+                return entry;
+            }());
+        }
+        return updateEntries;
+    }());
+    updateOp.setWriteCommandBase([&] {
+        write_ops::WriteCommandBase wcb;
+        wcb.setOrdered(false);
+        wcb.setBypassDocumentValidation(bypassDocValidation);
+        return wcb;
+    }());
+    return updateOp;
 }
 
 void MongoInterfaceStandalone::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                       const NamespaceString& ns,
-                                      std::vector<BSONObj>&& objs) {
+                                      std::vector<BSONObj>&& objs,
+                                      const WriteConcernOptions& wc,
+                                      boost::optional<OID> targetEpoch) {
     auto writeResults = performInserts(
         expCtx->opCtx, buildInsertOp(ns, std::move(objs), expCtx->bypassDocumentValidation));
 
-    // Only need to check that the final result passed because the inserts are ordered and the batch
-    // will stop on the first failure.
-    uassertStatusOKWithContext(writeResults.results.back().getStatus(), "Insert failed: ");
+    // Need to check each result in the batch since the writes are unordered.
+    uassertStatusOKWithContext(
+        [&writeResults]() {
+            for (const auto& result : writeResults.results) {
+                if (result.getStatus() != Status::OK()) {
+                    return result.getStatus();
+                }
+            }
+            return Status::OK();
+        }(),
+        "Insert failed: ");
 }
 
 void MongoInterfaceStandalone::update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                       const NamespaceString& ns,
                                       std::vector<BSONObj>&& queries,
                                       std::vector<BSONObj>&& updates,
+                                      const WriteConcernOptions& wc,
                                       bool upsert,
-                                      bool multi) {
+                                      bool multi,
+                                      boost::optional<OID> targetEpoch) {
     auto writeResults = performUpdates(expCtx->opCtx,
                                        buildUpdateOp(ns,
                                                      std::move(queries),
@@ -189,9 +233,17 @@ void MongoInterfaceStandalone::update(const boost::intrusive_ptr<ExpressionConte
                                                      multi,
                                                      expCtx->bypassDocumentValidation));
 
-    // Only need to check that the final result passed because the updates are ordered and the batch
-    // will stop on the first failure.
-    uassertStatusOKWithContext(writeResults.results.back().getStatus(), "Update failed: ");
+    // Need to check each result in the batch since the writes are unordered.
+    uassertStatusOKWithContext(
+        [&writeResults]() {
+            for (const auto& result : writeResults.results) {
+                if (result.getStatus() != Status::OK()) {
+                    return result.getStatus();
+                }
+            }
+            return Status::OK();
+        }(),
+        "Update failed: ");
 }
 
 CollectionIndexUsageMap MongoInterfaceStandalone::getIndexStats(OperationContext* opCtx,
@@ -238,7 +290,7 @@ void MongoInterfaceStandalone::renameIfOptionsAndIndexesHaveNotChanged(
     const NamespaceString& targetNs,
     const BSONObj& originalCollectionOptions,
     const std::list<BSONObj>& originalIndexes) {
-    Lock::GlobalWrite globalLock(opCtx);
+    Lock::DBLock(opCtx, targetNs.db(), MODE_X);
 
     uassert(ErrorCodes::CommandFailed,
             str::stream() << "collection options of target collection " << targetNs.ns()
@@ -265,63 +317,48 @@ void MongoInterfaceStandalone::renameIfOptionsAndIndexesHaveNotChanged(
             _client.runCommand("admin", renameCommandObj, info));
 }
 
-StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> MongoInterfaceStandalone::makePipeline(
+std::unique_ptr<Pipeline, PipelineDeleter> MongoInterfaceStandalone::makePipeline(
     const std::vector<BSONObj>& rawPipeline,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const MakePipelineOptions opts) {
-    auto pipeline = Pipeline::parse(rawPipeline, expCtx);
-    if (!pipeline.isOK()) {
-        return pipeline.getStatus();
-    }
+    auto pipeline = uassertStatusOK(Pipeline::parse(rawPipeline, expCtx));
 
     if (opts.optimize) {
-        pipeline.getValue()->optimizePipeline();
+        pipeline->optimizePipeline();
     }
-
-    Status cursorStatus = Status::OK();
 
     if (opts.attachCursorSource) {
-        cursorStatus = attachCursorSourceToPipeline(expCtx, pipeline.getValue().get());
+        pipeline = attachCursorSourceToPipeline(expCtx, pipeline.release());
     }
 
-    return cursorStatus.isOK() ? std::move(pipeline) : cursorStatus;
+    return pipeline;
 }
 
-Status MongoInterfaceStandalone::attachCursorSourceToPipeline(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) {
+unique_ptr<Pipeline, PipelineDeleter> MongoInterfaceStandalone::attachCursorSourceToPipeline(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* ownedPipeline) {
+    std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
+                                                        PipelineDeleter(expCtx->opCtx));
+
     invariant(pipeline->getSources().empty() ||
               !dynamic_cast<DocumentSourceCursor*>(pipeline->getSources().front().get()));
 
     boost::optional<AutoGetCollectionForReadCommand> autoColl;
-    if (expCtx->uuid) {
-        try {
-            autoColl.emplace(expCtx->opCtx,
-                             NamespaceStringOrUUID{expCtx->ns.db().toString(), *expCtx->uuid});
-        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
-            // The UUID doesn't exist anymore
-            return ex.toStatus();
-        }
-    } else {
-        autoColl.emplace(expCtx->opCtx, expCtx->ns);
-    }
+    const NamespaceStringOrUUID nsOrUUID = expCtx->uuid
+        ? NamespaceStringOrUUID{expCtx->ns.db().toString(), *expCtx->uuid}
+        : expCtx->ns;
+    autoColl.emplace(expCtx->opCtx,
+                     nsOrUUID,
+                     AutoGetCollection::ViewMode::kViewsForbidden,
+                     Date_t::max(),
+                     AutoStatsTracker::LogMode::kUpdateTop);
 
-    // makePipeline() is only called to perform secondary aggregation requests and expects the
-    // collection representing the document source to be not-sharded. We confirm sharding state
-    // here to avoid taking a collection lock elsewhere for this purpose alone.
-    // TODO SERVER-27616: This check is incorrect in that we don't acquire a collection cursor
-    // until after we release the lock, leaving room for a collection to be sharded in-between.
-    auto css = CollectionShardingState::get(expCtx->opCtx, expCtx->ns);
-    uassert(4567,
-            str::stream() << "from collection (" << expCtx->ns.ns() << ") cannot be sharded",
-            !css->getMetadata(expCtx->opCtx)->isSharded());
-
-    PipelineD::prepareCursorSource(autoColl->getCollection(), expCtx->ns, nullptr, pipeline);
+    PipelineD::prepareCursorSource(autoColl->getCollection(), expCtx->ns, nullptr, pipeline.get());
 
     // Optimize again, since there may be additional optimizations that can be done after adding
     // the initial cursor stage.
     pipeline->optimizePipeline();
 
-    return Status::OK();
+    return pipeline;
 }
 
 std::string MongoInterfaceStandalone::getShardName(OperationContext* opCtx) const {
@@ -332,14 +369,21 @@ std::string MongoInterfaceStandalone::getShardName(OperationContext* opCtx) cons
     return std::string();
 }
 
-std::pair<std::vector<FieldPath>, bool> MongoInterfaceStandalone::collectDocumentKeyFields(
-    OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const {
+std::pair<std::vector<FieldPath>, bool>
+MongoInterfaceStandalone::collectDocumentKeyFieldsForHostedCollection(OperationContext* opCtx,
+                                                                      const NamespaceString& nss,
+                                                                      UUID uuid) const {
     return {{"_id"}, false};  // Nothing is sharded.
+}
+
+std::vector<FieldPath> MongoInterfaceStandalone::collectDocumentKeyFieldsActingAsRouter(
+    OperationContext* opCtx, const NamespaceString& nss) const {
+    return {"_id"};  // Nothing is sharded.
 }
 
 std::vector<GenericCursor> MongoInterfaceStandalone::getIdleCursors(
     const intrusive_ptr<ExpressionContext>& expCtx, CurrentOpUserMode userMode) const {
-    return CursorManager::getIdleCursors(expCtx->opCtx, userMode);
+    return CursorManager::getGlobalCursorManager()->getIdleCursors(expCtx->opCtx, userMode);
 }
 
 boost::optional<Document> MongoInterfaceStandalone::lookupSingleDocument(
@@ -347,9 +391,13 @@ boost::optional<Document> MongoInterfaceStandalone::lookupSingleDocument(
     const NamespaceString& nss,
     UUID collectionUUID,
     const Document& documentKey,
-    boost::optional<BSONObj> readConcern) {
+    boost::optional<BSONObj> readConcern,
+    bool allowSpeculativeMajorityRead) {
     invariant(!readConcern);  // We don't currently support a read concern on mongod - it's only
                               // expected to be necessary on mongos.
+    invariant(!allowSpeculativeMajorityRead);  // We don't expect 'allowSpeculativeMajorityRead' on
+                                               // mongod - it's only expected to be necessary on
+                                               // mongos.
 
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline;
     try {
@@ -358,7 +406,7 @@ boost::optional<Document> MongoInterfaceStandalone::lookupSingleDocument(
             nss,
             collectionUUID,
             _getCollectionDefaultCollator(expCtx->opCtx, nss.db(), collectionUUID));
-        pipeline = uassertStatusOK(makePipeline({BSON("$match" << documentKey)}, foreignExpCtx));
+        pipeline = makePipeline({BSON("$match" << documentKey)}, foreignExpCtx);
     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         return boost::none;
     }
@@ -374,6 +422,18 @@ boost::optional<Document> MongoInterfaceStandalone::lookupSingleDocument(
                                 << next->toString()
                                 << "]");
     }
+
+    // Set the speculative read optime appropriately after we do a document lookup locally. We don't
+    // know exactly what optime the document reflects, we so set the speculative read optime to the
+    // most recent applied optime.
+    repl::SpeculativeMajorityReadInfo& speculativeMajorityReadInfo =
+        repl::SpeculativeMajorityReadInfo::get(expCtx->opCtx);
+    if (speculativeMajorityReadInfo.isSpeculativeRead()) {
+        auto replCoord = repl::ReplicationCoordinator::get(expCtx->opCtx);
+        speculativeMajorityReadInfo.setSpeculativeReadOpTimeForward(
+            replCoord->getMyLastAppliedOpTime());
+    }
+
     return lookedUpDocument;
 }
 
@@ -386,12 +446,23 @@ BackupCursorState MongoInterfaceStandalone::openBackupCursor(OperationContext* o
     }
 }
 
-void MongoInterfaceStandalone::closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) {
+void MongoInterfaceStandalone::closeBackupCursor(OperationContext* opCtx, const UUID& backupId) {
     auto backupCursorHooks = BackupCursorHooks::get(opCtx->getServiceContext());
     if (backupCursorHooks->enabled()) {
-        backupCursorHooks->closeBackupCursor(opCtx, cursorId);
+        backupCursorHooks->closeBackupCursor(opCtx, backupId);
     } else {
         uasserted(50955, "Backup cursors are an enterprise only feature.");
+    }
+}
+
+BackupCursorExtendState MongoInterfaceStandalone::extendBackupCursor(OperationContext* opCtx,
+                                                                     const UUID& backupId,
+                                                                     const Timestamp& extendTo) {
+    auto backupCursorHooks = BackupCursorHooks::get(opCtx->getServiceContext());
+    if (backupCursorHooks->enabled()) {
+        return backupCursorHooks->extendBackupCursor(opCtx, backupId, extendTo);
+    } else {
+        uasserted(51010, "Backup cursors are an enterprise only feature.");
     }
 }
 
@@ -430,18 +501,17 @@ bool MongoInterfaceStandalone::uniqueKeyIsSupportedByIndex(
     // the catalog.
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
     Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_IS);
-    const auto* collection = [&]() -> Collection* {
-        auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.db());
-        return db ? db->getCollection(opCtx, nss) : nullptr;
-    }();
+    auto databaseHolder = DatabaseHolder::get(opCtx);
+    auto db = databaseHolder->getDb(opCtx, nss.db());
+    auto collection = db ? db->getCollection(opCtx, nss) : nullptr;
     if (!collection) {
         return uniqueKeyPaths == std::set<FieldPath>{"_id"};
     }
 
     auto indexIterator = collection->getIndexCatalog()->getIndexIterator(opCtx, false);
-    while (indexIterator.more()) {
-        IndexDescriptor* descriptor = indexIterator.next();
-        if (supportsUniqueKey(expCtx, indexIterator.catalogEntry(descriptor), uniqueKeyPaths)) {
+    while (indexIterator->more()) {
+        const IndexCatalogEntry* entry = indexIterator->next();
+        if (supportsUniqueKey(expCtx, entry, uniqueKeyPaths)) {
             return true;
         }
     }
@@ -459,7 +529,7 @@ BSONObj MongoInterfaceStandalone::_reportCurrentOpForClient(
 
     if (clientOpCtx) {
         if (auto txnParticipant = TransactionParticipant::get(clientOpCtx)) {
-            txnParticipant->reportUnstashedState(repl::ReadConcernArgs::get(clientOpCtx), &builder);
+            txnParticipant->reportUnstashedState(clientOpCtx, &builder);
         }
 
         // Append lock stats before returning.
@@ -489,11 +559,9 @@ void MongoInterfaceStandalone::_reportCurrentOpsForIdleSessions(OperationContext
                               : KillAllSessionsByPatternSet{{}});
 
     sessionCatalog->scanSessions(
-        opCtx,
         {std::move(sessionFilter)},
-        [&](OperationContext* opCtx, Session* session) {
-            auto op =
-                TransactionParticipant::getFromNonCheckedOutSession(session)->reportStashedState();
+        [&](const ObservableSession& session) {
+            auto op = TransactionParticipant::get(session.get())->reportStashedState();
             if (!op.isEmpty()) {
                 ops->emplace_back(op);
             }
@@ -522,6 +590,10 @@ std::unique_ptr<CollatorInterface> MongoInterfaceStandalone::_getCollectionDefau
 
     auto& collator = it->second;
     return collator ? collator->clone() : nullptr;
+}
+
+std::unique_ptr<ResourceYielder> MongoInterfaceStandalone::getResourceYielder() const {
+    return std::make_unique<MongoDResourceYielder>();
 }
 
 }  // namespace mongo

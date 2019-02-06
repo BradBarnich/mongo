@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,8 +33,10 @@
 #include <memory>
 
 #include "mongo/base/status.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/functional.h"
 #include "mongo/util/future.h"
 #include "mongo/util/time_support.h"
 
@@ -106,8 +110,8 @@ public:
     enum WhichReactor { kIngress, kEgress, kNewReactor };
     virtual ReactorHandle getReactor(WhichReactor which) = 0;
 
-    virtual BatonHandle makeBaton(OperationContext* opCtx) {
-        return nullptr;
+    virtual BatonHandle makeBaton(OperationContext* opCtx) const {
+        return opCtx->getServiceContext()->makeBaton(opCtx);
     }
 
 protected:
@@ -116,7 +120,8 @@ protected:
 
 class ReactorTimer {
 public:
-    ReactorTimer() = default;
+    ReactorTimer();
+
     ReactorTimer(const ReactorTimer&) = delete;
     ReactorTimer& operator=(const ReactorTimer&) = delete;
 
@@ -124,6 +129,10 @@ public:
      * The destructor calls cancel() to ensure outstanding Futures are filled.
      */
     virtual ~ReactorTimer() = default;
+
+    size_t id() const {
+        return _id;
+    }
 
     /*
      * Cancel any outstanding future from waitFor/waitUntil. The future will be filled with an
@@ -139,6 +148,9 @@ public:
      * Calling this implicitly calls cancel().
      */
     virtual Future<void> waitUntil(Date_t deadline, const BatonHandle& baton = nullptr) = 0;
+
+private:
+    const size_t _id;
 };
 
 class Reactor {
@@ -156,7 +168,7 @@ public:
     virtual void stop() = 0;
     virtual void drain() = 0;
 
-    using Task = stdx::function<void()>;
+    using Task = unique_function<void()>;
 
     enum ScheduleMode { kDispatch, kPost };
     virtual void schedule(ScheduleMode mode, Task task) = 0;
@@ -164,8 +176,8 @@ public:
     template <typename Callback>
     Future<FutureContinuationResult<Callback>> execute(Callback&& cb) {
         auto pf = makePromiseFuture<FutureContinuationResult<Callback>>();
-        schedule(kPost, [ cb = std::forward<Callback>(cb), sp = pf.promise.share() ]() mutable {
-            sp.setWith(cb);
+        schedule(kPost, [ cb = std::forward<Callback>(cb), p = std::move(pf.promise) ]() mutable {
+            p.setWith(cb);
         });
 
         return std::move(pf.future);

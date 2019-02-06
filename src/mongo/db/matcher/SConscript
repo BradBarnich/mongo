@@ -64,6 +64,7 @@ env.Library(
         'schema/expression_internal_schema_str_length.cpp',
         'schema/expression_internal_schema_unique_items.cpp',
         'schema/expression_internal_schema_xor.cpp',
+        'schema/json_pointer.cpp',
         'schema/json_schema_parser.cpp',
     ],
     LIBDEPS=[
@@ -79,6 +80,14 @@ env.Library(
         '$BUILD_DIR/third_party/shim_pcrecpp',
         'path',
     ],
+)
+
+env.CppUnitTest(
+    target='json_pointer_test',
+    source=['schema/json_pointer_test.cpp'],
+    LIBDEPS=[
+        'expressions'
+    ]
 )
 
 env.CppUnitTest(
@@ -161,13 +170,11 @@ env.Library(
         'expression_where.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/fts/base_fts',
         '$BUILD_DIR/mongo/scripting/scripting_server',
         'expressions',
         '$BUILD_DIR/mongo/db/catalog/collection',
-        '$BUILD_DIR/mongo/db/catalog/database',
         '$BUILD_DIR/mongo/db/catalog/index_catalog',
         '$BUILD_DIR/mongo/db/catalog_raii',
     ],
@@ -183,3 +190,5 @@ env.CppUnitTest(
         'expressions',
     ],
 )
+
+

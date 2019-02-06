@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,7 +40,7 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/value.h"
-#include "mongo/db/query/query_knobs.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -194,9 +196,16 @@ StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState) const {
         txnRequirement = resolvedRequirements.second;
     }
 
+    // If executing on mongos and the foreign collection is sharded, then this stage can run on
+    // mongos or any shard.
+    HostTypeRequirement hostRequirement =
+        (pExpCtx->inMongos && pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _fromNs))
+        ? HostTypeRequirement::kNone
+        : HostTypeRequirement::kPrimaryShard;
+
     StageConstraints constraints(StreamType::kStreaming,
                                  PositionRequirement::kNone,
-                                 HostTypeRequirement::kPrimaryShard,
+                                 hostRequirement,
                                  diskRequirement,
                                  FacetRequirement::kAllowed,
                                  txnRequirement);
@@ -257,14 +266,16 @@ DocumentSource::GetNextResult DocumentSourceLookUp::getNext() {
 
     std::vector<Value> results;
     int objsize = 0;
+    const auto maxBytes = internalLookupStageIntermediateDocumentMaxSizeBytes.load();
     while (auto result = pipeline->getNext()) {
         objsize += result->getApproximateSize();
         uassert(4568,
                 str::stream() << "Total size of documents in " << _fromNs.coll()
-                              << " matching pipeline "
-                              << getUserPipelineDefinition()
-                              << " exceeds maximum document size",
-                objsize <= BSONObjMaxInternalSize);
+                              << " matching pipeline's $lookup stage exceeds "
+                              << maxBytes
+                              << " bytes",
+
+                objsize <= maxBytes);
         results.emplace_back(std::move(*result));
     }
     for (auto&& source : pipeline->getSources()) {
@@ -287,8 +298,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
 
     // If we don't have a cache, build and return the pipeline immediately.
     if (!_cache || _cache->isAbandoned()) {
-        return uassertStatusOK(
-            pExpCtx->mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx));
+        return pExpCtx->mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx);
     }
 
     // Tailor the pipeline construction for our needs. We want a non-optimized pipeline without a
@@ -298,8 +308,8 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
     pipelineOpts.attachCursorSource = false;
 
     // Construct the basic pipeline without a cache stage.
-    auto pipeline = uassertStatusOK(
-        pExpCtx->mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts));
+    auto pipeline =
+        pExpCtx->mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts);
 
     // Add the cache stage at the end and optimize. During the optimization process, the cache will
     // either move itself to the correct position in the pipeline, or will abandon itself if no
@@ -311,8 +321,8 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
 
     if (!_cache->isServing()) {
         // The cache has either been abandoned or has not yet been built. Attach a cursor.
-        uassertStatusOK(pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(
-            _fromExpCtx, pipeline.get()));
+        pipeline = pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(_fromExpCtx,
+                                                                                pipeline.release());
     }
 
     // If the cache has been abandoned, release it.
@@ -320,6 +330,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
         _cache.reset();
     }
 
+    invariant(pipeline);
     return pipeline;
 }
 
@@ -646,8 +657,14 @@ void DocumentSourceLookUp::initializeIntrospectionPipeline() {
     // Ensure that the pipeline does not contain a $changeStream stage. This check will be
     // performed recursively on all sub-pipelines.
     uassert(ErrorCodes::IllegalOperation,
-            "$changeStream is not allowed within a $lookup foreign pipeline",
+            "$changeStream is not allowed within a $lookup's pipeline",
             sources.empty() || !sources.front()->constraints().isChangeStreamStage());
+
+    // Ensure that the pipeline does not contain a $out stage. Since $out must be the last stage
+    // of a pipeline, we only need to check the last DocumentSource.
+    uassert(51047,
+            "$out is not allowed within a $lookup's pipeline",
+            sources.empty() || !sources.back()->constraints().writesPersistentData());
 }
 
 void DocumentSourceLookUp::serializeToArray(
@@ -720,7 +737,12 @@ DepsTracker::State DocumentSourceLookUp::getDependencies(DepsTracker* deps) cons
         // We will use the introspection pipeline which we prebuilt during construction.
         invariant(_parsedIntrospectionPipeline);
 
-        DepsTracker subDeps(deps->getMetadataAvailable());
+        // We are not attempting to enforce that any referenced metadata are in fact available,
+        // this is done elsewhere. We only need to know what variable dependencies exist in the
+        // subpipeline for the top-level pipeline. So without knowledge of what metadata is in fact
+        // available, we "lie" and say that all metadata is available to avoid tripping any
+        // assertions.
+        DepsTracker subDeps(DepsTracker::kAllMetadataAvailable);
 
         // Get the subpipeline dependencies. Subpipeline stages may reference both 'let' variables
         // declared by this $lookup and variables declared externally.

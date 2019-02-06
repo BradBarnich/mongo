@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,7 +40,6 @@
 #include "mongo/base/status.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authz_session_external_state.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/restriction_environment.h"
@@ -406,51 +407,23 @@ Status AuthorizationSessionImpl::checkAuthForKillCursors(const NamespaceString& 
         return Status::OK();
     }
 
-    if (ns.isListCollectionsCursorNS()) {
-        // listCollections: Target the database being enumerated.
-        if (isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(ns.db()),
-                                             ActionType::killAnyCursor)) {
-            return Status::OK();
-        }
-        const bool canKill =
-            isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(ns.db()),
-                                             ActionType::killCursors) ||
-            isAuthorizedToListCollections(ns.db(), BSONObj());
-        if (canKill && isCoauthorizedWith(cursorOwner)) {
-            return Status::OK();
-        }
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "not authorized to kill listCollections cursor on "
-                                    << ns.ns());
-    } else if (ns.isListIndexesCursorNS()) {
-
-        // listIndexes: Target the underlying collection.
-        NamespaceString targetNS = ns.getTargetNSForListIndexes();
-        if (isAuthorizedForActionsOnNamespace(targetNS, ActionType::killAnyCursor)) {
-            return Status::OK();
-        }
-        const bool canKill = isAuthorizedForActionsOnNamespace(targetNS, ActionType::killCursors) ||
-            isAuthorizedForActionsOnNamespace(targetNS, ActionType::listIndexes);
-        if (canKill && isCoauthorizedWith(cursorOwner)) {
-            return Status::OK();
-        }
-
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "not authorized to kill listIndexes cursor on " << ns.ns());
-    } else {
-
-        // Otherwise: Target the collection as named.
-        if (isAuthorizedForActionsOnNamespace(ns, ActionType::killAnyCursor)) {
-            return Status::OK();
-        }
-        const bool canKill = isAuthorizedForActionsOnNamespace(ns, ActionType::killCursors) ||
-            isAuthorizedForActionsOnNamespace(ns, ActionType::find);
-        if (canKill && isCoauthorizedWith(cursorOwner)) {
-            return Status::OK();
-        }
-        return Status(ErrorCodes::Unauthorized,
-                      str::stream() << "not authorized to kill cursor on " << ns.ns());
+    if (isCoauthorizedWith(cursorOwner)) {
+        return Status::OK();
     }
+
+    ResourcePattern target;
+    if (ns.isListCollectionsCursorNS()) {
+        target = ResourcePattern::forDatabaseName(ns.db());
+    } else {
+        target = ResourcePattern::forExactNamespace(ns);
+    }
+
+    if (isAuthorizedForActionsOnResource(target, ActionType::killAnyCursor)) {
+        return Status::OK();
+    }
+
+    return Status(ErrorCodes::Unauthorized,
+                  str::stream() << "not authorized to kill cursor on " << ns.ns());
 }
 
 Status AuthorizationSessionImpl::checkAuthForCreate(const NamespaceString& ns,
@@ -690,7 +663,9 @@ static int buildResourceSearchList(const ResourcePattern& target,
         }
         resourceSearchList[size++] = ResourcePattern::forCollectionName(target.ns().coll());
     } else if (target.isDatabasePattern()) {
-        resourceSearchList[size++] = ResourcePattern::forAnyNormalResource();
+        if (target.ns().db() != "local" && target.ns().db() != "config") {
+            resourceSearchList[size++] = ResourcePattern::forAnyNormalResource();
+        }
     }
     resourceSearchList[size++] = target;
     dassert(size <= resourceSearchListCapacity);
@@ -759,7 +734,7 @@ void AuthorizationSessionImpl::_refreshUserInfoAsNeeded(OperationContext* opCtx)
         if (!user->isValid()) {
             // The user is invalid, so make sure that we erase it from _authenticateUsers at the
             // end of this block.
-            auto removeGuard = MakeGuard([&] { _authenticatedUsers.removeAt(it++); });
+            auto removeGuard = makeGuard([&] { _authenticatedUsers.removeAt(it++); });
 
             // Make a good faith effort to acquire an up-to-date user object, since the one
             // we've cached is marked "out-of-date."
@@ -793,7 +768,7 @@ void AuthorizationSessionImpl::_refreshUserInfoAsNeeded(OperationContext* opCtx)
                     }
 
                     // Success! Replace the old User object with the updated one.
-                    removeGuard.Dismiss();
+                    removeGuard.dismiss();
                     _authenticatedUsers.replaceAt(it, std::move(updatedUser));
                     LOG(1) << "Updated session cache of user information for " << name;
                     break;
@@ -817,7 +792,7 @@ void AuthorizationSessionImpl::_refreshUserInfoAsNeeded(OperationContext* opCtx)
                     warning() << "Could not fetch updated user privilege information for " << name
                               << "; continuing to use old information.  Reason is "
                               << redact(status);
-                    removeGuard.Dismiss();
+                    removeGuard.dismiss();
                     break;
             }
         }

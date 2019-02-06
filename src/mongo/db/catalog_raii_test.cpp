@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,6 +34,7 @@
 
 #include <string>
 
+#include "mongo/db/catalog/database_holder_mock.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -60,7 +63,14 @@ public:
     const Milliseconds timeoutMs = Seconds(1);
     const ClientAndCtx client1 = makeClientWithLocker("client1");
     const ClientAndCtx client2 = makeClientWithLocker("client2");
+
+private:
+    void setUp() override;
 };
+
+void CatalogRAIITestFixture::setUp() {
+    DatabaseHolder::set(getServiceContext(), std::make_unique<DatabaseHolderMock>());
+}
 
 void failsWithLockTimeout(stdx::function<void()> func, Milliseconds timeoutMillis) {
     Date_t t1 = Date_t::now();
@@ -198,7 +208,7 @@ TEST_F(CatalogRAIITestFixture, AutoGetCollectionDeadlineMin) {
                                    MODE_IX,
                                    MODE_X,
                                    AutoGetCollection::ViewMode::kViewsForbidden,
-                                   Date_t::min());
+                                   Date_t());
         },
         Milliseconds(0));
 }

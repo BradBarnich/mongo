@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,6 +33,7 @@
 #include <set>
 
 #include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/drop_database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -67,12 +70,15 @@ public:
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) override;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
-                                  OptionalCollectionUUID uuid) override;
+                                  OptionalCollectionUUID uuid,
+                                  std::uint64_t numRecords,
+                                  CollectionDropType dropType) override;
 
     std::set<std::string> droppedDatabaseNames;
     std::set<NamespaceString> droppedCollectionNames;
     Database* db = nullptr;
     bool onDropCollectionThrowsException = false;
+    const repl::OpTime dropOpTime = {Timestamp(Seconds(100), 1U), 1LL};
 };
 
 void OpObserverMock::onDropDatabase(OperationContext* opCtx, const std::string& dbName) {
@@ -84,9 +90,13 @@ void OpObserverMock::onDropDatabase(OperationContext* opCtx, const std::string& 
 
 repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
                                               const NamespaceString& collectionName,
-                                              OptionalCollectionUUID uuid) {
+                                              OptionalCollectionUUID uuid,
+                                              std::uint64_t numRecords,
+                                              const CollectionDropType dropType) {
     ASSERT_TRUE(opCtx->lockState()->inAWriteUnitOfWork());
-    auto opTime = OpObserverNoop::onDropCollection(opCtx, collectionName, uuid);
+    auto opTime =
+        OpObserverNoop::onDropCollection(opCtx, collectionName, uuid, numRecords, dropType);
+    invariant(opTime.isNull());
     // Do not update 'droppedCollectionNames' if OpObserverNoop::onDropCollection() throws.
     droppedCollectionNames.insert(collectionName);
 
@@ -98,7 +108,7 @@ repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
     uassert(
         ErrorCodes::OperationFailed, "onDropCollection() failed", !onDropCollectionThrowsException);
 
-    OpObserver::Times::get(opCtx).reservedOpTimes.push_back(opTime);
+    OpObserver::Times::get(opCtx).reservedOpTimes.push_back(dropOpTime);
     return {};
 }
 
@@ -193,8 +203,10 @@ void _removeDatabaseFromCatalog(OperationContext* opCtx, StringData dbName) {
     auto db = autoDB.getDb();
     // dropDatabase can call awaitReplication more than once, so do not attempt to drop the database
     // twice.
-    if (db)
-        Database::dropDatabase(opCtx, db);
+    if (db) {
+        auto databaseHolder = DatabaseHolder::get(opCtx);
+        databaseHolder->dropDb(opCtx, db);
+    }
 }
 
 TEST_F(DropDatabaseTest, DropDatabaseReturnsNamespaceNotFoundIfDatabaseDoesNotExist) {

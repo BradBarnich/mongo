@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,6 +32,7 @@
 
 #include "mongo/s/write_ops/write_op.h"
 
+#include "mongo/s/transaction_router.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -69,12 +72,13 @@ Status WriteOp::targetWrites(OperationContext* opCtx,
         }
     }();
 
-    // If we're targeting more than one endpoint with an update/delete, we have to target everywhere
-    // since we cannot currently retry partial results.
+    // Unless executing as part of a transaction, if we're targeting more than one endpoint with an
+    // update/delete, we have to target everywhere since we cannot currently retry partial results.
     //
     // NOTE: Index inserts are currently specially targeted only at the current collection to avoid
     // creating collections everywhere.
-    if (swEndpoints.isOK() && swEndpoints.getValue().size() > 1u) {
+    const bool inTransaction = TransactionRouter::get(opCtx) != nullptr;
+    if (swEndpoints.isOK() && swEndpoints.getValue().size() > 1u && !inTransaction) {
         swEndpoints = targeter.targetAllShards(opCtx);
     }
 
@@ -89,8 +93,9 @@ Status WriteOp::targetWrites(OperationContext* opCtx,
 
         WriteOpRef ref(_itemRef.getItemIndex(), _childOps.size() - 1);
 
-        // For now, multiple endpoints imply no versioning - we can't retry half a multi-write
-        if (endpoints.size() > 1u) {
+        // Outside of a transaction, multiple endpoints currently imply no versioning, since we
+        // can't retry half a regular multi-write.
+        if (endpoints.size() > 1u && !inTransaction) {
             endpoint.shardVersion = ChunkVersion::IGNORED();
         }
 
@@ -113,10 +118,21 @@ static bool isRetryErrCode(int errCode) {
         errCode == ErrorCodes::CannotImplicitlyCreateCollection;
 }
 
+static bool errorsAllSame(const vector<ChildWriteOp const*>& errOps) {
+    auto errCode = errOps.front()->error->toStatus().code();
+    if (std::all_of(++errOps.begin(), errOps.end(), [errCode](const ChildWriteOp* errOp) {
+            return errOp->error->toStatus().code() == errCode;
+        })) {
+        return true;
+    }
+
+    return false;
+}
+
 // Aggregate a bunch of errors for a single op together
 static void combineOpErrors(const vector<ChildWriteOp const*>& errOps, WriteErrorDetail* error) {
-    // Special case single response
-    if (errOps.size() == 1) {
+    // Special case single response or all errors are the same
+    if (errOps.size() == 1 || errorsAllSame(errOps)) {
         errOps.front()->error->cloneTo(error);
         return;
     }

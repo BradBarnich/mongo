@@ -591,6 +591,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
         _removeSetParameterIfBeforeVersion(opts, "writePeriodicNoops", "3.3.12");
         _removeSetParameterIfBeforeVersion(opts, "numInitialSyncAttempts", "3.3.12");
         _removeSetParameterIfBeforeVersion(opts, "numInitialSyncConnectAttempts", "3.3.12");
+        _removeSetParameterIfBeforeVersion(opts, "migrationLockAcquisitionMaxWaitMS", "4.1.7");
 
         if (!opts.logFile && opts.useLogFiles) {
             opts.logFile = opts.dbpath + "/mongod.log";
@@ -1121,16 +1122,6 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                     }
                 }
 
-                // New mongod-specific options in 4.1.x.
-                if (!programMajorMinorVersion || programMajorMinorVersion >= 410) {
-                    if (jsTest.options().setSkipShardingPartsOfPrepareTransactionFailpoint &&
-                        jsTest.options().enableTestCommands) {
-                        argArray.push(
-                            ...["--setParameter",
-                                "failpoint.skipShardingPartsOfPrepareTransaction={mode:'alwaysOn'}"]);
-                    }
-                }
-
                 // New mongod-specific options in 4.0.x
                 if (!programMajorMinorVersion || programMajorMinorVersion >= 400) {
                     if (jsTest.options().transactionLifetimeLimitSeconds !== undefined) {
@@ -1156,7 +1147,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                 if (programName.endsWith('mongod')) {
                     if (jsTest.options().storageEngine === "wiredTiger" ||
                         !jsTest.options().storageEngine) {
-                        if (jsTest.options().enableMajorityReadConcern &&
+                        if (jsTest.options().enableMajorityReadConcern !== undefined &&
                             !argArrayContains("--enableMajorityReadConcern")) {
                             argArray.push(
                                 ...['--enableMajorityReadConcern',
@@ -1186,6 +1177,12 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                         if (jsTest.options().storageEngineCacheSizeGB) {
                             argArray.push(...['--rocksdbCacheSizeGB',
                                               jsTest.options().storageEngineCacheSizeGB]);
+                        }
+                    } else if (jsTest.options().storageEngine === "inMemory") {
+                        if (jsTest.options().storageEngineCacheSizeGB &&
+                            !argArrayContains("--inMemorySizeGB")) {
+                            argArray.push(
+                                ...["--inMemorySizeGB", jsTest.options().storageEngineCacheSizeGB]);
                         }
                     }
                     // apply setParameters for mongod. The 'setParameters' field should be given as
@@ -1251,7 +1248,8 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
             } catch (e) {
                 var res = checkProgram(pid);
                 if (!res.alive) {
-                    print("Could not start mongo program at " + port + ", process ended");
+                    print("Could not start mongo program at " + port +
+                          ", process ended with exit code: " + res.exitCode);
                     serverExitCodeMap[port] = res.exitCode;
                     return true;
                 }
@@ -1287,9 +1285,10 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                 m.pid = pid;
                 return true;
             } catch (e) {
-                if (!checkProgram(pid).alive) {
-                    print("Could not start mongo program at " + port + ", process ended");
-
+                var res = checkProgram(pid);
+                if (!res.alive) {
+                    print("Could not start mongo program at " + port +
+                          ", process ended with exit code: " + res.exitCode);
                     // Break out
                     m = null;
                     return true;
