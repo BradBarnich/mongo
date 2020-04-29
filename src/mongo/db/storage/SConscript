@@ -10,6 +10,7 @@ env.SConscript(
         'ephemeral_for_test',
         'kv',
         'wiredtiger',
+        'rocks'
     ],
     exports=[
         'env'

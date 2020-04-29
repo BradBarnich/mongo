@@ -1,0 +1,3 @@
+[submodule "src/mongo/db/storage/rocks"]
+	path = src/mongo/db/storage/rocks
+	url = https://github.com/bradbarnich/mongo-rocks.git

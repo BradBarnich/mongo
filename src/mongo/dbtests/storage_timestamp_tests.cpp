@@ -286,14 +286,14 @@ public:
         {
             WriteUnitOfWork wuow(_opCtx);
             // Timestamping index completion. Primaries write an oplog entry.
-            ASSERT_OK(
-                indexer.commit(_opCtx,
-                               coll,
-                               [&](const BSONObj& indexSpec) {
-                                   _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                                       _opCtx, coll->ns(), coll->uuid(), indexSpec, false);
-                               },
-                               MultiIndexBlock::kNoopOnCommitFn));
+            ASSERT_OK(indexer.commit(
+                _opCtx,
+                coll,
+                [&](const BSONObj& indexSpec) {
+                    _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                        _opCtx, coll->ns(), coll->uuid(), indexSpec, false);
+                },
+                MultiIndexBlock::kNoopOnCommitFn));
             // The timestamping repsponsibility is placed on the caller rather than the
             // MultiIndexBlock.
             wuow.commit();
@@ -3006,7 +3006,8 @@ class CreateCollectionWithSystemIndex : public StorageTimestampTest {
 public:
     void run() {
         // Only run on 'wiredTiger'. No other storage engines to-date support timestamp writes.
-        if (!(mongo::storageGlobalParams.engine == "wiredTiger" &&
+        if (!((mongo::storageGlobalParams.engine == "wiredTiger" ||
+               mongo::storageGlobalParams.engine == "rocksdb") &&
               mongo::serverGlobalParams.enableMajorityReadConcern)) {
             return;
         }

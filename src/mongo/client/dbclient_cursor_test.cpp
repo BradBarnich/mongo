@@ -214,7 +214,9 @@ TEST_F(DBClientCursorTest, DBClientCursorHandlesOpMsgExhaustCorrectly) {
     auto m = conn.getLastSentMessage();
     ASSERT(!m.empty());
     auto msg = OpMsg::parse(m);
+#ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
     ASSERT_EQ(OpMsg::flags(m), OpMsg::kChecksumPresent);
+#endif
     ASSERT_EQ(msg.body.getStringField("find"), nss.coll());
     ASSERT_EQ(msg.body["batchSize"].number(), 0);
 
@@ -483,7 +485,9 @@ TEST_F(DBClientCursorTest, DBClientCursorPassesReadOnceFlag) {
     auto m = conn.getLastSentMessage();
     ASSERT(!m.empty());
     auto msg = OpMsg::parse(m);
+#ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
     ASSERT_EQ(OpMsg::flags(m), OpMsg::kChecksumPresent);
+#endif
     ASSERT_EQ(msg.body.getStringField("find"), nss.coll());
     ASSERT_EQ(msg.body["batchSize"].number(), 0);
     ASSERT_TRUE(msg.body.getBoolField("readOnce")) << msg.body;

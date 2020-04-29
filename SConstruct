@@ -180,6 +180,15 @@ add_option('disable-minimum-compiler-version-enforcement',
     nargs=0,
 )
 
+add_option('rocksdb',
+    choices=['on', 'off'],
+    const='on',
+    default='on',
+    help='Enable RocksDB',
+    nargs='?',
+    type='choice',
+)
+
 add_option('ssl',
     help='Enable or Disable SSL',
     choices=['on', 'off'],
@@ -1060,6 +1069,8 @@ if releaseBuild and (debugBuild or not optBuild):
 noshell = has_option( "noshell" )
 
 jsEngine = get_option( "js-engine")
+
+rocksdb = get_option( "rocksdb" ) == "on"
 
 serverJs = get_option( "server-js" ) == "on"
 
@@ -3449,7 +3460,7 @@ def doConfigure(myenv):
         conf.FindSysLibDep("zlib", ["zdll" if conf.env.TargetOSIs('windows') else "z"])
 
     if use_system_version_of_library("zstd"):
-        conf.FindSysLibDep("zstd", ["libzstd" if conf.env.TargetOSIs('windows') else "zstd"])
+        conf.FindSysLibDep("zstd", ["zstd"] )
 
     if use_system_version_of_library("stemmer"):
         conf.FindSysLibDep("stemmer", ["stemmer"])
@@ -4353,6 +4364,7 @@ Export([
     'http_client',
     'module_sconscripts',
     'optBuild',
+    'rocksdb',
     'serverJs',
     'ssl_provider',
     'use_libunwind',

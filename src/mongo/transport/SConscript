@@ -1,6 +1,7 @@
 # -*- mode: python -*-
 
 Import('env')
+Import("use_system_version_of_library")
 
 env = env.Clone()
 
@@ -126,7 +127,12 @@ env.Library(
 )
 
 zlibEnv = env.Clone()
-zlibEnv.InjectThirdParty(libraries=['zlib', 'zstd', 'snappy'])
+
+zlibEnv.InjectThirdParty(libraries=['zlib', 'snappy'])
+
+if not use_system_version_of_library("zstd"):
+    zlibEnv.InjectThirdParty(libraries=['zstd'])
+
 zlibEnv.Library(
     target='message_compressor',
     source=[

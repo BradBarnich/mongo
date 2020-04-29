@@ -84,7 +84,7 @@ public:
      * Background validation runs on a checkpoint, and therefore only on storage engines that
      * support checkpoints.
      */
-    BackgroundCollectionValidationTest() : CollectionValidationTest("wiredTiger") {}
+    BackgroundCollectionValidationTest() : CollectionValidationTest("rocksdb") {}
 };
 
 /**

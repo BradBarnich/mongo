@@ -506,7 +506,7 @@ public:
 
         // Testing with 'wiredTiger' because the registered storage engine factory
         // supports custom index options under 'storageEngine'.
-        const std::string storageEngineName = "wiredTiger";
+        const std::string storageEngineName = "rocksdb";
 
         // Run 'wiredTiger' tests if the storage engine is supported.
         if (isRegisteredStorageEngine(getGlobalServiceContext(), storageEngineName)) {

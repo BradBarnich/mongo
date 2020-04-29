@@ -15,6 +15,7 @@ Import("usemozjs")
 Import("use_system_version_of_library")
 Import("use_libunwind")
 Import("wiredtiger")
+Import("rocksdb")
 
 env = env.Clone()
 
@@ -448,6 +449,7 @@ mongod = env.Program(
         'db/storage/storage_init_d',
         'db/storage/storage_options',
         'db/storage/wiredtiger/storage_wiredtiger' if wiredtiger else [],
+        'db/storage/rocks/storage_rocks' if rocksdb else [],
         'db/system_index',
         'db/traffic_recorder',
         'db/ttl_collection_cache',

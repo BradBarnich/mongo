@@ -92,7 +92,7 @@ configs:
         description: 'What storage engine to use'
         arg_vartype: String
         short_name: storageEngine
-        default: wiredTiger
+        default: rocksdb
     enableFlowControl:
         description: 'Whether Flow Control is enabled'
         arg_vartype: Bool

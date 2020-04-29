@@ -171,7 +171,7 @@ public:
 
 private:
     const char* wt_uri = "table:prepare_transaction";
-    const char* wt_config = "key_format=S,value_format=S";
+    const char* wt_config = "key_format=S,value_format=S,assert=(commit_timestamp=key_consistent)";
 };
 
 TEST_F(WiredTigerRecoveryUnitTestFixture, SetReadSource) {

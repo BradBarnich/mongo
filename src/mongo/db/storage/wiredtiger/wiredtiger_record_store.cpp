@@ -754,6 +754,8 @@ StatusWith<std::string> WiredTigerRecordStore::generateCreateString(
     }
     ss << ",value_format=u";
 
+    ss << ",assert=(commit_timestamp=key_consistent)";
+
     // Record store metadata
     ss << ",app_metadata=(formatVersion=" << kCurrentRecordStoreVersion;
     if (NamespaceString::oplog(ns)) {

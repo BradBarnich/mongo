@@ -42,7 +42,9 @@
 #include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/hex.h"
+#ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
 #include "third_party/wiredtiger/wiredtiger.h"
+#endif
 
 namespace mongo {
 namespace {
@@ -139,6 +141,7 @@ public:
     }
 
     OpMsgBytes&& appendChecksum() && {
+#ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
         // Reserve space at the end for the checksum.
         append<uint32_t>(0);
         updateSize();
@@ -147,6 +150,7 @@ public:
         // Write the checksum bits at the end.
         auto checksumBits = DataView(buffer.buf() + buffer.len() - sizeof(checksum));
         checksumBits.write<LittleEndian<uint32_t>>(checksum);
+#endif
         return std::move(*this);
     }
 

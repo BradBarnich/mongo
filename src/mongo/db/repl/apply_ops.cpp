@@ -211,7 +211,7 @@ Status _applyOps(OperationContext* opCtx,
                     opCtx,
                     "applyOps",
                     nss.ns(),
-                    [opCtx, nss, opObj, opType, alwaysUpsert, oplogApplicationMode] {
+                    [opCtx, &nss, opObj, opType, alwaysUpsert, oplogApplicationMode] {
                         BSONObjBuilder builder;
                         builder.appendElements(opObj);
                         if (!builder.hasField(OplogEntry::kTimestampFieldName)) {

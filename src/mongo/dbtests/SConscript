@@ -5,6 +5,7 @@ Import("get_option")
 Import("has_option")
 Import("usemozjs")
 Import("wiredtiger")
+Import("rocksdb")
 
 env = env.Clone()
 
@@ -165,6 +166,7 @@ if not has_option('noshell') and usemozjs:
             "$BUILD_DIR/mongo/db/storage/storage_engine_impl",
             "$BUILD_DIR/mongo/db/storage/storage_debug_util",
             "$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger" if wiredtiger else [],
+            "$BUILD_DIR/mongo/db/storage/rocks/storage_rocks" if rocksdb else [],
             "$BUILD_DIR/mongo/db/transaction",
             "$BUILD_DIR/mongo/shell_core",
             "$BUILD_DIR/mongo/transport/message_compressor_options_server",

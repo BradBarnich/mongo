@@ -555,7 +555,7 @@ TestAssertionFailureException::TestAssertionFailureException(
 
 std::string TestAssertionFailureException::toString() const {
     std::ostringstream os;
-    os << getMessage() << " @" << getFile() << ":" << getLine();
+    os << getMessage() << " @ " << getFile() << ":" << getLine();
     return os.str();
 }
 
